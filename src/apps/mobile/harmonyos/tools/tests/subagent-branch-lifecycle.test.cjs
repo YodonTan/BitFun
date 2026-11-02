@@ -533,7 +533,8 @@ test('the branch cache is written at most once per interval while a worker strea
   callbacks.onCaughtUp();
   assert.equal(branchCache.writes, 0, 'a streaming worker does not rewrite its transcript per step');
 
-  await until(() => branchCache.writes === 1, 'the first write', Math.ceil(FLUSH_MS / 5) + 200);
+  // Each attempt waits at least 1 ms, so budget attempts by milliseconds.
+  await until(() => branchCache.writes === 1, 'the first write', FLUSH_MS * 2 + 200);
   assert.equal(branchCache.writes, 1, 'and the write holds the rest of the interval back');
   harness.coordinator.endSession();
   await flush();
