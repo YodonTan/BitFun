@@ -697,9 +697,9 @@ test('the device-model scenarios are one family the launcher can open', () => {
   const gallery = source('entry/src/main/ets/pages/preview/MobileDesignGallery.ets');
   const preview = source('entry/src/main/ets/pages/preview/DeviceModelDefaultsPreview.ets');
 
-  assert.match(entryAbility, /String\(scenarioId \|\| ''\)\.startsWith\('device-model'\)/,
+  assert.match(entryAbility, /scenarioId\.startsWith\('device-model'\)/,
     'the launcher has to recognize the whole device-model family');
-  assert.match(entryAbility, /deviceModelScenario && String\(scenarioId\)\.endsWith\('-dark'\)/,
+  assert.match(entryAbility, /deviceModelScenario && scenarioId\.endsWith\('-dark'\)/,
     'the dark variants have to lock the dark colour mode');
   assert.match(gallery, /startsWith\('device-model'\)/,
     'the gallery has to route the family to the preview');
