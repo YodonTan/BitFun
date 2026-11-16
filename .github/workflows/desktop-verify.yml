@@ -1,0 +1,336 @@
+name: Desktop Verify (unsigned)
+
+# Unsigned Desktop verification build for one pinned commit.
+#
+# Derived from .github/workflows/desktop-package.yml, with every signing and
+# release-publication stage removed. This workflow never signs an artifact,
+# never creates a tag or a release, never uploads an update manifest, and never
+# pushes a container image. Its only output is an unsigned Windows NSIS
+# installer artifact plus the commit/SHA-256 metadata that proves which commit
+# produced it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      checkout_ref:
+        description: "Commit SHA, branch, or tag to build. The value is resolved to a pinned commit SHA before any build step runs."
+        required: false
+        default: main
+        type: string
+      target_platform:
+        description: "Verification target. Only 'windows' is supported; any other value fails before building."
+        required: false
+        default: windows
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-verify-${{ inputs.target_platform || 'windows' }}-${{ inputs.checkout_ref || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Resolve and pin the build commit ───────────────────────────────
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      checkout_sha: ${{ steps.meta.outputs.checkout_sha }}
+      target_platform: ${{ inputs.target_platform || 'windows' }}
+      package_matrix: ${{ steps.platforms.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and pin build commit
+        id: meta
+        shell: bash
+        env:
+          INPUT_CHECKOUT_REF: ${{ inputs.checkout_ref }}
+        run: |
+          set -euo pipefail
+
+          REF="${INPUT_CHECKOUT_REF:-main}"
+          CHECKOUT_SHA="$(git rev-parse --verify --quiet "${REF}^{commit}" || true)"
+          if [[ -z "${CHECKOUT_SHA}" ]]; then
+            # Branch, tag, or commit the workflow checkout did not fetch.
+            git fetch --no-tags --force origin "${REF}"
+            CHECKOUT_SHA="$(git rev-parse --verify --quiet 'FETCH_HEAD^{commit}' || true)"
+          fi
+          if [[ ! "${CHECKOUT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Could not resolve '${REF}' to a commit SHA; refusing to build an unpinned revision." >&2
+            exit 1
+          fi
+
+          VERSION="$(jq -r '.version' package.json)"
+          node --input-type=module -e \
+            "import { validateReleaseVersion } from './scripts/release-channel.mjs'; validateReleaseVersion(process.argv[1], process.argv[2]);" \
+            stable "${VERSION}"
+
+          {
+            echo "version=${VERSION}"
+            echo "checkout_sha=${CHECKOUT_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Desktop verify (unsigned)"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Requested ref | ${REF} |"
+            echo "| Pinned commit | ${CHECKOUT_SHA} |"
+            echo "| Version | ${VERSION} |"
+            echo "| Channel | stable |"
+            echo "| Signing | disabled (unsigned artifact) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Select verification platform
+        id: platforms
+        env:
+          TARGET_PLATFORM: ${{ inputs.target_platform || 'windows' }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const all = JSON.parse(fs.readFileSync('scripts/desktop-package-platforms.json', 'utf8'));
+          const target = process.env.TARGET_PLATFORM;
+          const supported = { windows: ['windows-x64'] };
+          if (!Object.prototype.hasOwnProperty.call(supported, target)) {
+            throw new Error(`Unsupported target_platform "${target}". Supported values: ${Object.keys(supported).join(', ')}.`);
+          }
+          const names = supported[target];
+          const selected = all.filter((platform) => names.includes(platform.name));
+          if (selected.length !== names.length) {
+            throw new Error(`Desktop package platform definitions are missing: ${names.join(', ')}.`);
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify(selected)}\n`);
+          NODE
+
+  # ── Build the unsigned Windows installer ───────────────────────────
+  package:
+    name: Package (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.os }}
+    needs: prepare
+    if: needs.prepare.outputs.target_platform == 'windows'
+    timeout-minutes: 180
+    env:
+      NODE_OPTIONS: --max-old-space-size=6144
+      OPENBITFUN_RELEASE_CHANNEL: stable
+      # Tauri signs updater artifacts, and this workflow intentionally has no
+      # signing key. Keep them disabled so the bundle stays unsigned.
+      OPENBITFUN_ENABLE_UPDATER_ARTIFACTS: 'false'
+      CHECKOUT_SHA: ${{ needs.prepare.outputs.checkout_sha }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      REQUESTED_REF: ${{ inputs.checkout_ref }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(needs.prepare.outputs.package_matrix) }}
+    steps:
+      # Also preserve bytes when the pinned commit predates a .gitattributes pin.
+      - name: Preserve source bytes on Windows
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - name: Checkout the pinned build commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_sha }}
+
+      - name: Verify the checked-out commit is the pinned commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          if [[ "${HEAD_SHA}" != "${CHECKOUT_SHA}" ]]; then
+            echo "Checked out ${HEAD_SHA}, expected pinned commit ${CHECKOUT_SHA}." >&2
+            exit 1
+          fi
+          echo "Building pinned commit ${CHECKOUT_SHA} (unsigned)."
+
+      - name: Install NSIS (Windows)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install nsis -y --no-progress
+          $nsisRoot = "${env:ProgramFiles(x86)}\NSIS"
+          $nsisBin = "${env:ProgramFiles(x86)}\NSIS\Bin"
+          if (Test-Path $nsisRoot) {
+            Add-Content $env:GITHUB_PATH $nsisRoot
+          }
+          if (Test-Path $nsisBin) {
+            Add-Content $env:GITHUB_PATH $nsisBin
+          }
+
+      - name: Verify NSIS (Windows)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          where.exe makensis
+          makensis /VERSION
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Resolve Bun executable cache
+        id: bun-cache-target
+        shell: bash
+        run: |
+          if [[ -f scripts/ci/bun-cache-target.mjs ]]; then
+            node scripts/ci/bun-cache-target.mjs 1.3.14
+          else
+            echo "::notice::Bun caching is unavailable for this older source revision; setup-bun will install it normally."
+          fi
+
+      - name: Restore Bun executable
+        id: bun-executable-cache
+        if: steps.bun-cache-target.outputs.key != ''
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ steps.bun-cache-target.outputs.path }}
+          key: ${{ steps.bun-cache-target.outputs.key }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+          no-cache: true
+
+      - name: Save Bun executable
+        if: >-
+          steps.bun-cache-target.outputs.key != '' &&
+          steps.bun-executable-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ steps.bun-cache-target.outputs.path }}
+          key: ${{ steps.bun-cache-target.outputs.key }}
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: "desktop-verify-${{ matrix.platform.name }}"
+          cache-bin: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify release version metadata
+        run: node scripts/verify-release-version-sync.mjs --version "$RELEASE_VERSION"
+
+      - name: Download and verify target Flashgrep binary
+        run: node scripts/prepare-flashgrep-resource.mjs --target "${{ matrix.platform.target }}"
+
+      # Runs `tauri build --no-bundle`: the frontend build
+      # (beforeBuildCommand -> pnpm run frontend:build-all) plus the Rust
+      # executable. Bundling is a separate step so the installer always packages
+      # the binary this run produced.
+      - name: Build desktop frontend and executable
+        run: ${{ matrix.platform.build_command }}
+
+      # Unsigned: the Authenticode signing stages of the release workflow are
+      # intentionally absent, and Tauri only signs when
+      # WINDOWS_CERTIFICATE_THUMBPRINT is set.
+      - name: Bundle unsigned Windows NSIS installer
+        shell: pwsh
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node scripts/desktop-tauri-build.mjs --bundle-only --target "${{ matrix.platform.target }}" --bundles nsis --verbose
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify installer, checksums, and build metadata
+        id: verify
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = '${{ matrix.platform.target }}'
+          # Same candidate roots the release workflow collects bundles from.
+          $candidates = @(
+            (Join-Path 'target' (Join-Path $target 'release/bundle/nsis')),
+            (Join-Path 'target' 'release/bundle/nsis'),
+            (Join-Path 'src/apps/desktop/target' (Join-Path $target 'release/bundle/nsis')),
+            (Join-Path 'src/apps/desktop/target' 'release/bundle/nsis')
+          )
+          $bundleDirs = @($candidates | Where-Object { Test-Path $_ })
+          if ($bundleDirs.Count -eq 0) {
+            throw "No NSIS bundle directory was produced; looked in: $($candidates -join ', ')"
+          }
+          $installers = @($bundleDirs | ForEach-Object { Get-ChildItem -Path $_ -File -Filter '*.exe' } |
+            Where-Object { $_.Length -gt 0 })
+          if ($installers.Count -eq 0) {
+            throw "No non-empty NSIS installer was produced; looked in: $($bundleDirs -join ', ')"
+          }
+
+          New-Item -ItemType Directory -Force -Path 'verify-out' | Out-Null
+          $entries = @()
+          $lines = @()
+          foreach ($installer in $installers) {
+            $hash = (Get-FileHash -Algorithm SHA256 -Path $installer.FullName).Hash.ToLowerInvariant()
+            Copy-Item -Path $installer.FullName -Destination (Join-Path 'verify-out' $installer.Name) -Force
+            Set-Content -Path (Join-Path 'verify-out' "$($installer.Name).sha256") -Value "$hash  $($installer.Name)"
+            $lines += "$hash  $($installer.Name)"
+            $entries += [ordered]@{
+              name = $installer.Name
+              size_bytes = $installer.Length
+              sha256 = $hash
+            }
+          }
+          Set-Content -Path 'verify-out/SHA256SUMS.txt' -Value $lines
+
+          $metadata = [ordered]@{
+            kind = 'openbitfun-desktop-verify'
+            signed = $false
+            updater_artifacts = $false
+            release_channel = 'stable'
+            repository = $env:GITHUB_REPOSITORY
+            workflow_ref = $env:GITHUB_WORKFLOW_REF
+            workflow_run_id = $env:GITHUB_RUN_ID
+            workflow_run_attempt = $env:GITHUB_RUN_ATTEMPT
+            workflow_run_url = "$($env:GITHUB_SERVER_URL)/$($env:GITHUB_REPOSITORY)/actions/runs/$($env:GITHUB_RUN_ID)"
+            triggered_by = $env:GITHUB_ACTOR
+            requested_ref = $env:REQUESTED_REF
+            commit_sha = $env:CHECKOUT_SHA
+            version = $env:RELEASE_VERSION
+            platform = '${{ matrix.platform.name }}'
+            rust_target = $target
+            runner_os = $env:RUNNER_OS
+            built_utc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            installers = $entries
+          }
+          Set-Content -Path 'verify-out/build-metadata.json' -Value ($metadata | ConvertTo-Json -Depth 5)
+
+          "artifact_name=openbitfun-desktop-verify-unsigned-$($env:CHECKOUT_SHA)-${{ matrix.platform.name }}" >> $env:GITHUB_OUTPUT
+
+          $summary = @(
+            '',
+            '### Unsigned installer output',
+            '',
+            '| Installer | SHA-256 | Size (bytes) |',
+            '| --- | --- | --- |'
+          )
+          foreach ($entry in $entries) {
+            $summary += "| $($entry.name) | $($entry.sha256) | $($entry.size_bytes) |"
+            Write-Host "Verifier: $($entry.name) sha256=$($entry.sha256) bytes=$($entry.size_bytes)"
+          }
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
+
+      - name: Upload unsigned installer artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.verify.outputs.artifact_name }}
+          if-no-files-found: error
+          retention-days: 7
+          path: verify-out/*
