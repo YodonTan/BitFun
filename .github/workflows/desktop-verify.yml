@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       checkout_ref:
-        description: "Commit SHA, branch, or tag to build. The value is resolved to a pinned commit SHA before any build step runs."
+        description: "Commit SHA, branch, or tag to build. Resolved to a pinned commit SHA before any build step runs; the default 'main' is this repository's own main branch."
         required: false
         default: main
         type: string
@@ -36,12 +36,13 @@ jobs:
     name: Prepare
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.meta.outputs.version }}
+      version: ${{ steps.version.outputs.version }}
       checkout_sha: ${{ steps.meta.outputs.checkout_sha }}
       target_platform: ${{ inputs.target_platform || 'windows' }}
       package_matrix: ${{ steps.platforms.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout workflow revision
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -65,22 +66,39 @@ jobs:
             exit 1
           fi
 
+          echo "checkout_sha=${CHECKOUT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Pinned build commit: ${CHECKOUT_SHA} (from ${REF})"
+
+      # Every later step reads repository files from the pinned commit itself.
+      # A fork default branch can be unrelated to the revision under
+      # verification, so the workflow revision is used only to resolve the ref.
+      - name: Checkout the pinned build commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.meta.outputs.checkout_sha }}
+
+      - name: Resolve version metadata
+        id: version
+        shell: bash
+        env:
+          CHECKOUT_SHA: ${{ steps.meta.outputs.checkout_sha }}
+          REQUESTED_REF: ${{ inputs.checkout_ref || 'main' }}
+        run: |
+          set -euo pipefail
+
           VERSION="$(jq -r '.version' package.json)"
           node --input-type=module -e \
             "import { validateReleaseVersion } from './scripts/release-channel.mjs'; validateReleaseVersion(process.argv[1], process.argv[2]);" \
             stable "${VERSION}"
 
-          {
-            echo "version=${VERSION}"
-            echo "checkout_sha=${CHECKOUT_SHA}"
-          } >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
           {
             echo "### Desktop verify (unsigned)"
             echo ""
             echo "| Field | Value |"
             echo "| --- | --- |"
-            echo "| Requested ref | ${REF} |"
+            echo "| Requested ref | ${REQUESTED_REF} |"
             echo "| Pinned commit | ${CHECKOUT_SHA} |"
             echo "| Version | ${VERSION} |"
             echo "| Channel | stable |"
