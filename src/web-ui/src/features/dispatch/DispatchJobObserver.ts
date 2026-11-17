@@ -96,6 +96,9 @@ const RAW_EVENT_NAMES: Record<string, string> = {
   DialogTurnFailed: 'agentic://dialog-turn-failed',
   DialogTurnCancelled: 'agentic://dialog-turn-cancelled',
   TokenUsageUpdated: 'agentic://token-usage-updated',
+  // Recorded request-context facts of one target-owned model request. The
+  // controller folds them into the same non-billing read model it uses locally.
+  RequestContextSnapshotUpdated: 'agentic://request-context-snapshot-updated',
   ContextCompressionStarted: 'agentic://context-compression-started',
   ContextCompressionCompleted: 'agentic://context-compression-completed',
   ContextCompressionFailed: 'agentic://context-compression-failed',

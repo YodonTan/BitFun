@@ -3334,6 +3334,7 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                 tags: Vec::new(),
                 custom_metadata: None,
                 current_context_usage: None,
+                last_recorded_request_snapshot: None,
                 relationship: None,
                 todos: None,
                 review_action_state: None,

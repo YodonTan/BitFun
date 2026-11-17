@@ -58,6 +58,8 @@ pub struct RoundExecutor {
     event_queue: Arc<EventQueue>,
     cancellation_tokens: DialogTurnCancellationTokenStore,
     usage_service: Option<Arc<crate::service::token_usage::TokenUsageService>>,
+    /// Sink shared with the off-send-path recorded-snapshot summary job.
+    snapshot_sink: super::request_context_snapshot::SnapshotEventSink,
 }
 
 /// The same observed failure facts drive HTTP and in-stream recovery. Account
@@ -671,6 +673,9 @@ impl RoundExecutor {
         Self {
             stream_processor,
             tool_pipeline: Some(tool_pipeline),
+            snapshot_sink: super::request_context_snapshot::SnapshotEventSink::new(
+                event_queue.clone(),
+            ),
             event_queue,
             cancellation_tokens: DialogTurnCancellationTokenStore::new(),
             usage_service: crate::service::token_usage::get_global_token_usage_service(),
@@ -692,6 +697,31 @@ impl RoundExecutor {
         tool_definitions: Option<Vec<ToolDefinition>>,
         context_window: Option<usize>,
     ) -> OpenBitFunResult<RoundResult> {
+        self.execute_round_with_session(
+            ai_client,
+            context,
+            ai_messages,
+            tool_definitions,
+            context_window,
+            None,
+        )
+        .await
+    }
+
+    /// Execute a single model round whose recorded request snapshot belongs to a
+    /// session owner.
+    ///
+    /// The owner is only used to persist the snapshot of the attempt; the round
+    /// itself behaves exactly like [`Self::execute_round`].
+    pub async fn execute_round_with_session(
+        &self,
+        ai_client: Arc<AIClient>,
+        context: RoundContext,
+        ai_messages: Vec<AIMessage>,
+        tool_definitions: Option<Vec<ToolDefinition>>,
+        context_window: Option<usize>,
+        session_manager: Option<Arc<SessionManager>>,
+    ) -> OpenBitFunResult<RoundResult> {
         let mut lifecycle = ModelRoundLifecycle::new();
         self.execute_round_with_lifecycle(
             ai_client,
@@ -700,7 +730,7 @@ impl RoundExecutor {
             tool_definitions,
             context_window,
             &mut lifecycle,
-            None,
+            session_manager,
             None,
         )
         .await
@@ -716,7 +746,7 @@ impl RoundExecutor {
         tool_definitions: Option<Vec<ToolDefinition>>,
         context_window: Option<usize>,
         lifecycle: &'a mut ModelRoundLifecycle,
-        session_manager: Option<&'a SessionManager>,
+        session_manager: Option<Arc<SessionManager>>,
         pool_attempt: Option<&'a super::model_pool::PoolAttempt>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = OpenBitFunResult<RoundResult>> + Send + 'a>,
@@ -741,7 +771,7 @@ impl RoundExecutor {
         tool_definitions: Option<Vec<ToolDefinition>>,
         context_window: Option<usize>,
         lifecycle: &mut ModelRoundLifecycle,
-        session_manager: Option<&SessionManager>,
+        session_manager: Option<Arc<SessionManager>>,
         pool_attempt: Option<&super::model_pool::PoolAttempt>,
     ) -> OpenBitFunResult<RoundResult> {
         lifecycle.safe_to_switch_model =
@@ -948,6 +978,7 @@ impl RoundExecutor {
         let max_attempts = Self::MAX_STREAM_ATTEMPTS;
         let mut local_attempt_index = 0usize;
         let mut retry_reason = None;
+        let snapshot_tool_definitions = tool_definitions.clone().map(Arc::new);
         let (stream_result, send_to_stream_ms, stream_processing_ms, ttft_ms, final_trace_handle) = loop {
             let source = account_source.as_ref();
             let attempt_number = lifecycle.begin_attempt();
@@ -1020,6 +1051,29 @@ impl RoundExecutor {
             }
             crate::infrastructure::ai::channel_client_source::ChannelClientSource::validate_replay_binding(&ai_messages, &context.model_config_id, &ai_client, channels.is_some())
                 .map_err(|error| OpenBitFunError::AIClient(error.to_string()).with_channel_bound_replay())?;
+            // The recorded provenance describes the prepared send input. Every
+            // projection above preserves the message count and the order; when
+            // the two no longer line up, degrade to role-based categories
+            // instead of classifying or rebuilding the current context.
+            let attempt_send_categories = match context
+                .prepared_send_categories
+                .as_ref()
+                .filter(|categories| categories.len() == ai_messages.len())
+            {
+                Some(categories) => categories.clone(),
+                None => {
+                    if context.prepared_send_categories.is_some() {
+                        warn!(
+                            "Recorded request snapshot provenance does not match the send input; degrading to role-based categories: session_id={}, round_id={}, attempt_id={}, messages={}",
+                            context.session_id,
+                            round_id,
+                            attempt_id,
+                            ai_messages.len()
+                        );
+                    }
+                    super::context_composition::legacy_send_categories(&ai_messages)
+                }
+            };
             let mut usage_context =
                 openbitfun_services_core::token_usage::types::ModelRequestUsageContext {
                     context_composition: None,
@@ -1075,6 +1129,31 @@ impl RoundExecutor {
                         )
                         .collect(),
                 };
+            // Record this attempt's real prepared input. The reference is built
+            // from the existing attempt identity, so retries never share one.
+            super::request_context_snapshot::begin_attempt(
+                Arc::new(super::context_composition::PreparedSendInput {
+                    messages: ai_messages.clone(),
+                    categories: attempt_send_categories,
+                }),
+                super::request_context_snapshot::request_ref(
+                    super::request_context_snapshot::AttemptRequestIdentity {
+                        workspace: context.workspace.as_ref(),
+                        session_id: &context.session_id,
+                        turn_id: &context.dialog_turn_id,
+                        round_id: &usage_context.round_id,
+                        attempt_id: &usage_context.attempt_id,
+                        attempt_index: usage_context.attempt_index,
+                        started_at: usage_context.started_at.timestamp_millis(),
+                    },
+                ),
+                snapshot_tool_definitions.clone(),
+                context_window.map(|window| window as u64),
+                super::request_context_snapshot::SnapshotActivation::new(
+                    self.snapshot_sink.clone(),
+                    session_manager.clone(),
+                ),
+            );
             let request_started_at = Instant::now();
             debug!(
                 "Sending request: model={}, messages={}, tools={}, round_attempt={}, local_retry={}/{}",
@@ -1097,7 +1176,7 @@ impl RoundExecutor {
             );
             let send_result = tokio::select! {
                 _ = cancel_token.cancelled() => {
-                    self.record_attempt_usage(&context, &usage_context, None, openbitfun_services_core::token_usage::types::ModelRequestOutcome::Cancelled, context_window, is_subagent).await;
+                    self.record_attempt_usage(&context, &usage_context, None, openbitfun_services_core::token_usage::types::ModelRequestOutcome::Cancelled, context_window, is_subagent, session_manager.clone()).await;
                     return Err(OpenBitFunError::Cancelled("Execution cancelled".to_string()));
                 }
                 result = send_future => result,
@@ -1124,6 +1203,7 @@ impl RoundExecutor {
                         openbitfun_services_core::token_usage::types::ModelRequestOutcome::Failed,
                         context_window,
                         is_subagent,
+                        session_manager.clone(),
                     )
                     .await;
                     error!("AI request failed: {:#}", e);
@@ -1271,6 +1351,7 @@ impl RoundExecutor {
                     openbitfun_services_core::token_usage::types::ModelRequestOutcome::Cancelled,
                     context_window,
                     is_subagent,
+                    session_manager.clone(),
                 )
                 .await;
                 Self::complete_model_exchange_trace(
@@ -1338,7 +1419,7 @@ impl RoundExecutor {
                             || result.tool_calls.iter().any(|call| call.is_valid()),
                     );
                     usage_context.response_model = result.response_model.clone();
-                    self.record_attempt_usage(&context, &usage_context, result.usage.as_ref(), if result.partial_recovery_reason.is_some() { openbitfun_services_core::token_usage::types::ModelRequestOutcome::Failed } else { openbitfun_services_core::token_usage::types::ModelRequestOutcome::Completed }, context_window, is_subagent).await;
+                    self.record_attempt_usage(&context, &usage_context, result.usage.as_ref(), if result.partial_recovery_reason.is_some() { openbitfun_services_core::token_usage::types::ModelRequestOutcome::Failed } else { openbitfun_services_core::token_usage::types::ModelRequestOutcome::Completed }, context_window, is_subagent, session_manager.clone()).await;
                     let has_interrupted_invalid_tool_calls =
                         Self::has_interrupted_invalid_tool_calls(&result);
                     if let Some(partial_recovery_reason) = result.partial_recovery_reason.as_deref()
@@ -1600,7 +1681,7 @@ impl RoundExecutor {
                 Err(stream_err) => {
                     lifecycle.observe_output(stream_err.has_effective_output);
                     usage_context.response_model = stream_err.response_model.clone();
-                    self.record_attempt_usage(&context, &usage_context, stream_err.usage.as_ref(), if matches!(&stream_err.error, OpenBitFunError::Cancelled(_)) { openbitfun_services_core::token_usage::types::ModelRequestOutcome::Cancelled } else { openbitfun_services_core::token_usage::types::ModelRequestOutcome::Failed }, context_window, is_subagent).await;
+                    self.record_attempt_usage(&context, &usage_context, stream_err.usage.as_ref(), if matches!(&stream_err.error, OpenBitFunError::Cancelled(_)) { openbitfun_services_core::token_usage::types::ModelRequestOutcome::Cancelled } else { openbitfun_services_core::token_usage::types::ModelRequestOutcome::Failed }, context_window, is_subagent, session_manager.clone()).await;
                     if matches!(&stream_err.error, OpenBitFunError::Cancelled(_)) {
                         Self::complete_model_exchange_trace(
                             trace_config.as_ref(),
@@ -1792,7 +1873,7 @@ impl RoundExecutor {
         lifecycle.safe_to_switch_model = false;
         if let Some(attempt) = pool_attempt {
             let binding = attempt.accept().await?;
-            if let Some(manager) = session_manager {
+            if let Some(manager) = session_manager.as_ref() {
                 // The response is already accepted. Persistence failure must not
                 // replay it (and must not duplicate tool execution).
                 if let Err(error) = manager
@@ -2026,7 +2107,7 @@ impl RoundExecutor {
         // readers can observe the active tool call while it is running. Fork
         // snapshots normalize this intentionally incomplete exchange before
         // sending it to a provider.
-        let assistant_message_committed = if let Some(session_manager) = session_manager {
+        let assistant_message_committed = if let Some(session_manager) = session_manager.as_ref() {
             session_manager
                 .add_message(&context.session_id, assistant_message.clone())
                 .await?;
@@ -2612,6 +2693,7 @@ impl RoundExecutor {
         outcome: openbitfun_services_core::token_usage::types::ModelRequestOutcome,
         context_window: Option<usize>,
         is_subagent: bool,
+        session_manager: Option<Arc<SessionManager>>,
     ) {
         let mut request = request.clone();
         request.outcome = outcome;
@@ -2657,6 +2739,47 @@ impl RoundExecutor {
             )
             .await;
         }
+        // Recorded context facts are separate from the cumulative token ledger:
+        // they never add to token or billing accounting and never re-emit
+        // `TokenUsageUpdated`.
+        self.activate_recorded_request_snapshot(context, &request, usage, session_manager)
+            .await;
+    }
+
+    /// Persist the recorded request snapshot of a completed attempt.
+    ///
+    /// A provider-reported normalized input total is authoritative; without one
+    /// the snapshot is an explicit same-attempt estimate (summary ready) or an
+    /// explicit unknown. A zero is never recorded as a reported total.
+    async fn activate_recorded_request_snapshot(
+        &self,
+        context: &RoundContext,
+        request: &openbitfun_services_core::token_usage::types::ModelRequestUsageContext,
+        usage: Option<&crate::util::types::ai::GeminiUsage>,
+        session_manager: Option<Arc<SessionManager>>,
+    ) {
+        let request_ref = super::request_context_snapshot::request_ref(
+            super::request_context_snapshot::AttemptRequestIdentity {
+                workspace: context.workspace.as_ref(),
+                session_id: &context.session_id,
+                turn_id: &context.dialog_turn_id,
+                round_id: &request.round_id,
+                attempt_id: &request.attempt_id,
+                attempt_index: request.attempt_index,
+                started_at: request.started_at.timestamp_millis(),
+            },
+        );
+        let snapshot = super::request_context_snapshot::activate_attempt(
+            request_ref,
+            usage.map(|usage| u64::from(usage.prompt_token_count)),
+            usage.and_then(|usage| usage.cached_content_token_count.map(u64::from)),
+        );
+        super::request_context_snapshot::SnapshotActivation::new(
+            self.snapshot_sink.clone(),
+            session_manager,
+        )
+        .persist_and_publish(snapshot)
+        .await;
     }
 
     async fn emit_failed_partial_tool_calls(
@@ -2882,6 +3005,10 @@ pub(super) mod tests {
         RoundExecutor {
             stream_processor: Arc::new(StreamProcessor::new(event_queue.clone())),
             tool_pipeline: None,
+            snapshot_sink:
+                crate::agentic::execution::request_context_snapshot::SnapshotEventSink::new(
+                    event_queue.clone(),
+                ),
             event_queue,
             cancellation_tokens: DialogTurnCancellationTokenStore::new(),
             usage_service: None,
@@ -3023,6 +3150,7 @@ pub(super) mod tests {
             model_config_id: "model-1".to_string(),
             effective_model_name: "model-1".to_string(),
             model_request_context: Default::default(),
+            prepared_send_categories: None,
             account_client_source: None,
             channel_client_source: None,
             prepared_model: None,
@@ -6897,6 +7025,7 @@ pub(super) mod tests {
                 ModelRequestOutcome::Cancelled,
                 None,
                 false,
+                None,
             ),
         )
         .await
@@ -7801,7 +7930,7 @@ pub(super) mod tests {
             None,
             None,
             &mut lifecycle,
-            Some(&manager),
+            Some(Arc::new(manager)),
             None,
         );
         let observer = async {

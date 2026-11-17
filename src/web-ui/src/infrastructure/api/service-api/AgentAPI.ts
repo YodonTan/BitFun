@@ -824,6 +824,18 @@ export interface AcpContextUsageUpdatedEvent extends AgenticEvent {
   };
 }
 
+/**
+ * Numeric-only recorded context facts for one model request.
+ *
+ * Observational only: this never contributes to cumulative token usage, goal
+ * accounting, or `currentContextUsage`.
+ */
+export interface RequestContextSnapshotUpdatedEvent extends AgenticEvent {
+  sessionId: string;
+  turnId: string;
+  snapshot: import('./SessionAPI').UsageRequestSnapshot;
+}
+
 export interface CompressionEvent extends AgenticEvent {
   compressionId: string;          
   
@@ -1554,6 +1566,19 @@ export class AgentAPI {
   ): () => void {
     return api.listen<AcpContextUsageUpdatedEvent>(
       'agentic://acp-context-usage-updated',
+      callback
+    );
+  }
+
+  /**
+   * Recorded request-context facts for one model request. Non-billing: the
+   * listener feeds the default context overview only.
+   */
+  onRequestContextSnapshotUpdated(
+    callback: (event: RequestContextSnapshotUpdatedEvent) => void
+  ): () => void {
+    return api.listen<RequestContextSnapshotUpdatedEvent>(
+      'agentic://request-context-snapshot-updated',
       callback
     );
   }

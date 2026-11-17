@@ -167,6 +167,12 @@ export interface SessionUsageReportRequest {
   includeSystemPromptPreview?: boolean;
   contextPreviewCategory?: UsageContextCategory;
   contextEstimate?: { includeContents?: boolean; contextOnly?: boolean };
+  /**
+   * Read the recorded request-context snapshot. `{}` asks for the latest
+   * recorded snapshot only (fast metadata path); a fixed `request` plus
+   * `category` asks for one explicit preview of that exact request.
+   */
+  requestSnapshot?: { request?: UsageRequestRef; category?: UsageContextCategory };
 }
 
 export type UsageContextCategory = 'systemPrompt' | 'toolDefinitions' | 'rules' | 'skills' | 'mcpTools' | 'subagentDefinitions';
@@ -194,12 +200,81 @@ export interface UsageContextEstimate {
   unavailableReason?: string;
 }
 
+/**
+ * Identity of one recorded model request. `startedAt` orders attempts only and
+ * is never part of the identity; `attemptId`/`roundId` name the attempt.
+ */
+export interface UsageRequestRef {
+  /** Stable execution host scope; the local host uses `local`. */
+  executionHostId: string;
+  workspaceId?: string;
+  sessionId: string;
+  turnId: string;
+  roundId: string;
+  attemptId: string;
+  attemptIndex: number;
+  startedAt: number;
+}
+
+/** How the recorded input total was obtained for one request. */
+export type UsageRequestUsageState = 'provider_reported' | 'estimated' | 'unknown';
+
+/** Where the recorded request facts originally came from. */
+export type UsageRequestInputSource = 'model_request' | 'legacy_record' | 'unknown';
+
+/** Whether the recorded per-category summary is usable. */
+export type UsageSummaryState = 'pending' | 'ready' | 'unavailable';
+
+/**
+ * Recorded context facts of one parent-session model request.
+ *
+ * Numeric facts only: this is never cumulative billing and never prompt
+ * content. `inputTotal` is the provider-reported total and is never the sum of
+ * `categories`; `estimatedTotal` is always an estimate.
+ */
+export interface UsageRequestSnapshot {
+  schemaVersion: number;
+  request: UsageRequestRef;
+  capturedAt: number;
+  inputSource: UsageRequestInputSource;
+  inputTotal?: number;
+  cachedInputTokens?: number;
+  contextWindow?: number;
+  usageState: UsageRequestUsageState;
+  estimatedTotal?: number;
+  estimationVersion?: number;
+  summaryState: UsageSummaryState;
+  categories?: UsageContextBreakdown;
+  unavailableReason?: string;
+}
+
+/** One explicitly requested category preview from a recorded snapshot. */
+export interface UsageRequestSnapshotPreview {
+  category: UsageContextCategory;
+  content: string;
+  capturedAt: number;
+  /** The actual identity the preview came from; compare it with the request. */
+  request: UsageRequestRef;
+  unavailableReason?: string;
+}
+
+/** Recorded snapshot plus an optional explicitly requested preview. */
+export interface UsageRequestSnapshotView {
+  snapshot: UsageRequestSnapshot;
+  preview?: UsageRequestSnapshotPreview;
+}
+
 export interface SessionUsageReport {
   contextEstimate?: UsageContextEstimate;
   context?: UsageContextBreakdown;
   /** Opt-in view of the latest cached system message, not a historical snapshot. */
   systemPromptPreview?: { content: string; cachedAt: number };
   contextPreview?: { category: UsageContextCategory; content: string; capturedAt: number };
+  /**
+   * Latest recorded parent-session model request. Absent on hosts that predate
+   * the recorded-snapshot mode, and when the session has no recorded request.
+   */
+  requestSnapshot?: UsageRequestSnapshotView;
   schemaVersion: number;
   reportId: string;
   sessionId: string;
@@ -616,6 +691,12 @@ export class SessionAPI {
           ...(request.includeSystemPromptPreview ? { include_system_prompt_preview: true } : {}),
           ...(request.contextEstimate ? { context_estimate: request.contextEstimate } : {}),
           ...(request.contextPreviewCategory ? { context_preview_category: request.contextPreviewCategory } : {}),
+          ...(request.requestSnapshot ? {
+            request_snapshot: {
+              ...(request.requestSnapshot.request ? { request: request.requestSnapshot.request } : {}),
+              ...(request.requestSnapshot.category ? { category: request.requestSnapshot.category } : {}),
+            },
+          } : {}),
         }
       }));
     } catch (error) {

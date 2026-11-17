@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import type { SessionUsageReport } from '@/infrastructure/api/service-api/SessionAPI';
+import type { SessionUsageReport, UsageContextBreakdown, UsageRequestSnapshot } from '@/infrastructure/api/service-api/SessionAPI';
 import { AppearanceCompiler } from '@/infrastructure/appearance/compiler/AppearanceCompiler';
 import { AppearanceRegistry } from '@/infrastructure/appearance/registry/AppearanceRegistry';
 import { appearancePackageValidator } from '@/infrastructure/appearance/schema/AppearancePackageValidator';
@@ -18,6 +18,7 @@ import { SessionUsagePanel } from './SessionUsagePanel';
 import { sessionUsagePanelAppearanceDescriptor } from './appearance';
 import { SessionUsageReportCard } from './SessionUsageReportCard';
 import { USAGE_EXPORT_REDACT_PATHS_STORAGE_KEY } from './usageReportUtils';
+import { flowChatStore } from '../../store/FlowChatStore';
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -53,6 +54,22 @@ vi.mock('react-i18next', async (importOriginal) => ({
         'usage.context.exceedsCapacity': 'Estimated context usage exceeds the reported capacity. Only recorded usage by category is shown.',
         'usage.context.usageOfCapacity': '{{used}} / {{size}}',
         'usage.context.approximateTokens': '~{{value}}',
+        'usage.context.estimated': 'Estimated',
+        'usage.context.estimatedTokens': 'Estimated tokens',
+        'usage.context.providerReportedShort': 'Reported',
+        'usage.context.unknownShort': 'Unknown',
+        'usage.context.unknownUsage': 'No token total was recorded for this request.',
+        'usage.context.noRecordedRequest': 'No recorded model request',
+        'usage.context.snapshotUnsupported': 'This host does not record request context snapshots.',
+        'usage.context.pendingClassification': 'Request captured. Classifying its categories…',
+        'usage.context.summaryUnavailable': 'Category details are no longer available for this request.',
+        'usage.context.estimatedNotReported': 'Estimated from this request\'s own prompt sources. Not a provider-reported total.',
+        'usage.context.providerReported': 'The token total is what the provider reported for this request.',
+        'usage.context.legacyTotal': 'Last known prompt total: {{value}}. This host cannot record request context.',
+        'usage.context.previewStale': 'That preview belongs to a different request and was discarded.',
+        'usage.context.previewUnavailable': 'This session or host has no preview available for this category.',
+        'usage.context.previewFailed': 'Unable to load the preview. Please try again.',
+        'usage.context.previewEmpty': 'This category has no content in the current context.',
         'usage.unavailable': 'Unavailable',
         'usage.redacted': 'Redacted',
         'usage.percent': '{{value}}%',
@@ -269,6 +286,12 @@ function interpolate(template: string, options?: Record<string, unknown>): strin
 }
 
 const USAGE_LOCALE_REQUIRED_KEYS = [
+  'usage.context.pendingClassification',
+  'usage.context.estimatedNotReported',
+  'usage.context.unknownUsage',
+  'usage.context.noRecordedRequest',
+  'usage.context.previewStale',
+  'usage.context.snapshotUnsupported',
   'usage.actions.openFileDiff',
   'usage.actions.openSectionDetails',
   'usage.actions.jumpToTurn',
@@ -453,8 +476,47 @@ function usageReport(overrides: Partial<SessionUsageReport> = {}): SessionUsageR
     },
     ...overrides,
     contextEstimate: overrides.contextEstimate ?? (overrides.context ? { capturedAt: 123, composition: overrides.context } : undefined),
+    requestSnapshot: overrides.requestSnapshot ?? recordedRequestSnapshot(overrides.context),
   };
 }
+
+function recordedRequestSnapshot(
+  context: UsageContextBreakdown | undefined,
+): { snapshot: UsageRequestSnapshot } | undefined {
+  if (!context) {
+    return undefined;
+  }
+  const estimatedTotal = REQUEST_SNAPSHOT_TEST_CATEGORIES
+    .reduce((sum, key) => sum + (Number.isFinite(context[key]) ? context[key] : 0), 0);
+  return {
+    snapshot: {
+      schemaVersion: 1,
+      request: {
+        executionHostId: 'local',
+        workspaceId: 'workspace-1',
+        sessionId: 'session-1',
+        turnId: 'turn-1',
+        roundId: 'round-1',
+        attemptId: 'round-1:attempt:1',
+        attemptIndex: 1,
+        startedAt: Date.UTC(2026, 4, 10, 8, 0),
+      },
+      capturedAt: 123,
+      inputSource: 'model_request',
+      inputTotal: estimatedTotal,
+      usageState: 'provider_reported',
+      estimatedTotal,
+      estimationVersion: 1,
+      summaryState: 'ready',
+      categories: context,
+    },
+  };
+}
+
+const REQUEST_SNAPSHOT_TEST_CATEGORIES = [
+  'systemPrompt', 'toolDefinitions', 'rules', 'skills', 'mcpTools',
+  'subagentDefinitions', 'summarizedConversation', 'conversation',
+] as const;
 
 function collectLeafPaths(value: unknown, prefix = ''): string[] {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -1135,15 +1197,21 @@ describe('Session usage report UI components', () => {
     act(() => { button.focus(); button.click(); });
     expect(button.disabled).toBe(true);
     expect(promptPreviewMocks.open).toHaveBeenCalledExactlyOnceWith({
-      sessionId: 'session-1', reportSessionId: 'session-1', workspaceId: 'workspace-1', title: `usage.context.categories.${category}${category === 'toolDefinitions' ? '' : '.md'}`, category, emptyContent: 'usage.context.previewEmpty', estimate: undefined, onEstimate: expect.any(Function),
+      sessionId: 'session-1', reportSessionId: 'session-1', workspaceId: 'workspace-1', title: `usage.context.categories.${category}${category === 'toolDefinitions' ? '' : '.md'}`, category, emptyContent: 'This category has no content in the current context.',
+      // The preview is pinned to the recorded request the panel is showing.
+      request: {
+        executionHostId: 'local', workspaceId: 'workspace-1', sessionId: 'session-1', turnId: 'turn-1',
+        roundId: 'round-1', attemptId: 'round-1:attempt:1', attemptIndex: 1, startedAt: Date.UTC(2026, 4, 10, 8, 0),
+      },
+      estimate: undefined, onEstimate: expect.any(Function), onUnavailableReason: expect.any(Function),
     });
     expect(container.querySelector('.session-usage-panel__donut-segment[data-usage-category="conversation"]')?.hasAttribute('data-usage-muted')).toBe(true);
     await act(async () => finish('unavailable'));
     expect(button.disabled).toBe(false);
-    expect(promptPreviewMocks.warning).toHaveBeenCalledWith('usage.context.previewUnavailable');
+    expect(promptPreviewMocks.warning).toHaveBeenCalledWith('This session or host has no preview available for this category.');
     promptPreviewMocks.open.mockRejectedValueOnce(new Error('Host offline'));
     await act(async () => button.click());
-    expect(promptPreviewMocks.error).toHaveBeenCalledWith('usage.context.previewFailed');
+    expect(promptPreviewMocks.error).toHaveBeenCalledWith('Unable to load the preview. Please try again.');
   });
 
   it.each([
@@ -1237,7 +1305,7 @@ describe('Session usage report UI components', () => {
         tokens: { source: 'token_usage_records', inputTokens: 80, outputTokens: 20, totalTokens: 100,
           cachedTokens: 60, cacheCoverage, cacheHitRate: 0.8 },
       })} />);
-      expect(container.querySelector('.session-usage-panel__context')?.textContent).toContain('No context breakdown recorded');
+      expect(container.querySelector('.session-usage-panel__context')?.textContent).toContain('No recorded model request');
       expect(container.querySelector('.session-usage-panel__donut')).toBeNull();
       if (cacheCoverage === 'partial') {
         const cachedSegment = container.querySelector<HTMLElement>('.session-usage-panel__bar-segment[data-usage-category="cachedInput"]');
@@ -1511,28 +1579,39 @@ describe('Session usage report UI components', () => {
       .toEqual(['OpenBitFun', '1.5K', '~133.3K / 256K']);
   });
 
-  it('keeps legacy context values unavailable and distinguishes a recorded empty context', () => {
+  it('keeps an unrecorded context unavailable and never turns a legacy zero into a measurement', () => {
     render(<SessionUsagePanel report={usageReport()} />);
     const factValues = () => Array.from(container.querySelectorAll('.session-usage-panel__summary-facts dd'))
       .map(node => node.textContent);
     expect(factValues()).toEqual(['openbitfun', '1.5K', 'Unavailable']);
+    expect(container.querySelector('.session-usage-panel__context')?.textContent).toContain('No recorded model request');
 
     const emptyContext = {
       systemPrompt: 0, toolDefinitions: 0, rules: 0, skills: 0,
       mcpTools: 0, subagentDefinitions: 0, summarizedConversation: 0, conversation: 0,
     };
+    // An old payload carries neither a recorded snapshot nor a rebuild estimate.
     const legacyReport = usageReport({ context: emptyContext });
     delete legacyReport.contextEstimate;
+    delete legacyReport.requestSnapshot;
     render(<SessionUsagePanel report={legacyReport} />);
+    expect(factValues()).toEqual(['openbitfun', '1.5K', 'Unavailable']);
+
+    // A host that reported nothing for this request only ever recorded a zero
+    // ledger total, which is not a measurement.
+    const legacyZero = usageReport({ context: emptyContext });
+    legacyZero.requestSnapshot!.snapshot.inputSource = 'legacy_record';
+    legacyZero.requestSnapshot!.snapshot.usageState = 'unknown';
+    render(<SessionUsagePanel report={legacyZero} />);
     expect(factValues()).toEqual(['openbitfun', '1.5K', 'Unavailable']);
 
     render(<SessionUsagePanel report={usageReport({ context: emptyContext })} />);
     expect(factValues()).toEqual(['openbitfun', '1.5K', '~0 / Unavailable']);
 
     render(<SessionUsagePanel report={usageReport({
-      context: { ...emptyContext, conversation: Number.NaN, contextWindow: 256_000 },
+      context: { ...emptyContext, contextWindow: 256_000 },
     })} />);
-    expect(factValues()).toEqual(['openbitfun', '1.5K', 'Unavailable / 256K']);
+    expect(factValues()).toEqual(['openbitfun', '1.5K', '~0 / 256K']);
 
     for (const context of [
       { ...emptyContext, conversation: -1, contextWindow: 0 },
@@ -1540,14 +1619,108 @@ describe('Session usage report UI components', () => {
       { ...emptyContext, conversation: Number.MAX_SAFE_INTEGER, systemPrompt: 1, contextWindow: Infinity },
     ]) {
       render(<SessionUsagePanel report={usageReport({ context })} />);
-      expect(factValues()).toEqual(['openbitfun', '1.5K', 'Unavailable']);
+      expect(factValues()[2]).toMatch(/Unavailable$/);
     }
+
+    // Invalid recorded counts disable the category rows instead of printing them.
+    render(<SessionUsagePanel report={usageReport({
+      context: { ...emptyContext, conversation: Number.NaN, contextWindow: 256_000 },
+    })} />);
+    expect(container.querySelectorAll('.session-usage-panel__context .session-usage-panel__legend-row')).toHaveLength(0);
+    expect(container.querySelector('.session-usage-panel__context')?.textContent)
+      .toContain('Category details are no longer available for this request.');
 
     render(<SessionUsagePanel report={usageReport({
       context: { ...emptyContext, contextWindow: 256_000 },
       tokens: { source: 'unavailable', cacheCoverage: 'unavailable' },
     })} />);
     expect(factValues()).toEqual(['openbitfun', 'Unavailable', '~0 / 256K']);
+  });
+
+  it('labels an estimated recorded request as non-reported', () => {
+    const report = usageReport({ context: {
+      systemPrompt: 100, toolDefinitions: 50, rules: 0, skills: 0,
+      mcpTools: 0, subagentDefinitions: 0, summarizedConversation: 0, conversation: 850,
+      contextWindow: 100_000,
+    } });
+    report.requestSnapshot!.snapshot.usageState = 'estimated';
+    render(<SessionUsagePanel report={report} />);
+
+    const facts = Array.from(container.querySelectorAll('.session-usage-panel__summary-facts dd'))
+      .map(node => node.textContent);
+    expect(facts[2]).toBe('~1K / 100K');
+    // The reading is visibly labelled non-reported instead of being presented as provider data.
+    expect(container.querySelector('.session-usage-panel__chart-meta')?.textContent).toBe('Estimated');
+  });
+
+  it('keeps provider totals while the categories are still being classified', () => {
+    const report = usageReport({ context: {
+      systemPrompt: 100, toolDefinitions: 0, rules: 0, skills: 0,
+      mcpTools: 0, subagentDefinitions: 0, summarizedConversation: 0, conversation: 900,
+      contextWindow: 10_000,
+    } });
+    report.requestSnapshot!.snapshot.summaryState = 'pending';
+    render(<SessionUsagePanel report={report} />);
+
+    const facts = Array.from(container.querySelectorAll('.session-usage-panel__summary-facts dd'))
+      .map(node => node.textContent);
+    expect(facts[2]).toBe('~1K / 10K');
+    expect(container.querySelectorAll('.session-usage-panel__context .session-usage-panel__legend-row')).toHaveLength(0);
+    expect(container.querySelector('.session-usage-panel__context')?.textContent)
+      .toContain('Request captured. Classifying its categories…');
+  });
+
+  const contextFact = () => container.querySelectorAll('.session-usage-panel__summary-facts dd')[2]?.textContent;
+
+  it('clears the previous session reading instead of showing it for a session without one', () => {
+    render(<SessionUsagePanel report={usageReport({ context: {
+      systemPrompt: 100, toolDefinitions: 0, rules: 0, skills: 0,
+      mcpTools: 0, subagentDefinitions: 0, summarizedConversation: 0, conversation: 900,
+      contextWindow: 10_000,
+    } })} />);
+    expect(contextFact()).toBe('~1K / 10K');
+
+    // Another session has no recorded request: the panel must not keep the
+    // previous session's numbers on screen.
+    render(<SessionUsagePanel report={usageReport({ sessionId: 'session-2' })} />);
+    expect(contextFact()).toBe('Unavailable');
+    expect(container.querySelector('.session-usage-panel__context')?.textContent)
+      .toContain('No recorded model request');
+  });
+
+  it('follows the stored reading an event delivers while the panel is open', () => {
+    flowChatStore.setState(state => ({
+      ...state,
+      sessions: new Map([['session-1', { sessionId: 'session-1', config: { agentType: 'Standard' } }]]),
+    }) as never);
+    render(<SessionUsagePanel report={usageReport()} />);
+    expect(contextFact()).toBe('Unavailable');
+
+    act(() => {
+      flowChatStore.setRequestContextSnapshot('session-1', {
+        schemaVersion: 1,
+        request: {
+          executionHostId: 'local', workspaceId: 'workspace-1', sessionId: 'session-1',
+          turnId: 'turn-1', roundId: 'round-1', attemptId: 'round-1:attempt:1',
+          attemptIndex: 1, startedAt: 100,
+        },
+        capturedAt: 200, inputSource: 'model_request', inputTotal: 2000,
+        usageState: 'provider_reported', estimatedTotal: 2000, summaryState: 'ready',
+        categories: {
+          systemPrompt: 2000, toolDefinitions: 0, rules: 0, skills: 0, mcpTools: 0,
+          subagentDefinitions: 0, summarizedConversation: 0, conversation: 0, contextWindow: 8000,
+        },
+      });
+    });
+
+    // The panel, the ring and the overview read one stored reading.
+    expect(contextFact()).toBe('~2K / 8K');
+    expect(container.querySelectorAll('.session-usage-panel__context .session-usage-panel__legend-row').length)
+      .toBeGreaterThan(0);
+
+    act(() => {
+      flowChatStore.setState(state => ({ ...state, sessions: new Map() }) as never);
+    });
   });
 
 });

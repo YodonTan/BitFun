@@ -7,6 +7,8 @@ export const contextUsagePopoverAppearanceDescriptor: AppearanceSurfaceDescripto
     { id: 'root' }, { id: 'header' }, { id: 'totals' }, { id: 'body', propertyProfile: 'layout' },
     { id: 'bar', propertyProfile: 'layout' },
     { id: 'legend' }, { id: 'item' }, { id: 'status', propertyProfile: 'paint', visualRole: 'content' },
+    { id: 'estimateNote', propertyProfile: 'paint', visualRole: 'content' },
+    { id: 'legacyTotal', propertyProfile: 'paint', visualRole: 'content' },
   ],
 };
 
@@ -40,6 +42,8 @@ export const sessionUsagePanelAppearanceDescriptor: AppearanceSurfaceDescriptor 
     { id: 'tokenGroup', propertyProfile: 'layout' },
     { id: 'legendDetail', propertyProfile: 'paint', visualRole: 'content' },
     { id: 'legendShare', propertyProfile: 'layout' },
+    { id: 'contextPending', propertyProfile: 'paint', visualRole: 'content' },
+    { id: 'contextSource', propertyProfile: 'paint', visualRole: 'content' },
   ],
   states: [
     { id: 'fallback', selector: { kind: 'self', suffix: '[data-openbitfun-state~="fallback"]' } },

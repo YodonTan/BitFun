@@ -82,7 +82,11 @@ export async function runUsageReportCommand(
         sessionId: params.session.sessionId,
         workspaceId: requireSessionOwningWorkspaceId(params.session),
         includeHiddenSubagents: true,
-        contextEstimate: { includeContents: !!params.presentReport, contextOnly: !!params.presentReport },
+        // A normal report carries the recorded request snapshot the context
+        // section reads. Sending `requestSnapshot` would select the
+        // snapshot-only fast mode and starve the cumulative totals, so this
+        // request never asks for it; the estimate stays an independent,
+        // explicitly requested inspection.
       });
     const report = enrichUsageReportModelIdentity(rawReport, params.session);
     if (!surface.isCurrent()) return { shown: false };

@@ -38,7 +38,8 @@ import {
 } from './thread-goal/ThreadGoalStripControl';
 import { formatCompactTokenCount } from '../utils/tokenUsageDisplay';
 import { ContextUsagePopover } from './usage/ContextUsagePopover';
-import type { UsageContextEstimate } from '@/infrastructure/api/service-api/SessionAPI';
+import type { UsageRequestSnapshot, UsageRequestUsageState } from '@/infrastructure/api/service-api/SessionAPI';
+import type { RequestContextSnapshotReadResult } from '../services/requestContextSnapshotService';
 import './ChatInputWorkspaceStrip.scss';
 
 export interface ChatInputWorkspaceStripProps {
@@ -57,7 +58,14 @@ export interface ChatInputWorkspaceStripProps {
     sessionKey?: string;
     anchorRef?: React.RefObject<HTMLElement>;
     previewSession?: { sessionId: string; workspaceId?: string };
-    loadContext?: () => Promise<UsageContextEstimate | undefined>;
+    /** Latest recorded request snapshot for this Session; the ring reads it. */
+    snapshot?: UsageRequestSnapshot;
+    /** Fast snapshot-only read; opening the overview issues only this. */
+    loadSnapshot?: () => Promise<RequestContextSnapshotReadResult>;
+    /** The rendered host does not advertise the recorded-snapshot mode. */
+    snapshotUnsupported?: boolean;
+    /** Label for a non-reported total, or undefined when U is provider-reported. */
+    snapshotState?: UsageRequestUsageState;
     compactDisabled?: boolean;
     onCompact?: () => void;
     onOpen: () => void;
@@ -523,7 +531,13 @@ export const ChatInputWorkspaceStrip: React.FC<ChatInputWorkspaceStripProps> = (
   const usagePercentage = usageMaxTokens > 0
     ? Math.min(100, Math.max(0, Math.round((usageCurrentTokens / usageMaxTokens) * 100)))
     : 0;
-  const usageTooltip = `${formatCompactTokenCount(usageCurrentTokens)}/${formatCompactTokenCount(usageMaxTokens)} ${usagePercentage}%`;
+  // A missing recorded total is not a zero measurement: say so instead of
+  // presenting "0/max 0%" as if it had been reported.
+  const usageTooltip = usageCurrentTokens > 0 && usageMaxTokens > 0
+    ? `${formatCompactTokenCount(usageCurrentTokens)}/${formatCompactTokenCount(usageMaxTokens)} ${usagePercentage}%${
+      usageReport?.snapshotState === 'estimated' ? ` · ${t('usage.context.estimated')}` : ''
+    }`
+    : t('usage.context.unknownUsage');
   const usageDash = `${((usagePercentage / 100) * 62.83).toFixed(2)} 62.83`;
 
   const handleWorktreeChange = (enabled: boolean) => {
@@ -1157,7 +1171,9 @@ export const ChatInputWorkspaceStrip: React.FC<ChatInputWorkspaceStripProps> = (
             triggerRef={usageTriggerRef}
             currentTokens={usageCurrentTokens}
             maxTokens={usageMaxTokens}
-            loadContext={usageReport.loadContext}
+            snapshot={usageReport.snapshot}
+            loadSnapshot={usageReport.loadSnapshot}
+            unsupported={usageReport.snapshotUnsupported}
             previewSession={usageReport.previewSession}
             onClose={() => setUsagePopoverOpen(false)}
             compactDisabled={usageReport.compactDisabled}

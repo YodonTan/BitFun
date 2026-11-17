@@ -159,4 +159,34 @@ describe('system prompt preview tabs', () => {
     expect(tabs()).toHaveLength(0);
   });
 
+  it('opens a preview pinned to one recorded request and discards another request\'s echo', async () => {
+    const request = {
+      executionHostId: 'local', workspaceId: params.workspaceId, sessionId: params.sessionId,
+      turnId: 'turn-1', roundId: 'round-1', attemptId: 'round-1:attempt:1', attemptIndex: 1, startedAt: 100,
+    };
+    const recorded = {
+      schemaVersion: 1, request, capturedAt: 123, inputSource: 'model_request' as const,
+      inputTotal: 900, usageState: 'provider_reported' as const, estimatedTotal: 1000,
+      summaryState: 'ready' as const,
+    };
+    apiMocks.getSessionUsageReport.mockResolvedValue({ sessionId: params.sessionId,
+      requestSnapshot: { snapshot: recorded, preview: { category: 'systemPrompt', content: '# Recorded request prompt', capturedAt: 9, request } } });
+
+    await expect(openSessionContextPreview({ ...params, request })).resolves.toBe('opened');
+    // The read names the exact request and category it wants.
+    expect(apiMocks.getSessionUsageReport).toHaveBeenLastCalledWith({
+      sessionId: params.sessionId, workspaceId: params.workspaceId, includeHiddenSubagents: false,
+      requestSnapshot: { request, category: 'systemPrompt' },
+    });
+    expect(tabs()[0].content.data.initialContent).toBe('# Recorded request prompt');
+
+    const other = { ...request, attemptId: 'round-1:attempt:2' };
+    apiMocks.getSessionUsageReport.mockResolvedValue({ sessionId: params.sessionId,
+      requestSnapshot: { snapshot: { ...recorded, request: other },
+        preview: { category: 'systemPrompt', content: '# Another request', capturedAt: 9, request: other } } });
+    await expect(openSessionContextPreview({ ...params, request })).resolves.toBe('stale');
+    expect(tabs()).toHaveLength(1);
+    expect(tabs()[0].content.data.initialContent).toBe('# Recorded request prompt');
+  });
+
 });

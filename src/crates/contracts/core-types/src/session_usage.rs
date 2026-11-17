@@ -39,6 +39,9 @@ pub struct SessionUsageReport {
     /// One explicitly requested category from the latest host-owned request snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_preview: Option<UsageContextPreview>,
+    /// Latest recorded parent-session model request, numeric only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_snapshot: Option<UsageRequestSnapshotView>,
     #[serde(default)]
     pub models: Vec<UsageModelBreakdown>,
     #[serde(default)]
@@ -119,6 +122,139 @@ pub struct UsageContextBreakdown {
     pub conversation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+}
+
+/// Wire version of the recorded request-context snapshot contract.
+pub const REQUEST_CONTEXT_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+/// Version of the numeric estimation policy that produced `estimated_total`.
+pub const REQUEST_CONTEXT_ESTIMATION_VERSION: u16 = 1;
+
+/// Stable identity of one recorded model request. `started_at` only orders
+/// attempts and is never part of the identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRequestRef {
+    /// Stable execution host scope; the local host uses `"local"`.
+    pub execution_host_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    pub session_id: String,
+    pub turn_id: String,
+    pub round_id: String,
+    /// Existing attempt identity of the model request.
+    pub attempt_id: String,
+    pub attempt_index: u32,
+    /// Ordering only, never identity.
+    pub started_at: i64,
+}
+
+impl UsageRequestRef {
+    /// Whether both references name the same recorded model request.
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.execution_host_id == other.execution_host_id
+            && self.workspace_id == other.workspace_id
+            && self.session_id == other.session_id
+            && self.turn_id == other.turn_id
+            && self.round_id == other.round_id
+            && self.attempt_id == other.attempt_id
+    }
+}
+
+/// Where the recorded request facts originally came from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageRequestInputSource {
+    ModelRequest,
+    LegacyRecord,
+    #[serde(other)]
+    Unknown,
+}
+
+/// How the recorded input total was obtained for one request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageRequestUsageState {
+    /// Provider-reported normalized input total; the authoritative value.
+    ProviderReported,
+    /// Same-attempt estimate only; explicitly not a reported total.
+    Estimated,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Whether the recorded per-category summary is usable.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageSummaryState {
+    Pending,
+    Ready,
+    Unavailable,
+}
+
+/// Numeric-only recorded context facts for one model request. Never cumulative
+/// billing and never prompt content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRequestSnapshot {
+    pub schema_version: u16,
+    pub request: UsageRequestRef,
+    pub captured_at: u64,
+    pub input_source: UsageRequestInputSource,
+    /// Provider-reported normalized input total. Never a category sum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_total: Option<u64>,
+    /// The attempt's resolved context capacity. Present even while the summary
+    /// or the usage total is still pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    pub usage_state: UsageRequestUsageState,
+    /// Sum of the same-attempt per-category estimates. Always an estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimation_version: Option<u16>,
+    pub summary_state: UsageSummaryState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub categories: Option<UsageContextBreakdown>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+/// Explicit read of one recorded request snapshot. An unknown or unsupported
+/// read request degrades instead of failing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRequestSnapshotReadRequest {
+    /// Exact expected identity; the response echoes the actual identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<UsageRequestRef>,
+    /// Present for a lazy single-category preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<UsageContextCategory>,
+}
+
+/// One explicitly requested category preview from a recorded snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRequestSnapshotPreview {
+    pub category: UsageContextCategory,
+    pub content: String,
+    pub captured_at: u64,
+    /// The actual identity the preview came from.
+    pub request: UsageRequestRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+/// Recorded snapshot plus an optional explicitly requested preview.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRequestSnapshotView {
+    pub snapshot: UsageRequestSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<UsageRequestSnapshotPreview>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -504,6 +640,7 @@ impl SessionUsageReport {
             context_estimate: None,
             system_prompt_preview: None,
             context_preview: None,
+            request_snapshot: None,
             models: vec![],
             tools: vec![],
             files: UsageFileBreakdown {

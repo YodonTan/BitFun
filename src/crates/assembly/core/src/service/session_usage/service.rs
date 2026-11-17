@@ -1,3 +1,6 @@
+use crate::agentic::execution::{
+    materialize_request_context_preview, request_context_summary_is_live, RequestContextPreview,
+};
 use crate::agentic::persistence::PersistenceManager;
 use crate::service::session::{
     collect_hidden_subagent_cascade, DialogTurnData, DialogTurnKind, ModelRoundData,
@@ -47,6 +50,18 @@ pub async fn generate_session_usage_report_from_storage_path(
     session_storage_path: &Path,
     request: SessionUsageReportRequest,
 ) -> OpenBitFunResult<SessionUsageReport> {
+    // An explicit recorded-snapshot read is independent of cumulative
+    // accounting: it reads already-loaded Session metadata only and never loads
+    // Turns, queries the token ledger, rebuilds a context, or estimates one.
+    if request.request_snapshot.is_some() {
+        return generate_recorded_request_snapshot_report(
+            persistence_manager,
+            session_storage_path,
+            request,
+        )
+        .await;
+    }
+
     let revert_boundary = persistence_manager
         .load_session_revert_state(session_storage_path, &request.session_id)
         .await?
@@ -82,6 +97,24 @@ pub async fn generate_session_usage_report_from_storage_path(
         .await
         .ok()
         .and_then(|session| session.config.workspace_id);
+    // The side panel shows the recorded request context next to cumulative
+    // totals, so attach the numeric snapshot from the same metadata read.
+    // The snapshot view is additive: a metadata record this process cannot read
+    // degrades that view only and never fails the cumulative report.
+    let recorded_request_snapshot = match persistence_manager
+        .load_session_metadata(session_storage_path, &request.session_id)
+        .await
+    {
+        Ok(metadata) => metadata.and_then(|metadata| metadata.last_recorded_request_snapshot),
+        Err(error) => {
+            log::debug!(
+                "Usage report continues without a recorded request snapshot: session_id={}, error={}",
+                request.session_id,
+                error
+            );
+            None
+        }
+    };
     let snapshot_facts =
         load_snapshot_facts(&request, workspace_id.as_deref(), revert_boundary).await;
 
@@ -136,7 +169,166 @@ pub async fn generate_session_usage_report_from_storage_path(
         system_prompt_preview.is_some() || context_preview.is_some();
     report.system_prompt_preview = system_prompt_preview;
     report.context_preview = context_preview;
+    report.request_snapshot = recorded_request_snapshot.map(|snapshot| {
+        openbitfun_core_types::UsageRequestSnapshotView {
+            snapshot: degrade_dead_pending_request_snapshot(snapshot),
+            preview: None,
+        }
+    });
     Ok(report)
+}
+
+/// Coverage note when no recorded request snapshot is persisted for the session.
+const REQUEST_SNAPSHOT_MISSING_NOTE: &str =
+    "Session metadata records no request context snapshot (older host or earlier session).";
+/// Coverage note identifying a snapshot-only report.
+const REQUEST_SNAPSHOT_ONLY_NOTE: &str =
+    "Report reads the recorded request context snapshot only; cumulative usage was not scanned.";
+/// Explicit degradation when a recorded summary can never complete.
+const REQUEST_SNAPSHOT_SUMMARY_NOT_LIVE: &str =
+    "the recorded request summary never completed in this runtime";
+/// Explicit degradation when the caller asked about another recorded request.
+const REQUEST_SNAPSHOT_STALE_IDENTITY: &str = "stale request identity";
+/// External agents own their request context and never expose it to this host.
+const EXTERNAL_AGENT_REQUEST_SNAPSHOT_UNSUPPORTED: &str =
+    "external agent does not expose a recorded request context snapshot";
+
+/// Degrade a recorded snapshot whose summary can never complete.
+///
+/// A restarted process retains no summary job, so a still-pending summary would
+/// otherwise read as "already recorded, still classifying" forever. This is the
+/// single owner of that rule: both the explicit snapshot read and the cumulative
+/// report carry the same view, and neither persists the degraded copy.
+fn degrade_dead_pending_request_snapshot(
+    snapshot: openbitfun_core_types::UsageRequestSnapshot,
+) -> openbitfun_core_types::UsageRequestSnapshot {
+    if snapshot.summary_state != openbitfun_core_types::UsageSummaryState::Pending
+        || request_context_summary_is_live(&snapshot.request)
+    {
+        return snapshot;
+    }
+    let mut degraded = snapshot;
+    degraded.summary_state = openbitfun_core_types::UsageSummaryState::Unavailable;
+    degraded.categories = None;
+    degraded.estimated_total = None;
+    degraded.unavailable_reason = Some(REQUEST_SNAPSHOT_SUMMARY_NOT_LIVE.to_string());
+    degraded
+}
+
+/// Report one recorded model request from already-loaded Session metadata.
+///
+/// This is the independent snapshot read mode: no Turn load, no token-ledger
+/// query, no snapshot-fact load, no prompt-cache read, and no context rebuild or
+/// estimate. Every unavailable fact stays explicitly unavailable instead of
+/// being filled from the current context.
+async fn generate_recorded_request_snapshot_report(
+    persistence_manager: &PersistenceManager,
+    session_storage_path: &Path,
+    request: SessionUsageReportRequest,
+) -> OpenBitFunResult<SessionUsageReport> {
+    let generated_at = Utc::now().timestamp_millis();
+    let mut report = SessionUsageReport::partial_unavailable(&request.session_id, generated_at);
+    report.report_id = format!("usage-{}-{}", request.session_id, generated_at);
+    report.workspace = build_workspace(&request);
+    report.coverage.available = vec![UsageCoverageKey::WorkspaceIdentity];
+    report.coverage.notes.push(REQUEST_SNAPSHOT_ONLY_NOTE.to_string());
+
+    let metadata = persistence_manager
+        .load_session_metadata(session_storage_path, &request.session_id)
+        .await?;
+    let agent_type = match metadata.as_ref() {
+        Some(metadata) => Some(metadata.agent_type.clone()),
+        None => {
+            recorded_session_agent_type(
+                persistence_manager,
+                session_storage_path,
+                &request.session_id,
+            )
+            .await
+        }
+    };
+    if agent_type
+        .as_deref()
+        .is_some_and(|agent_type| agent_type.starts_with("acp:"))
+    {
+        return Err(OpenBitFunError::NotImplemented(
+            EXTERNAL_AGENT_REQUEST_SNAPSHOT_UNSUPPORTED.to_string(),
+        ));
+    }
+
+    let recorded = metadata.and_then(|metadata| metadata.last_recorded_request_snapshot);
+    let Some(recorded) = recorded else {
+        report.coverage.notes.push(REQUEST_SNAPSHOT_MISSING_NOTE.to_string());
+        return Ok(report);
+    };
+
+    let snapshot = degrade_dead_pending_request_snapshot(recorded);
+
+    let read = request.request_snapshot.clone().unwrap_or_default();
+    let stale_identity = read
+        .request
+        .as_ref()
+        .is_some_and(|expected| !snapshot.request.same_identity(expected));
+    let preview = read
+        .category
+        .map(|category| recorded_request_snapshot_preview(&snapshot, category, stale_identity));
+    report.privacy.prompt_content_included = preview
+        .as_ref()
+        .is_some_and(|preview| !preview.content.is_empty());
+    report.request_snapshot =
+        Some(openbitfun_core_types::UsageRequestSnapshotView { snapshot, preview });
+    Ok(report)
+}
+
+/// Render exactly one category from the retained source of the recorded request
+/// and echo the identity it actually came from.
+fn recorded_request_snapshot_preview(
+    snapshot: &openbitfun_core_types::UsageRequestSnapshot,
+    category: openbitfun_core_types::UsageContextCategory,
+    stale_identity: bool,
+) -> openbitfun_core_types::UsageRequestSnapshotPreview {
+    if stale_identity {
+        // The caller asked about a different recorded request. Return the actual
+        // identity with no content instead of another request or the current one.
+        return openbitfun_core_types::UsageRequestSnapshotPreview {
+            category,
+            content: String::new(),
+            captured_at: snapshot.captured_at,
+            request: snapshot.request.clone(),
+            unavailable_reason: Some(REQUEST_SNAPSHOT_STALE_IDENTITY.to_string()),
+        };
+    }
+    let (content, captured_at, unavailable_reason) =
+        match materialize_request_context_preview(&snapshot.request, category) {
+            RequestContextPreview::Available {
+                content,
+                captured_at,
+            } => (content, captured_at, None),
+            RequestContextPreview::Unavailable { reason } => {
+                (String::new(), snapshot.captured_at, Some(reason))
+            }
+        };
+    openbitfun_core_types::UsageRequestSnapshotPreview {
+        category,
+        content,
+        captured_at,
+        request: snapshot.request.clone(),
+        unavailable_reason,
+    }
+}
+
+/// Agent identity used only to reject a recorded-snapshot read for a session
+/// without metadata. Legacy sessions omit metadata but still carry a header.
+async fn recorded_session_agent_type(
+    persistence_manager: &PersistenceManager,
+    session_storage_path: &Path,
+    session_id: &str,
+) -> Option<String> {
+    persistence_manager
+        .load_session_header(session_storage_path, session_id)
+        .await
+        .ok()
+        .map(|session| session.agent_type)
 }
 
 fn token_usage_query(request: &SessionUsageReportRequest) -> TokenUsageQuery {
@@ -1771,6 +1963,561 @@ mod tests {
         assert!(!stale.privacy.prompt_content_included);
     }
 
+    const RECORDED_SESSION_ID: &str = "session-recorded";
+    const RECORDED_TURN_ID: &str = "turn-recorded";
+    const RECORDED_ROUND_ID: &str = "round-recorded";
+
+    fn recorded_request_ref(attempt_id: &str) -> openbitfun_core_types::UsageRequestRef {
+        openbitfun_core_types::UsageRequestRef {
+            execution_host_id: "local".to_string(),
+            workspace_id: Some("workspace-recorded".to_string()),
+            session_id: RECORDED_SESSION_ID.to_string(),
+            turn_id: RECORDED_TURN_ID.to_string(),
+            round_id: RECORDED_ROUND_ID.to_string(),
+            attempt_id: attempt_id.to_string(),
+            attempt_index: 1,
+            started_at: 1_778_347_200_000,
+        }
+    }
+
+    fn recorded_request_snapshot(
+        summary_state: openbitfun_core_types::UsageSummaryState,
+    ) -> openbitfun_core_types::UsageRequestSnapshot {
+        openbitfun_core_types::UsageRequestSnapshot {
+            schema_version: openbitfun_core_types::REQUEST_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
+            request: recorded_request_ref("attempt-recorded"),
+            captured_at: 1_778_347_200_100,
+            input_source: openbitfun_core_types::UsageRequestInputSource::ModelRequest,
+            input_total: Some(12_345),
+            context_window: Some(200_000),
+            cached_input_tokens: None,
+            usage_state: openbitfun_core_types::UsageRequestUsageState::ProviderReported,
+            estimated_total: Some(1_000),
+            estimation_version: Some(openbitfun_core_types::REQUEST_CONTEXT_ESTIMATION_VERSION),
+            summary_state,
+            categories: Some(openbitfun_core_types::UsageContextBreakdown {
+                system_prompt: 400,
+                tool_definitions: 600,
+                ..Default::default()
+            }),
+            unavailable_reason: None,
+        }
+    }
+
+    fn recorded_dialog_turn() -> DialogTurnData {
+        let mut turn = test_turn_with_tools(
+            RECORDED_TURN_ID,
+            0,
+            DialogTurnKind::UserDialog,
+            vec![test_tool_item(
+                "tool-recorded",
+                "write_file",
+                Some(true),
+                120,
+                "D:/workspace/openbitfun/src/main.rs",
+            )],
+        );
+        turn.session_id = RECORDED_SESSION_ID.to_string();
+        turn
+    }
+
+    async fn persistence_with_recorded_session(
+        agent_type: &str,
+        snapshot: Option<openbitfun_core_types::UsageRequestSnapshot>,
+    ) -> (tempfile::TempDir, std::path::PathBuf, PersistenceManager) {
+        use crate::agentic::core::Session;
+        use crate::infrastructure::PathManager;
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = dunce::canonicalize(temp.path()).unwrap();
+        crate::service::workspace::legacy_compat::register_local_fixture_blocking(&storage);
+        let persistence = PersistenceManager::new(Arc::new(PathManager::with_user_root_for_tests(
+            storage.join("user-root"),
+        )))
+        .unwrap();
+        let mut session = Session::new("Recorded".into(), agent_type.into(), Default::default());
+        session.session_id = RECORDED_SESSION_ID.into();
+        persistence.save_session(&storage, &session).await.unwrap();
+        if let Some(snapshot) = snapshot {
+            persistence
+                .update_session_metadata(&storage, RECORDED_SESSION_ID, move |metadata| {
+                    assert!(crate::service::session::apply_last_recorded_request_snapshot(
+                        metadata,
+                        snapshot.clone()
+                    ));
+                })
+                .await
+                .unwrap();
+        }
+        (temp, storage, persistence)
+    }
+
+    fn recorded_snapshot_read_request(
+        remote_connection_id: Option<&str>,
+        read: openbitfun_core_types::UsageRequestSnapshotReadRequest,
+    ) -> SessionUsageReportRequest {
+        let mut request = test_request(remote_connection_id);
+        request.session_id = RECORDED_SESSION_ID.to_string();
+        request.request_snapshot = Some(read);
+        request
+    }
+
+    /// Persisted metadata record of the recorded test session.
+    fn recorded_session_metadata_path(storage: &Path) -> std::path::PathBuf {
+        use crate::infrastructure::PathManager;
+        PathManager::with_user_root_for_tests(storage.join("user-root"))
+            .project_sessions_dir(storage)
+            .join(RECORDED_SESSION_ID)
+            .join("metadata.json")
+    }
+
+    fn recorded_full_report_request() -> SessionUsageReportRequest {
+        let mut request = test_request(None);
+        request.session_id = RECORDED_SESSION_ID.to_string();
+        request
+    }
+
+    #[tokio::test]
+    async fn recorded_request_snapshot_read_skips_turns_and_cumulative_accounting() {
+        let snapshot =
+            recorded_request_snapshot(openbitfun_core_types::UsageSummaryState::Ready);
+        let (_temp, storage, persistence) =
+            persistence_with_recorded_session("Standard", Some(snapshot.clone())).await;
+        // A persisted Turn would feed a cumulative report. The snapshot read
+        // must not load or aggregate it.
+        persistence
+            .save_dialog_turn(&storage, &recorded_dialog_turn())
+            .await
+            .unwrap();
+        let mut request = recorded_snapshot_read_request(
+            Some("ssh-host"),
+            openbitfun_core_types::UsageRequestSnapshotReadRequest::default(),
+        );
+        request.workspace_path = Some("/remote/project".into());
+
+        let report =
+            generate_session_usage_report_from_storage_path(&persistence, None, &storage, request)
+                .await
+                .unwrap();
+
+        let view = report.request_snapshot.clone().expect("recorded snapshot");
+        assert_eq!(view.snapshot, snapshot);
+        assert!(view.preview.is_none());
+        assert_eq!(report.tokens.total_tokens, None);
+        assert_eq!(report.tokens.source, UsageTokenSource::Unavailable);
+        assert_eq!(report.scope.turn_count, 0);
+        assert!(report.models.is_empty());
+        assert!(report.tools.is_empty());
+        assert!(report.files.files.is_empty());
+        assert!(report.time.active_turn_ms.is_none());
+        assert!(report.context.is_none());
+        assert!(!report.privacy.prompt_content_included);
+        assert_eq!(report.workspace.kind, UsageWorkspaceKind::RemoteSsh);
+        assert_eq!(
+            report.workspace.path_label.as_deref(),
+            Some("/remote/project")
+        );
+        assert_eq!(
+            report.workspace.remote_ssh_host.as_deref(),
+            Some("host.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_request_snapshot_read_reports_absent_snapshot_as_unknown() {
+        let (_temp, storage, persistence) =
+            persistence_with_recorded_session("Standard", None).await;
+
+        let report = generate_session_usage_report_from_storage_path(
+            &persistence,
+            None,
+            &storage,
+            recorded_snapshot_read_request(
+                None,
+                openbitfun_core_types::UsageRequestSnapshotReadRequest::default(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(report.request_snapshot.is_none());
+        assert_eq!(report.tokens.total_tokens, None);
+        assert_eq!(report.tokens.source, UsageTokenSource::Unavailable);
+        assert_eq!(report.scope.turn_count, 0);
+        assert!(report
+            .coverage
+            .notes
+            .iter()
+            .any(|note| note.contains("no request context snapshot")));
+    }
+
+    #[tokio::test]
+    async fn recorded_request_snapshot_read_degrades_a_dead_pending_summary_without_rewriting() {
+        let snapshot = recorded_request_snapshot(openbitfun_core_types::UsageSummaryState::Pending);
+        let (_temp, storage, persistence) =
+            persistence_with_recorded_session("Standard", Some(snapshot.clone())).await;
+
+        let report = generate_session_usage_report_from_storage_path(
+            &persistence,
+            None,
+            &storage,
+            recorded_snapshot_read_request(
+                None,
+                openbitfun_core_types::UsageRequestSnapshotReadRequest::default(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let view = report.request_snapshot.expect("recorded snapshot");
+        assert_eq!(
+            view.snapshot.summary_state,
+            openbitfun_core_types::UsageSummaryState::Unavailable
+        );
+        assert!(view.snapshot.categories.is_none());
+        assert!(view.snapshot.estimated_total.is_none());
+        assert_eq!(
+            view.snapshot.unavailable_reason.as_deref(),
+            Some(REQUEST_SNAPSHOT_SUMMARY_NOT_LIVE),
+            "the explicit degradation reason is shared with the cumulative report"
+        );
+        // Provider facts and capacity survive a summary degradation.
+        assert_eq!(view.snapshot.input_total, Some(12_345));
+        assert_eq!(view.snapshot.context_window, Some(200_000));
+
+        let stored = persistence
+            .load_session_metadata(&storage, RECORDED_SESSION_ID)
+            .await
+            .unwrap()
+            .expect("session metadata")
+            .last_recorded_request_snapshot
+            .expect("stored snapshot");
+        assert_eq!(
+            stored, snapshot,
+            "a read must not rewrite the recorded snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_request_snapshot_preview_reports_missing_source_with_the_actual_identity() {
+        let snapshot =
+            recorded_request_snapshot(openbitfun_core_types::UsageSummaryState::Ready);
+        let (_temp, storage, persistence) =
+            persistence_with_recorded_session("Standard", Some(snapshot.clone())).await;
+
+        let report = generate_session_usage_report_from_storage_path(
+            &persistence,
+            None,
+            &storage,
+            recorded_snapshot_read_request(
+                None,
+                openbitfun_core_types::UsageRequestSnapshotReadRequest {
+                    request: Some(snapshot.request.clone()),
+                    category: Some(openbitfun_core_types::UsageContextCategory::SystemPrompt),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let preview = report
+            .request_snapshot
+            .expect("recorded snapshot")
+            .preview
+            .expect("preview");
+        assert_eq!(
+            preview.category,
+            openbitfun_core_types::UsageContextCategory::SystemPrompt
+        );
+        assert!(preview.content.is_empty());
+        assert_eq!(preview.request, snapshot.request);
+        assert!(
+            preview
+                .unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty()),
+            "a missing retained source must explain itself"
+        );
+        assert!(!report.privacy.prompt_content_included);
+    }
+
+    #[tokio::test]
+    async fn recorded_request_snapshot_preview_rejects_a_stale_expected_identity() {
+        let snapshot =
+            recorded_request_snapshot(openbitfun_core_types::UsageSummaryState::Ready);
+        let (_temp, storage, persistence) =
+            persistence_with_recorded_session("Standard", Some(snapshot.clone())).await;
+        let mut expected = snapshot.request.clone();
+        expected.attempt_id = "attempt-other".to_string();
+
+        let report = generate_session_usage_report_from_storage_path(
+            &persistence,
+            None,
+            &storage,
+            recorded_snapshot_read_request(
+                None,
+                openbitfun_core_types::UsageRequestSnapshotReadRequest {
+                    request: Some(expected),
+                    category: Some(openbitfun_core_types::UsageContextCategory::Skills),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let view = report.request_snapshot.expect("recorded snapshot");
+        assert_eq!(view.snapshot, snapshot);
+        let preview = view.preview.expect("preview");
+        assert!(preview.content.is_empty());
+        assert_eq!(preview.request, snapshot.request);
+        assert_eq!(
+            preview.unavailable_reason.as_deref(),
+            Some("stale request identity")
+        );
+        assert!(!report.privacy.prompt_content_included);
+    }
+
+    #[tokio::test]
+    async fn full_report_also_carries_the_numeric_recorded_snapshot() {
+        let snapshot =
+            recorded_request_snapshot(openbitfun_core_types::UsageSummaryState::Ready);
+        let (_temp, storage, persistence) =
+            persistence_with_recorded_session("Standard", Some(snapshot.clone())).await;
+        persistence
+            .save_dialog_turn(&storage, &recorded_dialog_turn())
+            .await
+            .unwrap();
+        let request = recorded_full_report_request();
+
+        let report =
+            generate_session_usage_report_from_storage_path(&persistence, None, &storage, request)
+                .await
+                .unwrap();
+
+        let view = report.request_snapshot.expect("numeric view");
+        assert_eq!(view.snapshot, snapshot);
+        assert_eq!(
+            view.snapshot.summary_state,
+            openbitfun_core_types::UsageSummaryState::Ready,
+            "a ready summary is never degraded"
+        );
+        assert!(view.preview.is_none());
+        assert_eq!(report.scope.turn_count, 1);
+        assert!(!report.tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_report_degrades_a_dead_pending_snapshot_without_rewriting_it() {
+        let snapshot = recorded_request_snapshot(openbitfun_core_types::UsageSummaryState::Pending);
+        let (_temp, storage, persistence) =
+            persistence_with_recorded_session("Standard", Some(snapshot.clone())).await;
+        persistence
+            .save_dialog_turn(&storage, &recorded_dialog_turn())
+            .await
+            .unwrap();
+
+        let report = generate_session_usage_report_from_storage_path(
+            &persistence,
+            None,
+            &storage,
+            recorded_full_report_request(),
+        )
+        .await
+        .unwrap();
+
+        // This process started with an empty capture registry, so a persisted
+        // pending summary can never complete.
+        let view = report.request_snapshot.expect("numeric view");
+        assert!(view.preview.is_none());
+        assert_eq!(
+            view.snapshot.summary_state,
+            openbitfun_core_types::UsageSummaryState::Unavailable
+        );
+        assert!(view.snapshot.categories.is_none());
+        assert!(view.snapshot.estimated_total.is_none());
+        assert_eq!(
+            view.snapshot.unavailable_reason.as_deref(),
+            Some(REQUEST_SNAPSHOT_SUMMARY_NOT_LIVE),
+            "the cumulative report shares the explicit degradation reason"
+        );
+        // Provider facts are retained, and cumulative accounting is untouched.
+        assert_eq!(view.snapshot.input_total, Some(12_345));
+        assert_eq!(
+            view.snapshot.usage_state,
+            openbitfun_core_types::UsageRequestUsageState::ProviderReported
+        );
+        assert_eq!(view.snapshot.context_window, Some(200_000));
+        assert_eq!(report.scope.turn_count, 1);
+
+        let stored = persistence
+            .load_session_metadata(&storage, RECORDED_SESSION_ID)
+            .await
+            .unwrap()
+            .expect("session metadata")
+            .last_recorded_request_snapshot
+            .expect("stored snapshot");
+        assert_eq!(
+            stored, snapshot,
+            "a read must not rewrite the recorded snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_report_survives_an_unreadable_metadata_record() {
+        let snapshot =
+            recorded_request_snapshot(openbitfun_core_types::UsageSummaryState::Ready);
+        let (_temp, storage, persistence) =
+            persistence_with_recorded_session("Standard", Some(snapshot)).await;
+        persistence
+            .save_dialog_turn(&storage, &recorded_dialog_turn())
+            .await
+            .unwrap();
+        let metadata_path = recorded_session_metadata_path(&storage);
+        assert!(
+            metadata_path.is_file(),
+            "the metadata record must exist before it is corrupted: {metadata_path:?}"
+        );
+        std::fs::write(&metadata_path, b"{ \"metadata\": ").unwrap();
+        assert!(
+            persistence
+                .load_session_metadata(&storage, RECORDED_SESSION_ID)
+                .await
+                .is_err(),
+            "the corrupted record must really be unreadable"
+        );
+
+        let report = generate_session_usage_report_from_storage_path(
+            &persistence,
+            None,
+            &storage,
+            recorded_full_report_request(),
+        )
+        .await
+        .expect("an unreadable metadata index must not fail the cumulative report");
+
+        assert!(
+            report.request_snapshot.is_none(),
+            "an unreadable record degrades the snapshot view only"
+        );
+        assert_eq!(report.scope.turn_count, 1);
+        assert!(!report.tools.is_empty());
+        assert!(!report.models.is_empty());
+
+        // The fast branch is the opposite case: the metadata record is the
+        // answer, so an unreadable one fails instead of pretending.
+        let error = generate_session_usage_report_from_storage_path(
+            &persistence,
+            None,
+            &storage,
+            recorded_snapshot_read_request(
+                None,
+                openbitfun_core_types::UsageRequestSnapshotReadRequest::default(),
+            ),
+        )
+        .await
+        .expect_err("a snapshot read cannot answer without the metadata record");
+        assert!(
+            !matches!(&error, OpenBitFunError::NotImplemented(_)),
+            "an unreadable record is not an unsupported host: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_report_survives_a_missing_metadata_record() {
+        let (_temp, storage, persistence) =
+            persistence_with_recorded_session("Standard", None).await;
+        persistence
+            .save_dialog_turn(&storage, &recorded_dialog_turn())
+            .await
+            .unwrap();
+        let metadata_path = recorded_session_metadata_path(&storage);
+        std::fs::remove_file(&metadata_path).unwrap();
+        assert!(
+            persistence
+                .load_session_metadata(&storage, RECORDED_SESSION_ID)
+                .await
+                .unwrap()
+                .is_none(),
+            "the record must be absent for this case"
+        );
+
+        let report = generate_session_usage_report_from_storage_path(
+            &persistence,
+            None,
+            &storage,
+            recorded_full_report_request(),
+        )
+        .await
+        .expect("a missing metadata index must not fail the cumulative report");
+
+        assert!(report.request_snapshot.is_none());
+        assert_eq!(report.scope.turn_count, 1);
+        assert!(!report.tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recorded_request_snapshot_read_is_unsupported_for_an_external_agent_session() {
+        let (_temp, storage, persistence) =
+            persistence_with_recorded_session("acp:codex", None).await;
+        assert_eq!(
+            persistence
+                .load_session_metadata(&storage, RECORDED_SESSION_ID)
+                .await
+                .unwrap()
+                .expect("session metadata")
+                .agent_type,
+            "acp:codex"
+        );
+
+        let error = generate_session_usage_report_from_storage_path(
+            &persistence,
+            None,
+            &storage,
+            recorded_snapshot_read_request(
+                None,
+                openbitfun_core_types::UsageRequestSnapshotReadRequest::default(),
+            ),
+        )
+        .await
+        .expect_err("an external agent owns its request context");
+
+        match error {
+            OpenBitFunError::NotImplemented(message) => assert!(
+                message.contains("does not expose a recorded request context snapshot"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("expected an explicit unsupported error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recorded_request_snapshot_read_path_uses_only_session_metadata() {
+        let source = include_str!("service.rs");
+        let read_mode = source
+            .split("async fn generate_recorded_request_snapshot_report(")
+            .nth(1)
+            .expect("recorded snapshot read mode")
+            .split("fn recorded_request_snapshot_preview(")
+            .next()
+            .expect("preview helper boundary");
+        for forbidden in [
+            "load_session_turns",
+            "query_records_for_sessions",
+            "load_snapshot_facts",
+            "load_prompt_cache",
+            "load_usage_context_snapshot",
+            "build_session_usage_report_from_sources",
+            "token_usage_turn_scope",
+        ] {
+            assert!(
+                !read_mode.contains(forbidden),
+                "the recorded snapshot read mode must not call {forbidden}"
+            );
+        }
+        assert!(read_mode.contains("load_session_metadata"));
+    }
+
     #[test]
     fn report_marks_cache_unavailable_for_zero_filled_cache_source() {
         let request = test_request(None);
@@ -2971,6 +3718,7 @@ mod tests {
             include_system_prompt_preview: false,
             context_preview_category: None,
             context_estimate: None,
+            request_snapshot: None,
             include_hidden_subagents: true,
         }
     }

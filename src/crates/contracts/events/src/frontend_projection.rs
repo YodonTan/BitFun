@@ -355,6 +355,18 @@ pub fn project_agentic_frontend_event(event: AgenticEvent) -> Option<AgenticFron
                 "tokenDetails": token_details,
             }),
         )),
+        AgenticEvent::RequestContextSnapshotUpdated {
+            session_id,
+            turn_id,
+            snapshot,
+        } => Some(AgenticFrontendEvent::new(
+            "agentic://request-context-snapshot-updated",
+            json!({
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "snapshot": snapshot,
+            }),
+        )),
         AgenticEvent::ContextCompressionStarted {
             session_id,
             turn_id,
@@ -986,5 +998,64 @@ mod tests {
         assert_eq!(projected.payload["sessionId"], "session-1");
         assert_eq!(projected.payload["previousPresetId"], "high");
         assert_eq!(projected.payload["reason"], "reasoning_catalog_updated");
+    }
+
+    #[test]
+    fn request_context_snapshot_projects_recorded_request_facts_without_token_usage() {
+        let projected =
+            project_agentic_frontend_event(AgenticEvent::RequestContextSnapshotUpdated {
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                snapshot: openbitfun_core_types::UsageRequestSnapshot {
+                    schema_version: openbitfun_core_types::REQUEST_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
+                    request: openbitfun_core_types::UsageRequestRef {
+                        execution_host_id: "local".to_string(),
+                        workspace_id: Some("workspace-1".to_string()),
+                        session_id: "session-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        round_id: "round-1".to_string(),
+                        attempt_id: "round-1:attempt:1".to_string(),
+                        attempt_index: 1,
+                        started_at: 1_778_347_200_000,
+                    },
+                    captured_at: 1_778_347_200_500,
+                    input_source: openbitfun_core_types::UsageRequestInputSource::ModelRequest,
+                    input_total: Some(120_000),
+                    context_window: None,
+                    cached_input_tokens: Some(4_000),
+                    usage_state:
+                        openbitfun_core_types::UsageRequestUsageState::ProviderReported,
+                    estimated_total: Some(118_000),
+                    estimation_version: Some(
+                        openbitfun_core_types::REQUEST_CONTEXT_ESTIMATION_VERSION,
+                    ),
+                    summary_state: openbitfun_core_types::UsageSummaryState::Ready,
+                    categories: None,
+                    unavailable_reason: None,
+                },
+            })
+            .expect("projected");
+
+        assert_eq!(
+            projected.event_name,
+            "agentic://request-context-snapshot-updated"
+        );
+        assert_eq!(projected.payload["sessionId"], "session-1");
+        assert_eq!(projected.payload["turnId"], "turn-1");
+        assert_eq!(
+            projected.payload["snapshot"]["request"]["attemptId"],
+            "round-1:attempt:1"
+        );
+        assert_eq!(
+            projected.payload["snapshot"]["request"]["executionHostId"],
+            "local"
+        );
+        assert_eq!(projected.payload["snapshot"]["usageState"], "provider_reported");
+        assert_eq!(projected.payload["snapshot"]["summaryState"], "ready");
+        assert_eq!(projected.payload["snapshot"]["inputTotal"], 120_000);
+        let fields = projected.payload.as_object().expect("object payload");
+        assert!(fields.get("inputTokens").is_none());
+        assert!(fields.get("totalTokens").is_none());
+        assert!(fields.get("cachedTokens").is_none());
     }
 }

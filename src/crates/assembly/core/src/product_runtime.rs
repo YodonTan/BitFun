@@ -2718,6 +2718,15 @@ fn runtime_port_error(error: OpenBitFunError) -> PortError {
     PortError::new(kind, error.to_string())
 }
 
+/// A host that owns no recorded request context answers the explicit snapshot
+/// read as unsupported instead of a generic backend failure.
+fn request_snapshot_port_error(error: OpenBitFunError) -> PortError {
+    if matches!(error, OpenBitFunError::NotImplemented(_)) {
+        return PortError::new(PortErrorKind::NotAvailable, error.to_string());
+    }
+    runtime_port_error(error)
+}
+
 #[async_trait::async_trait]
 impl AgentSessionLineagePort for CoreSessionOperationsPort {
     async fn get_session_lineage(
@@ -3000,17 +3009,36 @@ impl AgentSessionUsagePort for CoreSessionOperationsPort {
                 request.remote_ssh_host.clone(),
             )
             .await?;
+        // An explicit recorded-snapshot read stays read-only: it never recovers
+        // an unfinished revert, so a state that needs recovery is reported as
+        // unknown instead of being written from this viewer path.
+        let is_request_snapshot_read = request.request_snapshot.is_some();
         let _read = begin_session_read(
             self.coordinator.as_ref(),
             self.persistence.as_ref(),
             &storage_path,
             &request.session_id,
             None,
-            request.context_estimate.is_none(),
+            !is_request_snapshot_read && request.context_estimate.is_none(),
         )
         .await
         .map_err(runtime_port_error)?;
         let estimate_options = request.context_estimate.clone();
+        // An explicit recorded-snapshot read is independent of cumulative
+        // accounting: it returns the fast report without a ledger scan and
+        // without a current-context estimate.
+        if is_request_snapshot_read {
+            let report = generate_core_session_usage_report(
+                self.persistence.as_ref(),
+                self.token_usage_service.as_ref(),
+                &storage_path,
+                request.clone(),
+            )
+            .await
+            .map_err(request_snapshot_port_error)?;
+            drop(_read);
+            return Ok(report);
+        }
         let mut report = if estimate_options
             .as_ref()
             .is_some_and(|options| options.context_only)
@@ -5271,6 +5299,7 @@ mod tests {
                     include_system_prompt_preview: false,
                     context_preview_category: None,
                     context_estimate: None,
+                    request_snapshot: None,
                     include_hidden_subagents: false,
                 })
                 .await
@@ -5356,6 +5385,7 @@ mod tests {
                 include_system_prompt_preview: false,
                 context_preview_category: None,
                 context_estimate: None,
+                request_snapshot: None,
                 include_hidden_subagents: false,
             },
         )
@@ -5423,6 +5453,7 @@ mod tests {
                 include_system_prompt_preview: false,
                 context_preview_category: None,
                 context_estimate: None,
+                request_snapshot: None,
                 include_hidden_subagents: false,
             },
         )

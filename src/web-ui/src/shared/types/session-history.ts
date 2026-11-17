@@ -7,6 +7,7 @@
 import type { ReviewTargetEvidence, ReviewTeamRunManifest } from '@/shared/services/reviewTeamService';
 import type { AiErrorDetail } from '@/shared/ai-errors/aiErrorPresenter';
 import type { SessionExecutionTarget } from '@/infrastructure/api/service-api/WorktreeAPI';
+import type { UsageRequestSnapshot } from '@/infrastructure/api/service-api/SessionAPI';
 
 export type SessionKind = 'normal' | 'btw' | 'review' | 'deep_review' | 'miniapp' | 'subagent';
 export type PersistedSessionKind = 'standard' | 'subagent';
@@ -109,6 +110,12 @@ export interface SessionMetadata {
   tags: string[];
   customMetadata?: SessionCustomMetadata;
   currentContextUsage?: SessionContextUsage;
+  /**
+   * Latest numeric-only recorded request-context snapshot for this Session, as
+   * the executing host persists it. Numeric request facts only: never prompt
+   * content and never cumulative billing.
+   */
+  lastRecordedRequestSnapshot?: UsageRequestSnapshot;
   relationship?: SessionRelationship;
   todos?: any[];
   workspacePath?: string;

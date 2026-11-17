@@ -133,6 +133,13 @@ export interface PeerHostCapabilities {
   readonly userQuestionInteraction?: boolean;
   readonly dialogQueueV1?: boolean;
   /**
+   * Host records the request-context snapshot behind `get_session_usage_report`
+   * and answers the explicit snapshot read. Absent on every older host: the
+   * mode is new for both Desktop and CLI, so a missing key is never resolved
+   * through `hostKind`.
+   */
+  readonly requestContextSnapshotV1?: boolean;
+  /**
    * Which kind of host answered `peer_mode_ping` (`"desktop"` | `"cli"`).
    * `null` = the host did not advertise `host_type` (even older host, or the
    * field is genuinely absent). Lets a controller resolve a `null` capability
@@ -231,6 +238,20 @@ interface PeerPingStatus {
   callerAttached: boolean | null;
 }
 
+/**
+ * Read one advertised capability by its wire name.
+ *
+ * Capability ids are generated from the Rust registry, so a capability added by
+ * a peer host can be read here before the generated bindings in this checkout
+ * are regenerated. The read stays in step with the registry either way.
+ */
+function advertisedCapability(
+  capabilities: PeerModePingResult['capabilities'],
+  id: string,
+): boolean {
+  return (capabilities as Record<string, boolean | undefined> | undefined)?.[id] === true;
+}
+
 const NO_CAPABILITIES: PeerHostCapabilities = {
   backgroundResultDeliveryV1: false,
   idempotentDialogSubmit: false,
@@ -276,6 +297,9 @@ const NO_CAPABILITIES: PeerHostCapabilities = {
   workspaceIdReferencesV1: false,
   workspaceLatexPreviewV1: false,
   userQuestionResponse: null,
+  // Request-context snapshots are a new mode for both host kinds, so an
+  // unprobed or older host is not given the benefit of the doubt.
+  requestContextSnapshotV1: false,
   // Host kind is unknown until the first `peer_mode_ping` resolves. Consumers
   // treat `null` optimistically. See PR #2428 round 5 #1.
   hostKind: null,
@@ -752,6 +776,7 @@ export class PeerConnectionManager {
       userQuestionResponse,
       userQuestionInteraction: caps?.user_question_interaction_v1 === true,
       dialogQueueV1: caps?.dialog_queue_v1 === true,
+      requestContextSnapshotV1: advertisedCapability(caps, 'session_request_context_snapshot_v1'),
       hostKind,
     } };
   }

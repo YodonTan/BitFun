@@ -510,6 +510,16 @@ export interface Session {
   currentTokenUsage?: TokenUsage;
   currentAcpContextUsage?: AcpContextUsage;
   maxContextTokens?: number;
+  /**
+   * Latest recorded parent-session model request, hydrated from authoritative
+   * host data and kept current by the non-billing
+   * `agentic://request-context-snapshot-updated` event.
+   *
+   * This is the default context overview reading. It is independent of
+   * `currentTokenUsage` (which tracks cumulative Turn usage) and of the
+   * on-demand `contextEstimate` inspection.
+   */
+  requestContextSnapshot?: import('@/infrastructure/api/service-api/SessionAPI').UsageRequestSnapshot;
   
   /**
    * Current/default mode selection in the chat input for this session.

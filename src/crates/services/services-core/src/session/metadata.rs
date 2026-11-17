@@ -4,7 +4,10 @@ use super::types::{
     DialogTurnData, DialogTurnKind, SessionLastTurn, SessionMemoryMode, SessionMetadata,
     SessionRelationship, SessionRelationshipKind, StoredSessionIndexFile, TurnStatus,
 };
-use openbitfun_core_types::{SessionExecutionTarget, SessionKind};
+use openbitfun_core_types::{
+    SessionExecutionTarget, SessionKind, UsageRequestSnapshot, UsageRequestUsageState,
+    UsageSummaryState,
+};
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
@@ -75,6 +78,10 @@ pub fn build_session_metadata(facts: SessionMetadataBuildFacts<'_>) -> SessionMe
         tags: existing.map(|value| value.tags.clone()).unwrap_or_default(),
         custom_metadata: existing.and_then(|value| value.custom_metadata.clone()),
         current_context_usage: existing.and_then(|value| value.current_context_usage.clone()),
+        // A new, child, or forked Session never inherits another Session's
+        // recorded request snapshot.
+        last_recorded_request_snapshot: existing
+            .and_then(|value| value.last_recorded_request_snapshot.clone()),
         relationship: build_session_relationship(facts.session_kind, existing),
         todos: existing.and_then(|value| value.todos.clone()),
         review_action_state: existing.and_then(|value| value.review_action_state.clone()),
@@ -227,6 +234,125 @@ fn dialog_turn_finished_at(turn: &DialogTurnData) -> Option<u64> {
     }
 
     turn.end_time
+}
+
+/// Records the numeric request-context snapshot of one model request.
+///
+/// Identity decides acceptance so the panel stays scoped to one Session and one
+/// attempt:
+/// - a snapshot recorded for another Session is rejected;
+/// - with no recorded snapshot yet, the incoming one is stored;
+/// - for the same attempt, provider facts are only upgraded, the summary may
+///   advance to `Ready` but never regress from it, and the newer capture wins;
+/// - for a different attempt, only a newer `(started_at, attempt_index)` wins.
+///
+/// Ledger append order and process-local counters are never part of the rule.
+/// Returns whether metadata actually changed.
+pub fn apply_last_recorded_request_snapshot(
+    metadata: &mut SessionMetadata,
+    snapshot: UsageRequestSnapshot,
+) -> bool {
+    if snapshot.request.session_id != metadata.session_id {
+        return false;
+    }
+
+    let Some(current) = metadata.last_recorded_request_snapshot.clone() else {
+        metadata.last_recorded_request_snapshot = Some(snapshot);
+        return true;
+    };
+
+    let same_attempt = current.request.attempt_id == snapshot.request.attempt_id
+        && current.request.round_id == snapshot.request.round_id;
+    let merged = if same_attempt {
+        merge_same_attempt_request_snapshot(current.clone(), snapshot)
+    } else {
+        let current_order = (current.request.started_at, current.request.attempt_index);
+        let incoming_order = (snapshot.request.started_at, snapshot.request.attempt_index);
+        if incoming_order <= current_order {
+            return false;
+        }
+        snapshot
+    };
+
+    if merged == current {
+        return false;
+    }
+    metadata.last_recorded_request_snapshot = Some(merged);
+    true
+}
+
+/// Merges two captures of the same attempt without losing provider facts.
+fn merge_same_attempt_request_snapshot(
+    existing: UsageRequestSnapshot,
+    incoming: UsageRequestSnapshot,
+) -> UsageRequestSnapshot {
+    // A provider-reported total is authoritative; an estimate or unknown state
+    // may upgrade it, never replace it.
+    let keep_existing_provider = existing.usage_state == UsageRequestUsageState::ProviderReported
+        && incoming.usage_state != UsageRequestUsageState::ProviderReported;
+    // A ready summary is authoritative; pending or unavailable captures cannot
+    // replace it.
+    let keep_existing_summary = existing.summary_state == UsageSummaryState::Ready
+        && incoming.summary_state != UsageSummaryState::Ready;
+    let newer_is_incoming = incoming.captured_at >= existing.captured_at;
+
+    let (input_source, input_total, cached_input_tokens, usage_state) = if keep_existing_provider {
+        (
+            existing.input_source,
+            existing.input_total,
+            existing.cached_input_tokens,
+            existing.usage_state,
+        )
+    } else {
+        (
+            incoming.input_source,
+            incoming.input_total,
+            incoming.cached_input_tokens,
+            incoming.usage_state,
+        )
+    };
+    // The summary group moves as a whole so `summary_state` can never disagree
+    // with `estimated_total`/`categories`.
+    let (summary_state, estimated_total, estimation_version, categories) =
+        if keep_existing_summary {
+            (
+                existing.summary_state,
+                existing.estimated_total,
+                existing.estimation_version,
+                existing.categories,
+            )
+        } else {
+            (
+                incoming.summary_state,
+                incoming.estimated_total,
+                incoming.estimation_version,
+                incoming.categories,
+            )
+        };
+
+    UsageRequestSnapshot {
+        schema_version: if newer_is_incoming {
+            incoming.schema_version
+        } else {
+            existing.schema_version
+        },
+        request: incoming.request,
+        captured_at: existing.captured_at.max(incoming.captured_at),
+        input_source,
+        input_total,
+        context_window: incoming.context_window.or(existing.context_window),
+        cached_input_tokens,
+        usage_state,
+        estimated_total,
+        estimation_version,
+        summary_state,
+        categories,
+        unavailable_reason: if newer_is_incoming {
+            incoming.unavailable_reason
+        } else {
+            existing.unavailable_reason
+        },
+    }
 }
 
 pub fn refresh_session_metadata_from_turns(

@@ -10137,3 +10137,227 @@ describe('read receipts of unloaded sessions', () => {
     workspaceFixtures.delete('rr-ws');
   });
 });
+
+describe('recorded request context snapshots', () => {
+  const requestRef = (overrides: Partial<{
+    executionHostId: string; workspaceId?: string; sessionId: string; turnId: string;
+    roundId: string; attemptId: string; attemptIndex: number; startedAt: number;
+  }> = {}) => ({
+    executionHostId: LOCAL_SURFACE_ID, sessionId: 'session-1', turnId: 'turn-1', roundId: 'round-1',
+    attemptId: 'round-1:attempt:1', attemptIndex: 1, startedAt: 100, ...overrides,
+  });
+
+  const recorded = (overrides: Partial<Record<string, unknown>> = {}) => ({
+    schemaVersion: 1, request: requestRef(), capturedAt: 200, inputSource: 'model_request' as const,
+    inputTotal: 900, usageState: 'provider_reported' as const, estimatedTotal: 1000,
+    summaryState: 'ready' as const, ...overrides,
+  });
+
+  const seed = (overrides: Partial<Session> = {}) => {
+    const session = createSession(overrides);
+    flowChatStore.setState(state => ({ ...state, sessions: new Map([[session.sessionId, session]]) }));
+    return session;
+  };
+  const storedSnapshot = () => flowChatStore.getState().sessions.get('session-1')?.requestContextSnapshot;
+
+  beforeEach(() => {
+    resetStore();
+  });
+
+  it('stores the reading for the session, host and workspace it describes', () => {
+    const session = seed();
+
+    expect(flowChatStore.setRequestContextSnapshot('session-1', recorded({
+      request: requestRef({ workspaceId: session.workspaceId }),
+    }) as never)).toBe(true);
+    expect(storedSnapshot()?.inputTotal).toBe(900);
+  });
+
+  it('drops a reading that belongs to another session, host or workspace', () => {
+    seed();
+
+    expect(flowChatStore.setRequestContextSnapshot('session-1', recorded({
+      request: requestRef({ sessionId: 'another-session' }),
+    }) as never)).toBe(false);
+    expect(flowChatStore.setRequestContextSnapshot('session-1', recorded({
+      request: requestRef({ executionHostId: 'another-host' }),
+    }) as never)).toBe(false);
+    expect(flowChatStore.setRequestContextSnapshot('session-1', recorded({
+      request: requestRef({ workspaceId: 'another-workspace' }),
+    }) as never)).toBe(false);
+    expect(flowChatStore.setRequestContextSnapshot('missing-session', recorded() as never)).toBe(false);
+    expect(storedSnapshot()).toBeUndefined();
+  });
+
+  it('accepts the same attempt moving forward and never downgrades it', () => {
+    const session = seed();
+    const request = requestRef({ workspaceId: session.workspaceId });
+    const pending = recorded({ request, summaryState: 'pending', categories: undefined, inputTotal: 900 });
+    const ready = recorded({ request, summaryState: 'ready', inputTotal: 950 });
+
+    expect(flowChatStore.setRequestContextSnapshot('session-1', pending as never)).toBe(true);
+    expect(flowChatStore.setRequestContextSnapshot('session-1', ready as never)).toBe(true);
+    expect(storedSnapshot()?.summaryState).toBe('ready');
+    expect(storedSnapshot()?.inputTotal).toBe(950);
+
+    // A later answer may not turn a provider total back into an estimate.
+    expect(flowChatStore.setRequestContextSnapshot('session-1', recorded({
+      request, usageState: 'estimated', inputTotal: undefined,
+    }) as never)).toBe(false);
+    expect(storedSnapshot()?.usageState).toBe('provider_reported');
+    expect(storedSnapshot()?.inputTotal).toBe(950);
+
+    // Identical facts are not a state change.
+    expect(flowChatStore.setRequestContextSnapshot('session-1', ready as never)).toBe(false);
+  });
+
+  it('orders attempts by (startedAt, attemptIndex), never by attempt id or a counter', () => {
+    const session = seed();
+    const newer = recorded({
+      request: requestRef({
+        workspaceId: session.workspaceId, attemptId: 'round-1:attempt:2', attemptIndex: 2, startedAt: 300,
+      }),
+      inputTotal: 1200,
+    });
+    expect(flowChatStore.setRequestContextSnapshot('session-1', newer as never)).toBe(true);
+
+    const older = recorded({
+      request: requestRef({
+        workspaceId: session.workspaceId, attemptId: 'round-1:attempt:9', attemptIndex: 9, startedAt: 200,
+      }),
+      inputTotal: 100,
+    });
+    expect(flowChatStore.setRequestContextSnapshot('session-1', older as never)).toBe(false);
+    expect(storedSnapshot()?.inputTotal).toBe(1200);
+
+    // A newer start time wins even when the attempt index is lower.
+    expect(flowChatStore.setRequestContextSnapshot('session-1', recorded({
+      request: requestRef({
+        workspaceId: session.workspaceId, attemptId: 'round-1:attempt:3', attemptIndex: 3, startedAt: 400,
+      }),
+      inputTotal: 1500,
+    }) as never)).toBe(true);
+    expect(storedSnapshot()?.inputTotal).toBe(1500);
+  });
+
+  it('takes the target host id for a dispatch projection and keeps billing facts untouched', () => {
+    seed({
+      config: { agentType: 'Standard', dispatchJobId: 'job-1' } as Session['config'],
+      currentContextUsage: {
+        inputTokens: 42_000, outputTokens: 1_500, totalTokens: 43_500, timestamp: 4,
+        turnId: 'turn-live', source: 'model_request',
+      } as Session['currentContextUsage'],
+    });
+
+    expect(flowChatStore.setRequestContextSnapshot('session-1', recorded({
+      request: requestRef({ executionHostId: 'dispatch-target', attemptId: 'round-1:attempt:2', startedAt: 500 }),
+    }) as never)).toBe(true);
+
+    const session = flowChatStore.getState().sessions.get('session-1');
+    expect(session?.requestContextSnapshot?.request.executionHostId).toBe('dispatch-target');
+    // A recorded snapshot is a read model: it never bills or moves context usage.
+    expect(session?.currentContextUsage?.totalTokens).toBe(43_500);
+    expect(session?.currentTokenUsage).toBeUndefined();
+  });
+
+  it('expects the workspace execution host, not the rendering surface, for a remote workspace', () => {
+    // Core names the host of the workspace that runs the request:
+    // `remote:<connection_id>` for an SSH workspace, even when the controller
+    // surface doing the reading is `local`.
+    const session = seed({ remoteConnectionId: 'conn-1' });
+    expect(getActiveSurfaceScope().surfaceId).toBe(LOCAL_SURFACE_ID);
+
+    expect(flowChatStore.setRequestContextSnapshot('session-1', recorded({
+      request: requestRef({
+        executionHostId: 'remote:conn-1', workspaceId: session.workspaceId,
+      }),
+    }) as never)).toBe(true);
+    expect(storedSnapshot()?.request.executionHostId).toBe('remote:conn-1');
+
+    // The surface id is not the host id for such a session.
+    expect(flowChatStore.setRequestContextSnapshot('session-1', recorded({
+      request: requestRef({
+        executionHostId: LOCAL_SURFACE_ID, workspaceId: session.workspaceId,
+        attemptId: 'round-1:attempt:2', attemptIndex: 2, startedAt: 500,
+      }),
+    }) as never)).toBe(false);
+    expect(storedSnapshot()?.request.attemptIndex).toBe(1);
+  });
+
+  it('accepts the target host id for a local session rendered on a peer surface', () => {
+    // The peer's core owns a workspace that is local to that device, so it
+    // stamps `local` while this controller's surface id is the peer id.
+    activateSurface('peer-snapshot');
+    const session = createSession();
+    flowChatStore.setState(state => ({ ...state, sessions: new Map([[session.sessionId, session]]) }));
+
+    expect(getActiveSurfaceScope().surfaceId).toBe('peer-snapshot');
+    expect(flowChatStore.setRequestContextSnapshot('session-1', recorded({
+      request: requestRef({ executionHostId: 'local', workspaceId: session.workspaceId }),
+    }) as never)).toBe(true);
+    expect(storedSnapshot()?.request.executionHostId).toBe('local');
+
+    activateSurface(LOCAL_SURFACE_ID);
+  });
+
+  it('accepts the host degrading a dead pending summary to unavailable', () => {
+    const session = seed();
+    const request = requestRef({ workspaceId: session.workspaceId });
+    expect(flowChatStore.setRequestContextSnapshot('session-1', recorded({
+      request, capturedAt: 200, inputTotal: 900, summaryState: 'pending', contextWindow: 8000,
+      categories: {
+        systemPrompt: 100, toolDefinitions: 100, rules: 100, skills: 100, mcpTools: 100,
+        subagentDefinitions: 100, summarizedConversation: 0, conversation: 400, contextWindow: 8000,
+      },
+    }) as never)).toBe(true);
+
+    // The host turns a pending summary into `unavailable` when no summary job is
+    // live. It keeps the capture time, and `pending` used to outrank it here, so
+    // the surface stayed "classifying" forever.
+    expect(flowChatStore.setRequestContextSnapshot('session-1', recorded({
+      request, capturedAt: 200, inputTotal: 900, summaryState: 'unavailable',
+      categories: undefined, estimatedTotal: undefined,
+      unavailableReason: 'No summary job is live for this recorded request.',
+    }) as never)).toBe(true);
+    expect(storedSnapshot()?.summaryState).toBe('unavailable');
+    expect(storedSnapshot()?.categories).toBeUndefined();
+    expect(storedSnapshot()?.estimatedTotal).toBeUndefined();
+    expect(storedSnapshot()?.unavailableReason).toBe('No summary job is live for this recorded request.');
+    // The provider facts the request was recorded with survive the degradation.
+    expect(storedSnapshot()?.usageState).toBe('provider_reported');
+    expect(storedSnapshot()?.inputTotal).toBe(900);
+    // The capacity the attempt knew is kept when the degraded capture omits it.
+    expect(storedSnapshot()?.contextWindow).toBe(8000);
+
+    // A late pending capture may not resurrect the categories or the estimate.
+    flowChatStore.setRequestContextSnapshot('session-1', recorded({
+      request, capturedAt: 300, inputTotal: 900, summaryState: 'pending',
+      categories: {
+        systemPrompt: 100, toolDefinitions: 100, rules: 100, skills: 100, mcpTools: 100,
+        subagentDefinitions: 100, summarizedConversation: 0, conversation: 400, contextWindow: 8000,
+      },
+    }) as never);
+    expect(storedSnapshot()?.summaryState).toBe('unavailable');
+    expect(storedSnapshot()?.categories).toBeUndefined();
+    expect(storedSnapshot()?.estimatedTotal).toBeUndefined();
+  });
+
+  it('does not merge two turns of the same attempt as one request', () => {
+    const session = seed();
+    const base = { workspaceId: session.workspaceId, startedAt: 100, attemptIndex: 1 };
+    expect(flowChatStore.setRequestContextSnapshot('session-1', recorded({
+      request: requestRef({ ...base, turnId: 'turn-1' }),
+      inputTotal: 900, capturedAt: 200,
+    }) as never)).toBe(true);
+
+    // Same AttemptId/index/start, different Turn: identity includes the Turn, so
+    // this is another request, never a newer capture of the first one.
+    expect(flowChatStore.setRequestContextSnapshot('session-1', recorded({
+      request: requestRef({ ...base, turnId: 'turn-2' }),
+      inputTotal: 400, capturedAt: 300,
+    }) as never)).toBe(false);
+    expect(storedSnapshot()?.request.turnId).toBe('turn-1');
+    expect(storedSnapshot()?.inputTotal).toBe(900);
+    expect(storedSnapshot()?.capturedAt).toBe(200);
+  });
+});

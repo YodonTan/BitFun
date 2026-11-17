@@ -5,7 +5,7 @@ use openbitfun_core_types::{
     AiErrorDetail, SessionContinuationPolicy, SessionExecutionTarget, SessionKind,
 };
 use openbitfun_events::ModelRoundAttemptDiagnostic;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub const SESSION_STORAGE_SCHEMA_VERSION: u32 = 2;
 pub const SESSION_TURN_CATALOG_SCHEMA_VERSION: u32 = 1;
@@ -78,6 +78,32 @@ impl SessionMemoryMode {
     pub fn is_enabled(self) -> bool {
         matches!(self, Self::Enabled)
     }
+}
+
+/// Reads the numeric recorded request-context snapshot without letting one
+/// unreadable value hide the rest of a Session's persisted metadata.
+///
+/// A malformed snapshot is rejected on its own: the Session keeps every other
+/// field, and the snapshot stays absent instead of being rewritten into a
+/// fabricated identity or usage total.
+fn deserialize_tolerant_request_snapshot<'de, D>(
+    deserializer: D,
+) -> Result<Option<openbitfun_core_types::UsageRequestSnapshot>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| {
+        match serde_json::from_value::<openbitfun_core_types::UsageRequestSnapshot>(value) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                log::warn!(
+                    "Discarding an unreadable recorded request-context snapshot while loading Session metadata: {error}"
+                );
+                None
+            }
+        }
+    }))
 }
 
 /// Session metadata
@@ -204,6 +230,18 @@ pub struct SessionMetadata {
         alias = "current_context_usage"
     )]
     pub current_context_usage: Option<SessionContextUsage>,
+
+    /// Latest numeric-only recorded request-context snapshot for this session.
+    ///
+    /// It carries token counts and per-category estimates for one recorded
+    /// model request only: no prompt body, tool input, or command output.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "last_recorded_request_snapshot",
+        deserialize_with = "deserialize_tolerant_request_snapshot"
+    )]
+    pub last_recorded_request_snapshot: Option<openbitfun_core_types::UsageRequestSnapshot>,
 
     /// Structured child-session relationship metadata.
     #[serde(
@@ -1257,6 +1295,7 @@ impl SessionMetadata {
             tags: Vec::new(),
             custom_metadata: None,
             current_context_usage: None,
+            last_recorded_request_snapshot: None,
             relationship: None,
             todos: None,
             review_action_state: None,

@@ -624,6 +624,7 @@ fn compute_active_duration_millis(
             include_system_prompt_preview: false,
             context_preview_category: None,
             context_estimate: None,
+            request_snapshot: None,
             include_hidden_subagents: false,
         },
         turns,

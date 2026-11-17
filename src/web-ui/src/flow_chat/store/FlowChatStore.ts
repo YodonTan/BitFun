@@ -87,6 +87,7 @@ import {
   type SessionViewRestoreTiming,
 } from '@/infrastructure/api/service-api/AgentAPI';
 import type { SessionCatalogQuery, SessionMetadataPage } from '@/infrastructure/api/service-api/SessionAPI';
+import type { UsageRequestSnapshot } from '@/infrastructure/api/service-api/SessionAPI';
 import {
   deriveLastFinishedAtFromMetadata,
   deriveSessionRelationshipFromMetadata,
@@ -2221,6 +2222,11 @@ function sessionFromPersistedMetadata(metadata: any, context: {
   const restoredCurrentTokenUsage = isAcpAgentType(restoredAgentType)
     ? undefined
     : deriveRestoredCurrentTokenUsage(persistedCurrentContextUsage);
+  // Only authoritative host data hydrates the recorded snapshot read model; a
+  // persisted snapshot that no longer parses is dropped rather than repaired.
+  const restoredRequestContextSnapshot = normalizePersistedRequestSnapshot(
+    metadata.lastRecordedRequestSnapshot ?? metadata.requestContextSnapshot,
+  );
 
   return {
     sessionId: metadata.sessionId,
@@ -2254,6 +2260,7 @@ function sessionFromPersistedMetadata(metadata: any, context: {
     todos: (metadata as any).todos || [],
     maxContextTokens,
     currentTokenUsage: restoredCurrentTokenUsage,
+    requestContextSnapshot: restoredRequestContextSnapshot,
     mode: restoredAgentType,
     lastUserDialogMode: metadata.lastUserDialogAgentType,
     lastSubmittedMode: metadata.lastSubmittedAgentType,
@@ -2293,6 +2300,7 @@ function adoptPersistedMetadataIntoPlaceholder(placeholder: Session, persisted: 
     lastFinishedAt: placeholder.lastFinishedAt ?? persisted.lastFinishedAt,
     lastActiveAt: Math.max(placeholder.lastActiveAt ?? 0, persisted.lastActiveAt ?? 0),
     currentTokenUsage: placeholder.currentTokenUsage ?? persisted.currentTokenUsage,
+    requestContextSnapshot: placeholder.requestContextSnapshot ?? persisted.requestContextSnapshot,
     btwThreads: placeholder.btwThreads ?? persisted.btwThreads,
     isHistorical: placeholder.isHistorical || hasEarlierTurns,
     historyState: placeholder.historyState === 'new' && !hasEarlierTurns
@@ -2303,6 +2311,134 @@ function adoptPersistedMetadataIntoPlaceholder(placeholder: Session, persisted: 
 }
 
 const EMPTY_SESSION_MAP: ReadonlyMap<string, Session> = new Map();
+
+const REQUEST_SNAPSHOT_USAGE_STATES = new Set(['provider_reported', 'estimated', 'unknown']);
+const REQUEST_SNAPSHOT_SUMMARY_STATES = new Set(['pending', 'ready', 'unavailable']);
+const REQUEST_SNAPSHOT_INPUT_SOURCES = new Set(['model_request', 'legacy_record', 'unknown']);
+/** Mirrors core's `execution_host_id`: `local`, or `remote:<connection_id>`. */
+const LOCAL_EXECUTION_HOST_ID = 'local';
+const REMOTE_EXECUTION_HOST_PREFIX = 'remote:';
+
+/**
+ * One recorded request identity: `executionHostId + workspaceId + sessionId +
+ * turnId + roundId + attemptId`. `startedAt` only orders attempts and is never
+ * identity. Mirrors the core's `UsageRequestRef::same_identity`, which includes
+ * the Turn so two Turns at the same attempt index can never merge.
+ */
+function requestSnapshotIdentity(snapshot: UsageRequestSnapshot): string {
+  return JSON.stringify([
+    snapshot.request.executionHostId,
+    snapshot.request.workspaceId ?? '',
+    snapshot.request.sessionId,
+    snapshot.request.turnId,
+    snapshot.request.roundId,
+    snapshot.request.attemptId,
+  ]);
+}
+
+/** Attempt order used to reject an older request: `(startedAt, attemptIndex)`. */
+function compareRequestSnapshotOrder(
+  a: UsageRequestSnapshot['request'],
+  b: UsageRequestSnapshot['request'],
+): number {
+  if (a.startedAt !== b.startedAt) return a.startedAt < b.startedAt ? -1 : 1;
+  if (a.attemptIndex !== b.attemptIndex) return a.attemptIndex < b.attemptIndex ? -1 : 1;
+  return 0;
+}
+
+function requestUsageStateRank(state: UsageRequestSnapshot['usageState']): number {
+  return state === 'provider_reported' ? 2 : state === 'estimated' ? 1 : 0;
+}
+
+/**
+ * `unavailable` outranks `pending`: the host degrades a pending capture to
+ * `unavailable` when no summary job is live (a restart, or bounded admission
+ * deferred it), and that degradation is the final state of the request. Only a
+ * `ready` summary may never be replaced.
+ */
+function requestSummaryStateRank(state: UsageRequestSnapshot['summaryState']): number {
+  return state === 'ready' ? 2 : state === 'unavailable' ? 1 : 0;
+}
+
+/**
+ * Merge two captures of the same request.
+ *
+ * The provider usage group and the summary group each move as a whole, like the
+ * core owner, so a fact from one side is never combined with a fact from the
+ * other: a degraded `unavailable` capture cannot regain stale categories or an
+ * estimate, and an estimate can never sit beside a provider total.
+ */
+function mergeSameAttemptRequestSnapshot(
+  current: UsageRequestSnapshot,
+  incoming: UsageRequestSnapshot,
+): UsageRequestSnapshot | undefined {
+  const newer = incoming.capturedAt >= current.capturedAt ? incoming : current;
+  const usageWinner = requestUsageStateRank(incoming.usageState) >= requestUsageStateRank(current.usageState)
+    ? incoming
+    : current;
+  const summaryWinner = requestSummaryStateRank(incoming.summaryState) >= requestSummaryStateRank(current.summaryState)
+    ? incoming
+    : current;
+  const merged: UsageRequestSnapshot = {
+    ...newer,
+    capturedAt: Math.max(current.capturedAt, incoming.capturedAt),
+    usageState: usageWinner.usageState,
+    inputSource: usageWinner.inputSource,
+    inputTotal: usageWinner.inputTotal,
+    cachedInputTokens: usageWinner.cachedInputTokens,
+    contextWindow: newer.contextWindow ?? current.contextWindow,
+    summaryState: summaryWinner.summaryState,
+    estimatedTotal: summaryWinner.estimatedTotal,
+    estimationVersion: summaryWinner.estimationVersion,
+    categories: summaryWinner.categories,
+    unavailableReason: summaryWinner.summaryState === 'unavailable'
+      ? summaryWinner.unavailableReason ?? newer.unavailableReason
+      : newer.unavailableReason ?? summaryWinner.unavailableReason,
+  };
+  return JSON.stringify(merged) === JSON.stringify(current) ? undefined : merged;
+}
+
+/** Validate the persisted read model; anything malformed is dropped, not repaired. */
+function normalizePersistedRequestSnapshot(value: unknown): UsageRequestSnapshot | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const snapshot = value as UsageRequestSnapshot;
+  const request = snapshot.request;
+  if (!request || typeof request !== 'object') return undefined;
+  const required = [
+    request.executionHostId,
+    request.sessionId,
+    request.turnId,
+    request.roundId,
+    request.attemptId,
+  ];
+  if (required.some(part => typeof part !== 'string' || !part.trim())) return undefined;
+  if (!Number.isSafeInteger(request.attemptIndex) || !Number.isFinite(request.startedAt)) {
+    return undefined;
+  }
+  if (!REQUEST_SNAPSHOT_USAGE_STATES.has(snapshot.usageState)) return undefined;
+  if (!REQUEST_SNAPSHOT_SUMMARY_STATES.has(snapshot.summaryState)) return undefined;
+  if (!REQUEST_SNAPSHOT_INPUT_SOURCES.has(snapshot.inputSource)) return undefined;
+  return snapshot;
+}
+
+/**
+ * Execution host identity core stamps on a recorded request.
+ *
+ * It follows the Session's workspace, not the surface rendering it: core names
+ * the workspace's host `remote:<connection_id>` when the workspace runs over
+ * SSH and `local` otherwise. So a local surface driving a remote workspace sees
+ * `remote:<id>`, and a peer surface sees `local` for the target's own workspace.
+ * A dispatch projection is owned by its target, so no host is imposed there.
+ */
+function expectedRequestSnapshotHostId(sessionId: string, session: Session): string | null {
+  if (resolveSessionDriverId(sessionId, session) === 'dispatch') return null;
+  const connectionId = session.remoteConnectionId?.trim()
+    || session.config?.remoteConnectionId?.trim();
+  if (!connectionId) return LOCAL_EXECUTION_HOST_ID;
+  return connectionId.startsWith(REMOTE_EXECUTION_HOST_PREFIX)
+    ? connectionId
+    : `${REMOTE_EXECUTION_HOST_PREFIX}${connectionId}`;
+}
 
 /** The host's record of an unread result, as its read receipt must name it. */
 function persistedUnreadReceipt(metadata: any): SessionLastTurn | undefined {
@@ -7589,6 +7725,88 @@ export class FlowChatStore {
   public rollbackTokenUsage(): void {
   }
 
+  /**
+   * Store the recorded request snapshot that the default context overview reads.
+   *
+   * This is a read-model write only: it never touches cumulative token usage,
+   * goal accounting, or `currentContextUsage`. Acceptance is decided by request
+   * identity and attempt order, never by ledger order or a local counter:
+   * - a snapshot recorded for another Session, workspace, or host is dropped
+   *   (it describes a scope that is no longer rendered);
+   * - for the same request identity the stored facts only move forward
+   *   (`pending` → `ready`, estimate → provider-reported);
+   * - a different attempt is accepted only when `(startedAt, attemptIndex)`
+   *   makes it newer.
+   *
+   * Returns whether the stored snapshot changed.
+   */
+  public setRequestContextSnapshot(sessionId: string, snapshot: UsageRequestSnapshot): boolean {
+    const session = this.state.sessions.get(sessionId);
+    if (!session) return false;
+    // The same shape rules as a persisted read model: a malformed payload is
+    // dropped, never repaired into something the host did not say.
+    const incoming = normalizePersistedRequestSnapshot(snapshot);
+    if (!incoming) return false;
+    if (incoming.request.sessionId !== sessionId) {
+      log.debug('Dropped request context snapshot for another session', {
+        sessionId,
+        snapshotSessionId: incoming.request.sessionId,
+      });
+      return false;
+    }
+    const expectedHostId = expectedRequestSnapshotHostId(sessionId, session);
+    if (expectedHostId !== null && incoming.request.executionHostId !== expectedHostId) {
+      log.debug('Dropped request context snapshot from another execution host', {
+        sessionId,
+        expectedHostId,
+        executionHostId: incoming.request.executionHostId,
+      });
+      return false;
+    }
+    const sessionWorkspaceIds = [
+      session.workspaceId,
+      session.config?.workspaceId,
+      session.projectWorkspaceId,
+      session.config?.projectWorkspaceId,
+    ].filter((id): id is string => typeof id === 'string' && id.length > 0);
+    if (
+      incoming.request.workspaceId
+      && sessionWorkspaceIds.length > 0
+      && !sessionWorkspaceIds.includes(incoming.request.workspaceId)
+    ) {
+      log.debug('Dropped request context snapshot from another workspace', {
+        sessionId,
+        snapshotWorkspaceId: incoming.request.workspaceId,
+      });
+      return false;
+    }
+
+    const current = session.requestContextSnapshot;
+    let next: UsageRequestSnapshot | undefined = incoming;
+    if (current) {
+      if (requestSnapshotIdentity(current) === requestSnapshotIdentity(incoming)) {
+        next = mergeSameAttemptRequestSnapshot(current, incoming);
+        if (!next) return false;
+      } else if (compareRequestSnapshotOrder(incoming.request, current.request) <= 0) {
+        log.debug('Dropped older request context snapshot', {
+          sessionId,
+          currentAttemptId: current.request.attemptId,
+          incomingAttemptId: incoming.request.attemptId,
+        });
+        return false;
+      }
+    }
+
+    this.setState(prev => {
+      const target = prev.sessions.get(sessionId);
+      if (!target || target.requestContextSnapshot === next) return prev;
+      const newSessions = new Map(prev.sessions);
+      newSessions.set(sessionId, { ...target, requestContextSnapshot: next });
+      return { ...prev, sessions: newSessions };
+    });
+    return true;
+  }
+
   public updateSessionMaxContextTokens(sessionId: string, maxContextTokens: number | undefined): void {
     this.setState(prev => {
       const session = prev.sessions.get(sessionId);
@@ -8879,6 +9097,9 @@ export class FlowChatStore {
               todos: (metadata as any).todos || [],
               maxContextTokens,
               currentTokenUsage: restoredCurrentTokenUsage,
+              requestContextSnapshot: normalizePersistedRequestSnapshot(
+                metadata.lastRecordedRequestSnapshot ?? metadata.requestContextSnapshot,
+              ),
               mode: restoredAgentType,
               lastUserDialogMode: metadata.lastUserDialogAgentType,
               lastSubmittedMode: metadata.lastSubmittedAgentType,

@@ -491,6 +491,10 @@ pub struct AgentSessionUsageRequest {
     pub context_preview_category: Option<openbitfun_core_types::UsageContextCategory>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_estimate: Option<openbitfun_core_types::UsageContextEstimateRequest>,
+    /// Explicit read of one recorded request-context snapshot, optionally with a
+    /// lazy single-category preview. Absence keeps the cumulative report only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_snapshot: Option<openbitfun_core_types::UsageRequestSnapshotReadRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3646,6 +3650,44 @@ mod tests {
         assert_eq!(
             request.context_preview_category,
             Some(openbitfun_core_types::UsageContextCategory::Unknown)
+        );
+    }
+
+    #[test]
+    fn session_usage_request_snapshot_read_is_opt_in_and_camel_case() {
+        let legacy = serde_json::json!({"sessionId": "session-1", "workspacePath": "/workspace"});
+        let mut request: AgentSessionUsageRequest = serde_json::from_value(legacy).unwrap();
+        assert!(request.request_snapshot.is_none());
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("requestSnapshot")
+                .is_none(),
+            "an absent snapshot read stays off the wire"
+        );
+
+        request.request_snapshot = Some(openbitfun_core_types::UsageRequestSnapshotReadRequest {
+            request: Some(openbitfun_core_types::UsageRequestRef {
+                execution_host_id: "local".to_string(),
+                workspace_id: None,
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                round_id: "round-1".to_string(),
+                attempt_id: "round-1:attempt:1".to_string(),
+                attempt_index: 1,
+                started_at: 10,
+            }),
+            category: Some(openbitfun_core_types::UsageContextCategory::SystemPrompt),
+        });
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            encoded["requestSnapshot"]["request"]["attemptId"],
+            "round-1:attempt:1"
+        );
+        assert_eq!(encoded["requestSnapshot"]["category"], "systemPrompt");
+        assert_eq!(
+            serde_json::from_value::<AgentSessionUsageRequest>(encoded).unwrap(),
+            request
         );
     }
 

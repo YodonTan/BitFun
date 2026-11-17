@@ -573,6 +573,7 @@ pub(crate) async fn print_usage_report(session_id: Option<&str>) -> Result<()> {
             include_system_prompt_preview: false,
             context_preview_category: None,
             context_estimate: None,
+            request_snapshot: None,
             include_hidden_subagents: true,
         })
         .await

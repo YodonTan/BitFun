@@ -220,12 +220,16 @@ describe('runUsageReportCommand', () => {
     expect(state.markdown).toContain('not reported');
     expect(state.markdown).not.toContain('Wall time');
     expect(state.markdown).not.toContain('Cached | unavailable');
-    expect(sessionApiMocks.getSessionUsageReport).toHaveBeenCalledWith({
+    const reportRequest = sessionApiMocks.getSessionUsageReport.mock.calls.at(-1)?.[0];
+    expect(reportRequest).toMatchObject({
       sessionId: 'session-1',
       workspaceId: 'workspace-1',
       includeHiddenSubagents: true,
-      contextEstimate: { includeContents: false, contextOnly: false },
     });
+    // The normal report attaches the numeric snapshot on its own. Naming
+    // `requestSnapshot` would select the snapshot-only fast mode and drop the
+    // cumulative totals this panel exists to show.
+    expect(reportRequest).not.toHaveProperty('requestSnapshot');
   });
 
   it('leaves the transcript alone, which is the point of it', async () => {

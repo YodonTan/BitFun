@@ -244,6 +244,10 @@ pub struct GetSessionUsageReportRequest {
     pub context_preview_category: Option<openbitfun_core_types::UsageContextCategory>,
     #[serde(default)]
     pub context_estimate: Option<openbitfun_core_types::UsageContextEstimateRequest>,
+    /// Explicit read of the recorded request context snapshot. Older
+    /// controllers omit it and keep receiving the full cumulative report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_snapshot: Option<openbitfun_core_types::UsageRequestSnapshotReadRequest>,
 }
 
 fn default_include_hidden_subagents() -> bool {
@@ -570,6 +574,7 @@ pub async fn get_session_usage_report(
             request.include_system_prompt_preview,
             request.context_preview_category,
             request.context_estimate,
+            request.request_snapshot,
         )
         .await
         .map_err(|error| {
@@ -993,5 +998,51 @@ mod context_estimate_request_tests {
         let options = restored.context_estimate.unwrap();
         assert!(options.include_contents);
         assert!(options.context_only);
+    }
+}
+
+#[cfg(test)]
+mod request_snapshot_request_tests {
+    use super::*;
+
+    #[test]
+    fn recorded_request_snapshot_read_is_opt_in_and_legacy_safe() {
+        let legacy = serde_json::json!({"session_id": "session-1", "workspace_id": "workspace-1"});
+        let request: GetSessionUsageReportRequest = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(request.request_snapshot.is_none());
+        let serialized = serde_json::to_value(request).unwrap();
+        assert!(
+            serialized.get("request_snapshot").is_none(),
+            "an older controller must not see a new field it did not ask for"
+        );
+
+        let mut current = legacy;
+        current["request_snapshot"] = serde_json::json!({
+            "request": {
+                "executionHostId": "local",
+                "workspaceId": "workspace-1",
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+                "roundId": "round-1",
+                "attemptId": "attempt-1",
+                "attemptIndex": 1,
+                "startedAt": 1_778_347_200_000_i64,
+            },
+            "category": "systemPrompt",
+        });
+        let request: GetSessionUsageReportRequest =
+            serde_json::from_value(current.clone()).unwrap();
+        let read = request.request_snapshot.clone().expect("snapshot read");
+        assert_eq!(
+            read.category,
+            Some(openbitfun_core_types::UsageContextCategory::SystemPrompt)
+        );
+        assert_eq!(
+            read.request.as_ref().map(|request| request.attempt_id.as_str()),
+            Some("attempt-1")
+        );
+        let restored: GetSessionUsageReportRequest =
+            serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+        assert_eq!(restored.request_snapshot, Some(read));
     }
 }

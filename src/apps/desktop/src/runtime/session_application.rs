@@ -607,6 +607,7 @@ impl DesktopSessionApplication {
         include_system_prompt_preview: bool,
         context_preview_category: Option<openbitfun_core_types::UsageContextCategory>,
         context_estimate: Option<openbitfun_core_types::UsageContextEstimateRequest>,
+        request_snapshot: Option<openbitfun_core_types::UsageRequestSnapshotReadRequest>,
     ) -> DesktopSessionApplicationResult<SessionUsageReport> {
         let scope = self.resolved_scope(request).await?;
         let storage_path = self.storage_path(&scope);
@@ -622,6 +623,7 @@ impl DesktopSessionApplication {
                 include_system_prompt_preview,
                 context_preview_category,
                 context_estimate,
+                request_snapshot,
             })
             .await
             .map_err(|error| DesktopSessionApplicationError::Runtime(error.into_message()))?;

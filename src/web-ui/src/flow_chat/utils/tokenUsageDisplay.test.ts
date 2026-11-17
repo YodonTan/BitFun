@@ -9,7 +9,9 @@ import {
   formatCompactTokenCount,
   getCompressionTriggerTokens,
   getSessionContextUsageDisplay,
+  resolveRequestContextSnapshotView,
 } from './tokenUsageDisplay';
+import type { UsageRequestSnapshot } from '@/infrastructure/api/service-api/SessionAPI';
 
 const t = (key: string, params?: Record<string, unknown>): string => {
   const strings: Record<string, string> = {
@@ -352,5 +354,98 @@ describe('deriveContextUsageFromTurns', () => {
         tokenUsage: usage(9000),
       }),
     ])).toBeUndefined();
+  });
+});
+
+describe('recorded request context snapshot display', () => {
+  const snapshot = (overrides: Partial<UsageRequestSnapshot> = {}): UsageRequestSnapshot => ({
+    schemaVersion: 1,
+    request: {
+      executionHostId: 'local', workspaceId: 'workspace-1', sessionId: 'session-1', turnId: 'turn-1',
+      roundId: 'round-1', attemptId: 'round-1:attempt:1', attemptIndex: 1, startedAt: 100,
+    },
+    capturedAt: 200,
+    inputSource: 'model_request',
+    inputTotal: 500,
+    usageState: 'provider_reported',
+    estimatedTotal: 1000,
+    summaryState: 'ready',
+    categories: {
+      systemPrompt: 100, toolDefinitions: 100, rules: 100, skills: 100,
+      mcpTools: 100, subagentDefinitions: 100, summarizedConversation: 0,
+      conversation: 400, contextWindow: 8000,
+    },
+    ...overrides,
+  });
+
+  it('presents the provider total and scales the same-attempt category proportions onto it', () => {
+    const view = resolveRequestContextSnapshotView(snapshot());
+
+    // The provider said 500; the estimate summed to 1000, so every category is
+    // halved instead of the total being replaced by the category sum.
+    expect(view.used).toBe(500);
+    expect(view.categories?.find(row => row.key === 'conversation')?.value).toBe(200);
+    expect(view.categories?.reduce((sum, row) => sum + row.value, 0)).toBe(500);
+    expect(view.categoryState).toBe('ready');
+  });
+
+  it('labels an estimated total instead of passing it off as provider-reported', () => {
+    const view = resolveRequestContextSnapshotView(snapshot({
+      inputTotal: undefined, usageState: 'estimated', estimationVersion: 2,
+    }));
+
+    expect(view.used).toBe(1000);
+    expect(view.usageState).toBe('estimated');
+    expect(view.categories?.reduce((sum, row) => sum + row.value, 0)).toBe(1000);
+  });
+
+  it('never turns an unknown or legacy zero total into a measurement', () => {
+    expect(resolveRequestContextSnapshotView(snapshot({ usageState: 'unknown' })).used).toBeUndefined();
+    expect(resolveRequestContextSnapshotView(snapshot({
+      inputSource: 'legacy_record', usageState: 'provider_reported', inputTotal: 0, estimatedTotal: 0,
+    })).used).toBeUndefined();
+    const absent = resolveRequestContextSnapshotView(undefined);
+    expect(absent.usageState).toBe('unknown');
+    expect(absent.categoryState).toBe('absent');
+    expect(absent.used).toBeUndefined();
+  });
+
+  it('keeps the provider total while the categories are still pending or gone', () => {
+    const pending = resolveRequestContextSnapshotView(snapshot({ summaryState: 'pending', categories: undefined }));
+    expect(pending.used).toBe(500);
+    expect(pending.categoryState).toBe('pending');
+    expect(pending.categories).toBeUndefined();
+
+    const unavailable = resolveRequestContextSnapshotView(snapshot({
+      summaryState: 'unavailable', categories: undefined, unavailableReason: 'Evicted after a restart.',
+    }));
+    expect(unavailable.used).toBe(500);
+    expect(unavailable.categoryState).toBe('unavailable');
+    expect(unavailable.unavailableReason).toBe('Evicted after a restart.');
+  });
+
+  it('prefers the recorded context window over the Session fallback', () => {
+    expect(resolveRequestContextSnapshotView(snapshot(), 4000).max).toBe(8000);
+    expect(resolveRequestContextSnapshotView(snapshot({ categories: undefined }), 4000).max).toBe(4000);
+    expect(resolveRequestContextSnapshotView(snapshot({ categories: undefined }), undefined).max).toBeUndefined();
+  });
+
+  it('makes the Session reading follow the recorded snapshot', () => {
+    const session = makeSession({
+      currentTokenUsage: { inputTokens: 1200, outputTokens: 300, totalTokens: 1500, timestamp: 10 },
+      requestContextSnapshot: snapshot(),
+    });
+
+    expect(getSessionContextUsageDisplay(session)).toEqual({
+      current: 500, max: 8000, source: 'agent_prompt', snapshotState: 'provider_reported',
+    });
+
+    const unknown = getSessionContextUsageDisplay(makeSession({
+      currentTokenUsage: { inputTokens: 1200, outputTokens: 300, totalTokens: 1500, timestamp: 10 },
+      requestContextSnapshot: snapshot({ usageState: 'unknown' }),
+    }));
+    // A recorded request without a total is not the legacy ledger number.
+    expect(unknown.current).toBe(0);
+    expect(unknown.snapshotState).toBe('unknown');
   });
 });

@@ -24,6 +24,7 @@ import type {
   UserSteeringInjectedEvent,
   DeepReviewQueueStateChangedEvent,
   AcpContextUsageUpdatedEvent,
+  RequestContextSnapshotUpdatedEvent,
   OpenBuiltInBrowserEvent,
   InterruptedDialogTurnEvent,
 } from '@/infrastructure/api/service-api/AgentAPI';
@@ -74,6 +75,7 @@ export interface AgenticEventCallbacks {
   onDialogTurnRecovered?: (event: InterruptedDialogTurnEvent) => void;
   onTokenUsageUpdated?: (event: AgenticEvent) => void;
   onAcpContextUsageUpdated?: (event: AcpContextUsageUpdatedEvent) => void;
+  onRequestContextSnapshotUpdated?: (event: RequestContextSnapshotUpdatedEvent) => void;
   onContextCompressionStarted?: (event: AgenticEvent) => void;
   onContextCompressionCompleted?: (event: AgenticEvent) => void;
   onContextCompressionFailed?: (event: AgenticEvent) => void;
@@ -271,6 +273,17 @@ export class AgenticEventListener {
         this.unlistenFunctions.push(unlisten);
       }
 
+      if (callbacks.onRequestContextSnapshotUpdated) {
+        const unlisten = agentAPI.onRequestContextSnapshotUpdated((event) => {
+          logger.debug('Request context snapshot updated:', {
+            sessionId: event.sessionId,
+            turnId: event.turnId,
+          });
+          callbacks.onRequestContextSnapshotUpdated?.(event);
+        });
+        this.unlistenFunctions.push(unlisten);
+      }
+
       if (callbacks.onContextCompressionStarted) {
         const unlisten = agentAPI.onContextCompressionStarted((event) => {
           logger.debug('Context compression started:', event);
@@ -444,6 +457,11 @@ export class AgenticEventListener {
         break;
       case 'agentic://acp-context-usage-updated':
         callbacks.onAcpContextUsageUpdated?.(payload as unknown as AcpContextUsageUpdatedEvent);
+        break;
+      case 'agentic://request-context-snapshot-updated':
+        callbacks.onRequestContextSnapshotUpdated?.(
+          payload as unknown as RequestContextSnapshotUpdatedEvent,
+        );
         break;
       case 'agentic://context-compression-started':
         callbacks.onContextCompressionStarted?.(payload as AgenticEvent);

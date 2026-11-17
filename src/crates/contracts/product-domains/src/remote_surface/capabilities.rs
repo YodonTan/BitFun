@@ -116,6 +116,9 @@ pub enum PeerHostCapability {
     SessionTrajectoryV1,
     /// `search_referenceable_sessions` accepts an omitted query to browse.
     SessionReferenceBrowseV1,
+    /// Session usage reports can return the latest recorded parent-session model
+    /// request context snapshot, plus explicit single-category previews.
+    SessionRequestContextSnapshotV1,
     /// `submit_user_answers` is implemented for Runtime-owned questions.
     UserQuestionResponse,
     /// First human interaction disables the unattended question timeout.
@@ -184,6 +187,7 @@ impl PeerHostCapability {
         Self::WholeSessionCopyV1,
         Self::SessionTrajectoryV1,
         Self::SessionReferenceBrowseV1,
+        Self::SessionRequestContextSnapshotV1,
         Self::UserQuestionResponse,
         Self::UserQuestionInteractionV1,
         Self::SshNoneAuthV1,
@@ -241,6 +245,7 @@ impl PeerHostCapability {
             Self::WorkspaceLatexPreviewV1 => "workspace_latex_preview_v1",
             Self::SessionTrajectoryV1 => "session_trajectory_v1",
             Self::SessionReferenceBrowseV1 => "session_reference_browse_v1",
+            Self::SessionRequestContextSnapshotV1 => "session_request_context_snapshot_v1",
             Self::WholeSessionCopyV1 => "whole_session_copy_v1",
             Self::UserQuestionResponse => "user_question_response",
             Self::UserQuestionInteractionV1 => "user_question_interaction_v1",
@@ -307,6 +312,7 @@ const DESKTOP_CAPABILITIES: &[PeerHostCapability] = &[
     PeerHostCapability::WholeSessionCopyV1,
     PeerHostCapability::SessionTrajectoryV1,
     PeerHostCapability::SessionReferenceBrowseV1,
+    PeerHostCapability::SessionRequestContextSnapshotV1,
     PeerHostCapability::UserQuestionResponse,
     PeerHostCapability::UserQuestionInteractionV1,
     PeerHostCapability::SshNoneAuthV1,
@@ -338,6 +344,7 @@ const CLI_CAPABILITIES: &[PeerHostCapability] = &[
     PeerHostCapability::CancelTool,
     PeerHostCapability::ToolCatalog,
     PeerHostCapability::SessionTrajectoryV1,
+    PeerHostCapability::SessionRequestContextSnapshotV1,
     PeerHostCapability::ChatMcpCatalogV1,
     PeerHostCapability::WorkspaceIconV1,
     PeerHostCapability::WorkspaceIdReferencesV1,

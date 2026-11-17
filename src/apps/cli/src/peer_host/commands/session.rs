@@ -1129,6 +1129,7 @@ pub(crate) async fn get_session_usage_report(
             include_system_prompt_preview: options.include_system_prompt_preview,
             context_preview_category: options.context_preview_category,
             context_estimate: options.context_estimate,
+            request_snapshot: options.request_snapshot,
         })
         .await
         .map_err(|error| {
@@ -1149,6 +1150,7 @@ struct UsageReportOptions {
     include_system_prompt_preview: bool,
     context_preview_category: Option<openbitfun_core_types::UsageContextCategory>,
     context_estimate: Option<openbitfun_core_types::UsageContextEstimateRequest>,
+    request_snapshot: Option<openbitfun_core_types::UsageRequestSnapshotReadRequest>,
 }
 
 /// Reads the Desktop `GetSessionUsageReportRequest` option fields with the
@@ -1175,7 +1177,60 @@ fn usage_report_options(request: &Value) -> Result<UsageReportOptions, String> {
             .map(|value| serde_json::from_value(value.clone()))
             .transpose()
             .map_err(|error| format!("Invalid context estimate options: {error}"))?,
+        request_snapshot: ["requestSnapshot", "request_snapshot"]
+            .iter()
+            .find_map(|key| request.get(*key))
+            .filter(|value| !value.is_null())
+            .map(request_snapshot_read_request)
+            .transpose()?,
     })
+}
+
+/// Validates an explicit recorded request-context snapshot read.
+///
+/// The identity fields arrive camelCase from the shared contract; snake_case
+/// aliases are accepted for older hand-written controllers. Absent fields keep
+/// their contract defaults and unknown extra fields are ignored, so an older or
+/// newer controller still reaches the shared host read mode.
+fn request_snapshot_read_request(
+    value: &Value,
+) -> Result<openbitfun_core_types::UsageRequestSnapshotReadRequest, String> {
+    let mut object = value
+        .as_object()
+        .ok_or_else(|| "Invalid request snapshot options: expected an object".to_string())?
+        .clone();
+    if let Some(identity) = object.get("request").and_then(Value::as_object).cloned() {
+        object.insert(
+            "request".to_string(),
+            Value::Object(alias_request_identity(identity)),
+        );
+    }
+    serde_json::from_value(Value::Object(object))
+        .map_err(|error| format!("Invalid request snapshot options: {error}"))
+}
+
+/// Accepts the camelCase identity from the shared contract plus the snake_case
+/// spellings an older hand-written controller may send.
+fn alias_request_identity(
+    mut identity: serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    for (snake_case, camel_case) in [
+        ("execution_host_id", "executionHostId"),
+        ("workspace_id", "workspaceId"),
+        ("session_id", "sessionId"),
+        ("turn_id", "turnId"),
+        ("round_id", "roundId"),
+        ("attempt_id", "attemptId"),
+        ("attempt_index", "attemptIndex"),
+        ("started_at", "startedAt"),
+    ] {
+        if !identity.contains_key(camel_case) {
+            if let Some(alias) = identity.remove(snake_case) {
+                identity.insert(camel_case.to_string(), alias);
+            }
+        }
+    }
+    identity
 }
 
 fn session_stats_validation_error(error: impl std::fmt::Display) -> String {
@@ -1236,6 +1291,7 @@ mod tests {
                 include_system_prompt_preview: false,
                 context_preview_category: None,
                 context_estimate: None,
+                request_snapshot: None,
             }
         );
         let snake = json!({
@@ -1250,6 +1306,7 @@ mod tests {
                 include_system_prompt_preview: true,
                 context_preview_category: Some(UsageContextCategory::ToolDefinitions),
                 context_estimate: None,
+                request_snapshot: None,
             }
         );
         // A category a newer controller knows maps to Unknown instead of failing.
@@ -1274,6 +1331,112 @@ mod tests {
             );
         }
         assert!(super::usage_report_options(&json!({ "context_preview_category": 3 })).is_err());
+    }
+
+    #[test]
+    fn usage_report_options_parse_recorded_request_snapshot_reads() {
+        use openbitfun_core_types::{
+            UsageContextCategory, UsageRequestRef, UsageRequestSnapshotReadRequest,
+        };
+        use serde_json::json;
+
+        let identity = json!({
+            "executionHostId": "local",
+            "workspaceId": "workspace-1",
+            "sessionId": "session-1",
+            "turnId": "turn-1",
+            "roundId": "round-1",
+            "attemptId": "attempt-1",
+            "attemptIndex": 2,
+            "startedAt": 1_778_347_200_000_i64,
+        });
+        let expected = UsageRequestSnapshotReadRequest {
+            request: Some(UsageRequestRef {
+                execution_host_id: "local".to_string(),
+                workspace_id: Some("workspace-1".to_string()),
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                round_id: "round-1".to_string(),
+                attempt_id: "attempt-1".to_string(),
+                attempt_index: 2,
+                started_at: 1_778_347_200_000,
+            }),
+            category: Some(UsageContextCategory::SystemPrompt),
+        };
+
+        for key in ["requestSnapshot", "request_snapshot"] {
+            let options = super::usage_report_options(&json!({
+                key: { "request": identity.clone(), "category": "systemPrompt" },
+            }))
+            .unwrap();
+            assert_eq!(options.request_snapshot, Some(expected.clone()));
+        }
+
+        // Absent or null keeps the legacy cumulative report.
+        assert_eq!(
+            super::usage_report_options(&json!({ "session_id": "s" }))
+                .unwrap()
+                .request_snapshot,
+            None
+        );
+        for key in ["requestSnapshot", "request_snapshot"] {
+            assert_eq!(
+                super::usage_report_options(&json!({ key: null }))
+                    .unwrap()
+                    .request_snapshot,
+                None
+            );
+        }
+
+        // A snapshot read without identity or category still asks for the
+        // recorded numbers.
+        assert_eq!(
+            super::usage_report_options(&json!({ "requestSnapshot": {} }))
+                .unwrap()
+                .request_snapshot,
+            Some(UsageRequestSnapshotReadRequest::default())
+        );
+
+        // Snake_case identity fields from an older hand-written controller are
+        // accepted and round-trip to the same identity.
+        let snake_identity = super::usage_report_options(&json!({
+            "request_snapshot": {
+                "request": {
+                    "execution_host_id": "local",
+                    "workspace_id": "workspace-1",
+                    "session_id": "session-1",
+                    "turn_id": "turn-1",
+                    "round_id": "round-1",
+                    "attempt_id": "attempt-1",
+                    "attempt_index": 2,
+                    "started_at": 1_778_347_200_000_i64,
+                },
+                "category": "systemPrompt",
+            },
+        }))
+        .unwrap();
+        assert_eq!(snake_identity.request_snapshot, Some(expected));
+
+        // Unknown extra fields from a newer controller are ignored.
+        assert!(super::usage_report_options(&json!({
+            "requestSnapshot": { "request": identity, "futureField": true },
+        }))
+        .unwrap()
+        .request_snapshot
+        .is_some());
+
+        for malformed in [
+            json!({ "requestSnapshot": 3 }),
+            json!({ "requestSnapshot": [] }),
+            json!({ "requestSnapshot": { "category": 7 } }),
+            json!({ "requestSnapshot": { "request": {} } }),
+            json!({ "requestSnapshot": { "request": { "executionHostId": "local" } } }),
+        ] {
+            assert!(
+                super::usage_report_options(&malformed).is_err(),
+                "malformed request snapshot options must be rejected: {malformed}"
+            );
+        }
     }
 
     use super::{

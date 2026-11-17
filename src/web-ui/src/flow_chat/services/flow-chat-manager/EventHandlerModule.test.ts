@@ -3,6 +3,7 @@ import {
   __test_only__,
   handleDialogTurnComplete,
   handlePromptSuggestion,
+  handleRequestContextSnapshotUpdate,
   handleSessionHistoryChanged,
   handleSessionStateChanged,
   insertSteeringItemIfAbsent,
@@ -2552,5 +2553,76 @@ describe('model round host timing', () => {
     expect(round?.ttftMs).toBe(ttftMs);
     expect(round?.streamDurationMs).toBe(ttftMs === undefined ? undefined : 1_200);
     expect(round?.firstVisibleOutputMs).toBe(ttftMs === undefined ? undefined : 200);
+  });
+});
+
+describe('recorded request context snapshot events', () => {
+  beforeEach(() => { resetFlowChatStore(); stateMachineManager.clear(); activateSurface('local'); });
+  afterEach(() => { resetFlowChatStore(); stateMachineManager.clear(); activateSurface('local'); });
+
+  const recorded = (overrides: Record<string, unknown> = {}) => ({
+    schemaVersion: 1,
+    request: {
+      executionHostId: 'local', sessionId: 'session-1', turnId: 'turn-1', roundId: 'round-1',
+      attemptId: 'round-1:attempt:1', attemptIndex: 1, startedAt: 100,
+    },
+    capturedAt: 200, inputSource: 'model_request', inputTotal: 900,
+    usageState: 'provider_reported', estimatedTotal: 1000, summaryState: 'ready',
+    ...overrides,
+  });
+
+  it('records the read model without billing, goal accounting or context usage', () => {
+    const store = FlowChatStore.getInstance();
+    store.createSession('session-1', {});
+    store.setState(state => {
+      const session = state.sessions.get('session-1')!;
+      const sessions = new Map(state.sessions);
+      sessions.set('session-1', {
+        ...session,
+        currentTokenUsage: { inputTokens: 10, outputTokens: 5, totalTokens: 15, timestamp: 1 },
+        currentContextUsage: {
+          inputTokens: 900, outputTokens: 5, totalTokens: 905, timestamp: 2,
+          turnId: 'turn-1', source: 'model_request',
+        },
+      });
+      return { ...state, sessions };
+    });
+
+    handleRequestContextSnapshotUpdate({
+      sessionId: 'session-1', turnId: 'turn-1', snapshot: recorded(),
+    } as never);
+
+    const session = store.getState().sessions.get('session-1');
+    expect(session?.requestContextSnapshot?.inputTotal).toBe(900);
+    // Billing facts belong to their own events; this one only records context.
+    expect(session?.currentTokenUsage?.totalTokens).toBe(15);
+    expect(session?.currentContextUsage?.totalTokens).toBe(905);
+  });
+
+  it('drops a stale capture and an event for a session that is no longer rendered', () => {
+    const store = FlowChatStore.getInstance();
+    store.createSession('session-1', {});
+    handleRequestContextSnapshotUpdate({
+      sessionId: 'session-1', turnId: 'turn-1',
+      snapshot: recorded({
+        request: {
+          executionHostId: 'local', sessionId: 'session-1', turnId: 'turn-1', roundId: 'round-1',
+          attemptId: 'round-1:attempt:2', attemptIndex: 2, startedAt: 300,
+        },
+        inputTotal: 1200,
+      }),
+    } as never);
+
+    handleRequestContextSnapshotUpdate({
+      sessionId: 'session-1', turnId: 'turn-1', snapshot: recorded(),
+    } as never);
+
+    expect(store.getState().sessions.get('session-1')?.requestContextSnapshot?.inputTotal).toBe(1200);
+
+    handleRequestContextSnapshotUpdate({
+      sessionId: 'gone-session', turnId: 'turn-1',
+      snapshot: recorded({ request: { ...recorded().request, sessionId: 'gone-session' } }),
+    } as never);
+    expect(store.getState().sessions.has('gone-session')).toBe(false);
   });
 });

@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ChatInputWorkspaceStrip } from './ChatInputWorkspaceStrip';
 import type { WorkspaceInfo } from '@/shared/types';
+import type { UsageRequestRef, UsageRequestSnapshot } from '@/infrastructure/api/service-api/SessionAPI';
 import { formatDuration } from '@/shared/utils/format';
 
 const mocks = vi.hoisted(() => ({
@@ -434,14 +435,34 @@ describe('ChatInputWorkspaceStrip git refresh behavior', () => {
   it('opens the overview from the context ring, highlights categories and offers explicit preview and report actions', async () => {
     const onOpen = vi.fn();
     const onCompact = vi.fn();
-    const loadContext = vi.fn(async () => ({ capturedAt: 123, contents: {}, composition: {
+    const request = {
+      executionHostId: 'local', workspaceId: 'workspace-1', sessionId: 'session-1', turnId: 'turn-1',
+      roundId: 'round-1', attemptId: 'round-1:attempt:1', attemptIndex: 1, startedAt: 100,
+    };
+    const recorded = (categories: Record<string, number>, capturedAt: number) => {
+      const sum = Object.entries(categories)
+        .filter(([key]) => key !== 'contextWindow')
+        .reduce((total, [, value]) => total + value, 0);
+      return {
+        status: 'ready' as const,
+        snapshot: {
+          schemaVersion: 1, request, capturedAt, inputSource: 'model_request' as const,
+          inputTotal: sum, usageState: 'provider_reported' as const, estimatedTotal: sum,
+          summaryState: 'ready' as const,
+          categories: categories as never,
+        },
+      };
+    };
+    let recordedSnapshot = recorded({
       systemPrompt: 1600, toolDefinitions: 3900, rules: 8300, skills: 1700,
       mcpTools: 2700, subagentDefinitions: 1100, summarizedConversation: 0,
       conversation: 114000, contextWindow: 256000,
-    } }));
+    }, 123);
+    // Opening the overview reads only the recorded snapshot, never the report.
+    const loadSnapshot = vi.fn(async () => recordedSnapshot);
     await act(async () => root.render(
       <ChatInputWorkspaceStrip workspaceId="workspace-1" repositoryPath="/project" workspaceLabel="Project"
-        usageReport={{ visible: true, currentTokens: 133300, maxTokens: 256000, onOpen, onCompact, loadContext,
+        usageReport={{ visible: true, currentTokens: 133300, maxTokens: 256000, onOpen, onCompact, loadSnapshot,
           previewSession: { sessionId: 'session-1', workspaceId: 'workspace-1' } }} />,
     ));
     const trigger = container.querySelector<HTMLButtonElement>('[data-openbitfun-part="usageAction"]')!;
@@ -451,7 +472,7 @@ describe('ChatInputWorkspaceStrip git refresh behavior', () => {
     expect(overview.getAttribute('aria-label')).toBe('Context composition');
     expect(overview.querySelector('.context-usage-popover__header')?.textContent).toContain('Context composition');
     expect(trigger.getAttribute('aria-expanded')).toBe('true');
-    expect(loadContext).toHaveBeenCalledOnce();
+    expect(loadSnapshot).toHaveBeenCalledOnce();
     expect(onOpen).not.toHaveBeenCalled();
     expect(overview.querySelectorAll('dl [data-usage-category]')).toHaveLength(7);
     expect(overview.querySelector('[data-usage-category="conversation"] dd')?.textContent).toBe('114K');
@@ -473,6 +494,8 @@ describe('ChatInputWorkspaceStrip git refresh behavior', () => {
     await act(async () => rules.querySelector<HTMLButtonElement>('button')!.click());
     expect(mocks.openContextPreview).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: 'session-1', reportSessionId: 'session-1', workspaceId: 'workspace-1', category: 'rules',
+      // The preview is pinned to the recorded request on screen.
+      request,
     }));
     expect(onOpen).not.toHaveBeenCalled();
     const headerActions = overview.querySelectorAll<HTMLButtonElement>('.context-usage-popover__header-actions button');
@@ -481,14 +504,14 @@ describe('ChatInputWorkspaceStrip git refresh behavior', () => {
     await act(async () => headerActions[0]!.click());
     expect(onCompact).toHaveBeenCalledOnce();
     expect(document.querySelector('[data-testid="context-usage-popover"]')).toBeNull();
-    loadContext.mockResolvedValueOnce({ capturedAt: 456, contents: {}, composition: {
+    recordedSnapshot = recorded({
       systemPrompt: 1600, toolDefinitions: 3900, rules: 8300, skills: 1700,
       mcpTools: 2700, subagentDefinitions: 1100, summarizedConversation: 2000,
       conversation: 0, contextWindow: 256000,
-    } });
+    }, 456);
     await act(async () => trigger.click());
     const reopenedOverview = document.querySelector<HTMLElement>('[data-testid="context-usage-popover"]')!;
-    expect(loadContext).toHaveBeenCalledTimes(2);
+    expect(loadSnapshot).toHaveBeenCalledTimes(2);
     expect(reopenedOverview.querySelector('[data-usage-category="conversation"] dd')?.textContent).toBe('0');
     expect(reopenedOverview.querySelector('[data-usage-category="summarizedConversation"] dd')?.textContent).toBe('2K');
     await act(async () => reopenedOverview.querySelector<HTMLButtonElement>('[data-testid="context-usage-view-report"]')!.click());
@@ -517,51 +540,240 @@ describe('ChatInputWorkspaceStrip git refresh behavior', () => {
     expect(document.querySelector('[data-testid="context-usage-compact"]')).toBeNull();
   });
 
-  it('shows unavailable legacy counts and loading errors instead of a fabricated category chart', async () => {
-    const loadContext = vi.fn().mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('offline'));
+  it('shows the unsupported host state and loading errors instead of a fabricated category chart', async () => {
     await act(async () => root.render(
       <ChatInputWorkspaceStrip workspaceId="workspace-1" repositoryPath="/project" workspaceLabel="Project"
-        usageReport={{ visible: true, currentTokens: 480, maxTokens: 4000, onOpen: vi.fn(), loadContext }} />,
+        usageReport={{ visible: true, currentTokens: 480, maxTokens: 4000, onOpen: vi.fn(), snapshotUnsupported: true }} />,
     ));
     const trigger = container.querySelector<HTMLButtonElement>('[data-openbitfun-part="usageAction"]')!;
     await act(async () => trigger.click());
-    expect(document.querySelector('[data-testid="context-usage-popover"]')?.textContent).toContain('usage.context.unsupported');
-    expect(document.querySelector('.context-usage-popover__bar')).toBeNull();
+    const unsupported = document.querySelector('[data-testid="context-usage-popover"]');
+    expect(unsupported?.textContent).toContain('usage.context.snapshotUnsupported');
+    expect(unsupported?.querySelector('.context-usage-popover__bar')).toBeNull();
+    // A legacy total may still be shown, but no category support is claimed.
+    expect(unsupported?.textContent).toContain('usage.context.legacyTotal');
+    expect(unsupported?.querySelectorAll('dl [data-usage-category]')).toHaveLength(0);
+    await act(async () => document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
+    expect(document.querySelector('[data-testid="context-usage-popover"]')).toBeNull();
     await act(async () => trigger.click());
-    await act(async () => trigger.click());
-    expect(document.querySelector('[data-testid="context-usage-popover"]')?.textContent).toContain('usage.context.loadFailed');
-    expect(document.querySelector('.context-usage-popover__bar')).toBeNull();
+    expect(document.querySelector('[data-testid="context-usage-popover"]')?.textContent)
+      .toContain('usage.context.snapshotUnsupported');
   });
 
-  it('keeps legacy category counts without treating the composer default as reported capacity', async () => {
-    const loadContext = vi.fn(async () => ({ capturedAt: 123, contents: {}, composition: {
-      systemPrompt: 100, toolDefinitions: 20, rules: 0, skills: 0, mcpTools: 0,
-      subagentDefinitions: 0, summarizedConversation: 40, conversation: 840,
+  it('reports a failed snapshot read instead of a fabricated category chart', async () => {
+    const loadSnapshot = vi.fn(async () => ({ status: 'failed' as const, errorMessage: 'offline' }));
+    await act(async () => root.render(
+      <ChatInputWorkspaceStrip workspaceId="workspace-1" repositoryPath="/project" workspaceLabel="Project"
+        usageReport={{ visible: true, currentTokens: 480, maxTokens: 4000, onOpen: vi.fn(), loadSnapshot }} />,
+    ));
+    const trigger = container.querySelector<HTMLButtonElement>('[data-openbitfun-part="usageAction"]')!;
+    await act(async () => trigger.click());
+    const overview = document.querySelector('[data-testid="context-usage-popover"]');
+    expect(overview?.textContent).toContain('usage.context.loadFailed');
+    expect(overview?.querySelector('.context-usage-popover__bar')).toBeNull();
+    expect(overview?.querySelectorAll('dl [data-usage-category]')).toHaveLength(0);
+  });
+
+  it('scales recorded category estimates onto the reported total instead of summing them', async () => {
+    const request = {
+      executionHostId: 'local', workspaceId: 'workspace-1', sessionId: 'session-1', turnId: 'turn-1',
+      roundId: 'round-1', attemptId: 'round-1:attempt:1', attemptIndex: 1, startedAt: 100,
+    };
+    const loadSnapshot = vi.fn(async () => ({ status: 'ready' as const, snapshot: {
+      schemaVersion: 1, request, capturedAt: 123, inputSource: 'model_request' as const,
+      // The provider reported twice what the same-attempt estimate summed to.
+      inputTotal: 2000, usageState: 'provider_reported' as const, estimatedTotal: 1000,
+      summaryState: 'ready' as const,
+      categories: {
+        systemPrompt: 100, toolDefinitions: 100, rules: 100, skills: 100, mcpTools: 100,
+        subagentDefinitions: 100, summarizedConversation: 0, conversation: 400, contextWindow: 4000,
+      },
     } }));
     await act(async () => root.render(
       <ChatInputWorkspaceStrip workspaceId="workspace-1" repositoryPath="/project" workspaceLabel="Project"
-        usageReport={{ visible: true, currentTokens: 1000, maxTokens: 128128, onOpen: vi.fn(), loadContext }} />,
+        usageReport={{ visible: true, currentTokens: 1000, maxTokens: 4000, onOpen: vi.fn(), loadSnapshot }} />,
     ));
     await act(async () => container.querySelector<HTMLButtonElement>('[data-openbitfun-part="usageAction"]')!.click());
     const overview = document.querySelector('[data-testid="context-usage-popover"]')!;
-    expect(overview.querySelectorAll('dl [data-usage-category]')).toHaveLength(8);
-    expect(overview.textContent).toContain('usage.context.capacityUnavailable');
-    expect(overview.querySelector('.context-usage-popover__bar')).toBeNull();
+    expect(overview.querySelector('[data-usage-category="conversation"] dd')?.textContent).toBe('800');
+    // The total stays the provider's number, never the category sum.
+    expect(overview.textContent).toContain('~2K / 4K Tokens');
+    expect(overview.textContent).toContain('50% Full');
+  });
+
+  it('moves an open overview from classifying to unavailable when the host degrades the summary', async () => {
+    const request: UsageRequestRef = {
+      executionHostId: 'local', workspaceId: 'workspace-1', sessionId: 'session-1', turnId: 'turn-1',
+      roundId: 'round-1', attemptId: 'round-1:attempt:1', attemptIndex: 1, startedAt: 100,
+    };
+    const pending: UsageRequestSnapshot = {
+      schemaVersion: 1, request, capturedAt: 200, inputSource: 'model_request',
+      inputTotal: 1000, usageState: 'provider_reported', estimatedTotal: 1000,
+      summaryState: 'pending',
+      categories: {
+        systemPrompt: 1000, toolDefinitions: 0, rules: 0, skills: 0, mcpTools: 0,
+        subagentDefinitions: 0, summarizedConversation: 0, conversation: 0, contextWindow: 4000,
+      },
+    };
+    // The host degrades a dead pending summary to `unavailable` in place, so the
+    // capture time does not move and the categories are gone.
+    const degraded: UsageRequestSnapshot = {
+      ...pending, summaryState: 'unavailable', categories: undefined,
+      estimatedTotal: undefined, estimationVersion: undefined,
+      unavailableReason: 'No summary job is live for this recorded request.',
+    };
+    const loadSnapshot = vi.fn(async () => ({ status: 'ready' as const, snapshot: pending }));
+    const render = (snapshot: UsageRequestSnapshot) => <ChatInputWorkspaceStrip workspaceId="workspace-1"
+      repositoryPath="/project" workspaceLabel="Project" usageReport={{
+        visible: true, currentTokens: 1000, maxTokens: 4000, onOpen: vi.fn(), loadSnapshot, snapshot,
+      }} />;
+    await act(async () => root.render(render(pending)));
+    await act(async () => container.querySelector<HTMLButtonElement>('[data-openbitfun-part="usageAction"]')!.click());
+    const overview = document.querySelector('[data-testid="context-usage-popover"]')!;
+    expect(overview.textContent).toContain('usage.context.pendingClassification');
+    expect(overview.querySelectorAll('dl [data-usage-category]')).toHaveLength(0);
+
+    await act(async () => root.render(render(degraded)));
+
+    const degradedOverview = document.querySelector('[data-testid="context-usage-popover"]')!;
+    expect(degradedOverview.textContent).toContain('usage.context.summaryUnavailable');
+    expect(degradedOverview.textContent).toContain('No summary job is live for this recorded request.');
+    expect(degradedOverview.textContent).not.toContain('usage.context.pendingClassification');
+    // The provider total survives the degradation.
+    expect(degradedOverview.textContent).toContain('~1K / 4K Tokens');
+    expect(loadSnapshot).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the open overview on the reading it opened with when live tokens change', async () => {
+    const request = {
+      executionHostId: 'local', workspaceId: 'workspace-1', sessionId: 'session-1', turnId: 'turn-1',
+      roundId: 'round-1', attemptId: 'round-1:attempt:1', attemptIndex: 1, startedAt: 100,
+    };
+    const loadSnapshot = vi.fn(async () => ({ status: 'ready' as const, snapshot: {
+      schemaVersion: 1, request, capturedAt: 123, inputSource: 'model_request' as const,
+      inputTotal: 1000, usageState: 'provider_reported' as const, estimatedTotal: 1000,
+      summaryState: 'ready' as const,
+      categories: {
+        systemPrompt: 1000, toolDefinitions: 0, rules: 0, skills: 0, mcpTools: 0,
+        subagentDefinitions: 0, summarizedConversation: 0, conversation: 0, contextWindow: 4000,
+      },
+    } }));
+    const render = (currentTokens: number) => <ChatInputWorkspaceStrip workspaceId="workspace-1"
+      repositoryPath="/project" workspaceLabel="Project" usageReport={{
+        visible: true, currentTokens, maxTokens: 4000, onOpen: vi.fn(), loadSnapshot,
+      }} />;
+    await act(async () => root.render(render(100)));
+    await act(async () => container.querySelector<HTMLButtonElement>('[data-openbitfun-part="usageAction"]')!.click());
+    expect(document.querySelector('[data-testid="context-usage-popover"]')?.textContent).toContain('~1K / 4K Tokens');
+
+    // A live token tick is not a new recorded request: the open overview keeps
+    // its reading instead of re-reading on every update.
+    await act(async () => root.render(render(3900)));
+    expect(loadSnapshot).toHaveBeenCalledOnce();
+    expect(document.querySelector('[data-testid="context-usage-popover"]')?.textContent).toContain('~1K / 4K Tokens');
+  });
+
+  it('adopts the newer recorded reading the store delivers while the overview is open', async () => {
+    const request = (attemptIndex: number, startedAt: number): UsageRequestRef => ({
+      executionHostId: 'local', workspaceId: 'workspace-1', sessionId: 'session-1', turnId: 'turn-1',
+      roundId: 'round-1', attemptId: `round-1:attempt:${attemptIndex}`, attemptIndex, startedAt,
+    });
+    const recorded = (
+      attemptIndex: number,
+      startedAt: number,
+      inputTotal: number,
+      capturedAt: number,
+    ): UsageRequestSnapshot => ({
+      schemaVersion: 1, request: request(attemptIndex, startedAt), capturedAt,
+      inputSource: 'model_request', inputTotal,
+      usageState: 'provider_reported', estimatedTotal: inputTotal,
+      summaryState: 'ready',
+      categories: {
+        systemPrompt: inputTotal, toolDefinitions: 0, rules: 0, skills: 0, mcpTools: 0,
+        subagentDefinitions: 0, summarizedConversation: 0, conversation: 0, contextWindow: 4000,
+      },
+    });
+    const older = recorded(1, 100, 1000, 100);
+    // The open-time read answers with the older reading: adopting the newer one
+    // must come from the delivered prop, not from another host read.
+    const loadSnapshot = vi.fn(async () => ({ status: 'ready' as const, snapshot: older }));
+    const render = (snapshot: UsageRequestSnapshot) => <ChatInputWorkspaceStrip workspaceId="workspace-1"
+      repositoryPath="/project" workspaceLabel="Project" usageReport={{
+        visible: true, currentTokens: 1000, maxTokens: 4000, onOpen: vi.fn(), loadSnapshot, snapshot,
+      }} />;
+    await act(async () => root.render(render(older)));
+    await act(async () => container.querySelector<HTMLButtonElement>('[data-openbitfun-part="usageAction"]')!.click());
+    expect(document.querySelector('[data-testid="context-usage-popover"]')?.textContent).toContain('~1K / 4K Tokens');
+
+    const newerSnapshot = recorded(2, 500, 2000, 200);
+    await act(async () => root.render(render(newerSnapshot)));
+
+    expect(document.querySelector('[data-testid="context-usage-popover"]')?.textContent).toContain('~2K / 4K Tokens');
+
+    // A later capture of that same attempt may not replace the provider total
+    // with an estimate.
+    await act(async () => root.render(render({
+      ...newerSnapshot, capturedAt: 300, inputTotal: undefined,
+      usageState: 'estimated', estimatedTotal: 4000,
+    })));
+    expect(document.querySelector('[data-testid="context-usage-popover"]')?.textContent).toContain('~2K / 4K Tokens');
+    expect(loadSnapshot).toHaveBeenCalledOnce();
+  });
+
+  it('labels an estimated recording as non-reported and keeps an unavailable category section explicit', async () => {
+    const request = {
+      executionHostId: 'local', workspaceId: 'workspace-1', sessionId: 'session-1', turnId: 'turn-1',
+      roundId: 'round-1', attemptId: 'round-1:attempt:1', attemptIndex: 1, startedAt: 100,
+    };
+    const base = {
+      schemaVersion: 1, request, capturedAt: 123, inputSource: 'model_request' as const,
+      inputTotal: 2000, estimatedTotal: 2000,
+      categories: {
+        systemPrompt: 1000, toolDefinitions: 0, rules: 0, skills: 0, mcpTools: 0,
+        subagentDefinitions: 0, summarizedConversation: 0, conversation: 1000, contextWindow: 4000,
+      },
+    };
+    let recordedSnapshot = { status: 'ready' as const, snapshot: {
+      ...base, usageState: 'estimated' as const, estimationVersion: 1, summaryState: 'ready' as const,
+    } };
+    await act(async () => root.render(
+      <ChatInputWorkspaceStrip workspaceId="workspace-1" repositoryPath="/project" workspaceLabel="Project"
+        usageReport={{ visible: true, currentTokens: 2000, maxTokens: 4000, onOpen: vi.fn(),
+          loadSnapshot: async () => recordedSnapshot }} />,
+    ));
+    const trigger = container.querySelector<HTMLButtonElement>('[data-openbitfun-part="usageAction"]')!;
+    await act(async () => trigger.click());
+    const overview = document.querySelector('[data-testid="context-usage-popover"]')!;
+    expect(overview.textContent).toContain('usage.context.estimatedNotReported');
+    expect(overview.querySelectorAll('dl [data-usage-category]')).toHaveLength(7);
+    await act(async () => document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
+
+    recordedSnapshot = { status: 'ready' as const, snapshot: {
+      ...base, usageState: 'provider_reported' as const, summaryState: 'unavailable' as const,
+      categories: undefined, unavailableReason: 'The request content was released after a restart.',
+    } } as never;
+    await act(async () => trigger.click());
+    const unavailable = document.querySelector('[data-testid="context-usage-popover"]')!;
+    expect(unavailable.querySelectorAll('dl [data-usage-category]')).toHaveLength(0);
+    expect(unavailable.textContent).toContain('usage.context.summaryUnavailable');
+    expect(unavailable.textContent).toContain('The request content was released after a restart.');
+    // The provider total survives an unavailable category section.
+    expect(unavailable.textContent).toContain('~2K / 4K Tokens');
   });
 
   it('closes on a session or peer activation switch and ignores the old in-flight overview', async () => {
-    let resolve!: (value: undefined) => void;
-    const loadContext = vi.fn(() => new Promise<undefined>(done => { resolve = done; }));
+    let resolve!: (value: { status: 'unsupported' }) => void;
+    const loadSnapshot = vi.fn(() => new Promise<{ status: 'unsupported' }>(done => { resolve = done; }));
     const render = (sessionKey: string) => <ChatInputWorkspaceStrip workspaceId="workspace-1"
       repositoryPath="/project" workspaceLabel="Project" usageReport={{
-        visible: true, currentTokens: 480, maxTokens: 4000, onOpen: vi.fn(), loadContext, sessionKey,
+        visible: true, currentTokens: 480, maxTokens: 4000, onOpen: vi.fn(), loadSnapshot, sessionKey,
       }} />;
     await act(async () => root.render(render('peer-a:session-1')));
     await act(async () => container.querySelector<HTMLButtonElement>('[data-openbitfun-part="usageAction"]')!.click());
     expect(document.querySelector('[data-testid="context-usage-popover"]')?.textContent).toContain('usage.context.loading');
     await act(async () => root.render(render('peer-b:session-1')));
     expect(document.querySelector('[data-testid="context-usage-popover"]')).toBeNull();
-    await act(async () => resolve(undefined));
+    await act(async () => resolve({ status: 'unsupported' }));
     expect(document.querySelector('[data-testid="context-usage-popover"]')).toBeNull();
   });
 

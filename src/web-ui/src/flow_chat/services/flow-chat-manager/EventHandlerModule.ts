@@ -46,6 +46,7 @@ import type {
   ModelRoundAttemptSupersededEvent,
   OpenBuiltInBrowserEvent,
   AcpContextUsageUpdatedEvent,
+  RequestContextSnapshotUpdatedEvent,
   PromptSuggestionEvent,
   SessionModelFallbackAppliedEvent,
   SessionReasoningPresetAutoClearedEvent,
@@ -960,6 +961,9 @@ export async function initializeEventListeners(
     },
     onAcpContextUsageUpdated: (event) => {
       handleAcpContextUsageUpdate(event);
+    },
+    onRequestContextSnapshotUpdated: (event) => {
+      handleRequestContextSnapshotUpdate(event);
     },
     onContextCompressionStarted: (event) => {
       handleCompressionStarted(context, event);
@@ -2743,6 +2747,29 @@ function handleAcpContextUsageUpdate(event: AcpContextUsageUpdatedEvent): void {
     sessionId,
     cost ? { used, size, cost } : { used, size },
   );
+}
+
+/**
+ * Record one request's context facts into the read model the context overview
+ * reads. Non-billing by construction: it never touches cumulative token usage,
+ * goal accounting, or `currentContextUsage`, and the store's identity/order
+ * rules decide acceptance so a stale capture cannot replace a newer request.
+ */
+export function handleRequestContextSnapshotUpdate(event: RequestContextSnapshotUpdatedEvent): void {
+  const sessionId = event.sessionId;
+  const snapshot = event.snapshot;
+  if (!sessionId || !snapshot?.request) {
+    log.debug('Dropped invalid request context snapshot update', { sessionId });
+    return;
+  }
+
+  const store = FlowChatStore.getInstance();
+  if (!store.getState().sessions.has(sessionId)) {
+    log.debug('Session not found (request context snapshot update)', { sessionId });
+    return;
+  }
+
+  store.setRequestContextSnapshot(sessionId, snapshot);
 }
 
 /**

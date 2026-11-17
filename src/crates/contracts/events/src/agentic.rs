@@ -298,6 +298,14 @@ pub enum AgenticEvent {
         token_details: Option<serde_json::Value>,
     },
 
+    /// Numeric-only recorded context facts for one model request. Observational
+    /// only: it never adds to cumulative token or billing accounting.
+    RequestContextSnapshotUpdated {
+        session_id: String,
+        turn_id: String,
+        snapshot: openbitfun_core_types::UsageRequestSnapshot,
+    },
+
     ContextCompressionStarted {
         session_id: String,
         turn_id: String,
@@ -741,6 +749,7 @@ impl AgenticEvent {
             | Self::SubagentSessionLinked { session_id, .. }
             | Self::DialogTurnCompleted { session_id, .. }
             | Self::TokenUsageUpdated { session_id, .. }
+            | Self::RequestContextSnapshotUpdated { session_id, .. }
             | Self::ContextCompressionStarted { session_id, .. }
             | Self::ContextCompressionCompleted { session_id, .. }
             | Self::ContextCompressionFailed { session_id, .. }
@@ -773,6 +782,7 @@ impl AgenticEvent {
             | Self::DialogTurnRecovered { turn_id, .. }
             | Self::DialogTurnFailed { turn_id, .. }
             | Self::TokenUsageUpdated { turn_id, .. }
+            | Self::RequestContextSnapshotUpdated { turn_id, .. }
             | Self::ContextCompressionStarted { turn_id, .. }
             | Self::ContextCompressionCompleted { turn_id, .. }
             | Self::ContextCompressionFailed { turn_id, .. }
@@ -816,6 +826,7 @@ impl AgenticEvent {
             | Self::ModelRoundAttemptSuperseded { .. }
             | Self::ModelRoundCompleted { .. }
             | Self::TokenUsageUpdated { .. }
+            | Self::RequestContextSnapshotUpdated { .. }
             | Self::DialogTurnCompleted { .. }
             | Self::ContextCompressionStarted { .. }
             | Self::ThreadGoalUpdated { .. }
@@ -1279,5 +1290,67 @@ mod tests {
         let serialized = serde_json::to_value(event).expect("serialize event");
         assert_eq!(serialized["type"], "SessionReasoningPresetAutoCleared");
         assert_eq!(serialized["previous_preset_id"], "high");
+    }
+
+    fn request_context_snapshot() -> openbitfun_core_types::UsageRequestSnapshot {
+        openbitfun_core_types::UsageRequestSnapshot {
+            schema_version: openbitfun_core_types::REQUEST_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
+            request: openbitfun_core_types::UsageRequestRef {
+                execution_host_id: "local".to_string(),
+                workspace_id: Some("workspace-1".to_string()),
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                round_id: "round-1".to_string(),
+                attempt_id: "round-1:attempt:1".to_string(),
+                attempt_index: 1,
+                started_at: 1_778_347_200_000,
+            },
+            captured_at: 1_778_347_200_500,
+            input_source: openbitfun_core_types::UsageRequestInputSource::ModelRequest,
+            input_total: Some(120_000),
+            context_window: None,
+            cached_input_tokens: Some(4_000),
+            usage_state: openbitfun_core_types::UsageRequestUsageState::ProviderReported,
+            estimated_total: Some(118_000),
+            estimation_version: Some(openbitfun_core_types::REQUEST_CONTEXT_ESTIMATION_VERSION),
+            summary_state: openbitfun_core_types::UsageSummaryState::Ready,
+            categories: Some(openbitfun_core_types::UsageContextBreakdown {
+                system_prompt: 10_000,
+                conversation: 108_000,
+                ..Default::default()
+            }),
+            unavailable_reason: None,
+        }
+    }
+
+    #[test]
+    fn request_context_snapshot_event_is_session_scoped_and_not_billing() {
+        let event = AgenticEvent::RequestContextSnapshotUpdated {
+            session_id: "session-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            snapshot: request_context_snapshot(),
+        };
+
+        assert_eq!(event.session_id(), Some("session-1"));
+        assert_eq!(event.turn_id(), Some("turn-1"));
+        assert_eq!(event.default_priority(), AgenticEventPriority::Normal);
+
+        let serialized = serde_json::to_value(&event).expect("serialize event");
+        assert_eq!(serialized["type"], "RequestContextSnapshotUpdated");
+        assert_eq!(serialized["session_id"], "session-1");
+        assert_eq!(serialized["turn_id"], "turn-1");
+        assert_eq!(serialized["snapshot"]["schemaVersion"], 1);
+        assert_eq!(
+            serialized["snapshot"]["request"]["attemptId"],
+            "round-1:attempt:1"
+        );
+        assert_eq!(serialized["snapshot"]["usageState"], "provider_reported");
+        // Recorded request facts only: no cumulative token-usage accounting.
+        assert!(serialized.get("input_tokens").is_none());
+        assert!(serialized.get("total_tokens").is_none());
+        assert!(matches!(
+            serde_json::from_value::<AgenticEvent>(serialized).expect("deserialize event"),
+            AgenticEvent::RequestContextSnapshotUpdated { .. }
+        ));
     }
 }

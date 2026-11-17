@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   canCopySessionsOnSurface,
+  canReadRequestContextSnapshotOnSurface,
   canUseSshNoneAuthOnSurface,
   canViewPullRequestsOnSurface,
   canQueryToolCatalogOnSurface,
@@ -157,5 +158,25 @@ describe('usesTerminalCursorReplay', () => {
   it('stays on terminal_event while the host is unknown or local', () => {
     expect(usesTerminalCursorReplay(capabilities({ hostKind: null }))).toBe(false);
     expect(usesTerminalCursorReplay(undefined)).toBe(false);
+  });
+});
+
+describe('canReadRequestContextSnapshotOnSurface', () => {
+  it('always records snapshots on the local surface', () => {
+    expect(canReadRequestContextSnapshotOnSurface(false, null)).toBe(true);
+    expect(canReadRequestContextSnapshotOnSurface(false, caps({ requestContextSnapshotV1: false }))).toBe(true);
+  });
+
+  it('requires the negotiated capability from a peer instead of guessing from its kind', () => {
+    expect(canReadRequestContextSnapshotOnSurface(true, null)).toBe(false);
+    expect(canReadRequestContextSnapshotOnSurface(true, caps({ hostKind: 'desktop' }))).toBe(false);
+    expect(canReadRequestContextSnapshotOnSurface(true, caps({ hostKind: 'cli' }))).toBe(false);
+    expect(canReadRequestContextSnapshotOnSurface(true, caps({ requestContextSnapshotV1: true }))).toBe(true);
+  });
+
+  it('never sends the snapshot mode to a peer that answered false', () => {
+    expect(canReadRequestContextSnapshotOnSurface(true, caps({
+      requestContextSnapshotV1: false, hostKind: 'desktop',
+    }))).toBe(false);
   });
 });

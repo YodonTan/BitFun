@@ -74,6 +74,10 @@ pub struct RoundContext {
     pub effective_model_name: String,
     /// Provider-neutral request-scoped facts resolved by the runtime owner.
     pub model_request_context: ModelRequestContext,
+    /// Typed provenance of the exact prepared send input handed to this round.
+    /// `None` means the caller captured no provenance and only a role-based
+    /// degradation is possible.
+    pub(crate) prepared_send_categories: Option<Vec<super::context_composition::SendCategory>>,
     /// Exact account resolution injected by the executing host's model factory.
     pub(crate) account_client_source:
         Option<Arc<dyn crate::infrastructure::ai::account_client_source::AccountClientSource>>,

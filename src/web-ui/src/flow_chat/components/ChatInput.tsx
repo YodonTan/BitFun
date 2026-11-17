@@ -11,8 +11,12 @@ import { expandLargePastes, pickReferencedLargePastes } from '../utils/largePast
  */
 
 import React, { useRef, useCallback, useEffect, useReducer, useState, useMemo, useSyncExternalStore } from 'react';
-import type { UsageContextEstimate } from '@/infrastructure/api/service-api/SessionAPI';
 import type { UsageReportUiParams } from '../session-drivers/types';
+import {
+  readRequestContextSnapshot,
+  surfaceSupportsRequestContextSnapshot,
+  type RequestContextSnapshotReadResult,
+} from '../services/requestContextSnapshotService';
 import path from 'path-browserify';
 import { useTranslation } from 'react-i18next';
 import { RotateCcw, Loader2, Play, Goal } from 'lucide-react';
@@ -3988,14 +3992,40 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     });
   }, [runEffectiveSessionUsageReport]);
 
-  const loadContextUsageOverview = useCallback(async () => {
-    let context: UsageContextEstimate | undefined;
-    await runEffectiveSessionUsageReport(report => {
-      context = report.contextEstimate;
-      return true;
+  const usageReportWorkspaceId = effectiveTargetSession
+    ? effectiveTargetSession.workspaceId ?? effectiveTargetSession.config.workspaceId
+    : undefined;
+  const requestContextSnapshotCapable = surfaceSupportsRequestContextSnapshot();
+
+  /**
+   * The overview's only read: the recorded snapshot, in fast mode. It never
+   * asks for the cumulative report or an on-demand context estimate.
+   */
+  const loadRequestContextSnapshot = useCallback(() => {
+    if (!effectiveTargetSessionId) {
+      return Promise.resolve({ status: 'unsupported' } as RequestContextSnapshotReadResult);
+    }
+    return readRequestContextSnapshot({
+      sessionId: effectiveTargetSessionId,
+      workspaceId: usageReportWorkspaceId,
     });
-    return context;
-  }, [runEffectiveSessionUsageReport]);
+  }, [effectiveTargetSessionId, usageReportWorkspaceId]);
+
+  // Hydrate the recorded snapshot when a Session becomes the composer target so
+  // the ring, popover, and side panel all read the same stored reading.
+  useEffect(() => {
+    if (!effectiveTargetSessionId || !requestContextSnapshotCapable) return;
+    if (!usageReportWorkspaceId) return;
+    void readRequestContextSnapshot({
+      sessionId: effectiveTargetSessionId,
+      workspaceId: usageReportWorkspaceId,
+    }).catch(() => undefined);
+  }, [
+    effectiveTargetSessionId,
+    usageReportWorkspaceId,
+    requestContextSnapshotCapable,
+    deviceSurfaceScope.epoch,
+  ]);
 
   const submitInitFromInput = useCallback(async () => {
     if (!effectiveTargetSessionId || !effectiveTargetSession) {
@@ -6725,7 +6755,10 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                 sessionId: effectiveTargetSessionId,
                 workspaceId: effectiveTargetSession.workspaceId ?? effectiveTargetSession.config.workspaceId,
               },
-              loadContext: loadContextUsageOverview,
+              loadSnapshot: loadRequestContextSnapshot,
+              snapshot: effectiveTargetSession.requestContextSnapshot,
+              snapshotState: tokenUsage.snapshotState,
+              snapshotUnsupported: !requestContextSnapshotCapable,
               compactDisabled: !!derivedState?.isProcessing,
               onCompact: caps.ops.has('compact')
                 ? () => { void submitManualCompaction(false); }

@@ -5,6 +5,7 @@
 mod context_estimate;
 
 use super::context_budget::CompressionTriggerBudget;
+use super::context_composition::PreparedSendInput;
 use super::model_exchange_trace::{
     prepare_model_exchange_trace_for_workspace, ModelExchangeTraceOperation,
 };
@@ -551,7 +552,7 @@ struct FinalizeRoundInput<'a> {
     tool_definitions: Option<Vec<ToolDefinition>>,
     reminder_text: &'a str,
     messages: &'a [Message],
-    prepended_reminders: &'a [&'a str],
+    prepended_reminders: &'a PrependedPromptReminders,
     primary_model_facts: &'a PrimaryModelFacts,
     model_request_context: &'a ModelRequestContext,
     execution_context_vars: &'a HashMap<String, String>,
@@ -2259,7 +2260,7 @@ impl ExecutionEngine {
         let finalize_tool_names = Self::finalize_tool_names(input.tool_definitions.as_deref());
         let finalize_runtime_tool_restrictions =
             Self::finalize_runtime_tool_restrictions(input.context, &finalize_tool_names);
-        let mut final_ai_messages = Self::build_ai_messages_for_send(
+        let mut prepared_finalize_input = Self::build_ai_messages_for_send(
             input.messages,
             &input.ai_client.config.format,
             input.context.workspace.as_ref(),
@@ -2269,8 +2270,21 @@ impl ExecutionEngine {
             input.prepended_reminders,
         )
         .await?;
-        final_ai_messages.push(AIMessage::user(render_system_reminder(input.reminder_text)));
-        final_ai_messages.push(AIMessage::user(Self::FINALIZE_USER_FOLLOWUP.to_string()));
+        // Finalize appends two user messages to the same request; both are
+        // conversation, and both must be present in the recorded provenance.
+        prepared_finalize_input
+            .messages
+            .push(AIMessage::user(render_system_reminder(input.reminder_text)));
+        prepared_finalize_input
+            .categories
+            .push(super::context_composition::SendCategory::Conversation);
+        prepared_finalize_input.messages.push(AIMessage::user(
+            Self::FINALIZE_USER_FOLLOWUP.to_string(),
+        ));
+        prepared_finalize_input
+            .categories
+            .push(super::context_composition::SendCategory::Conversation);
+        let final_ai_messages = prepared_finalize_input.messages;
 
         let model_exchange_trace_dir = self
             .session_manager
@@ -2296,6 +2310,7 @@ impl ExecutionEngine {
             available_tools: finalize_tool_names,
             deferred_tools: Vec::new(),
             loaded_deferred_tool_specs: Vec::new(),
+            prepared_send_categories: Some(prepared_finalize_input.categories),
             model_config_id: input.primary_model_facts.model_id.clone(),
             effective_model_name: input.ai_client.config.model.clone(),
             model_request_context: input.model_request_context.clone(),
@@ -2318,16 +2333,21 @@ impl ExecutionEngine {
         };
 
         self.round_executor
-            .execute_round(
+            .execute_round_with_session(
                 input.ai_client,
                 round_context,
                 final_ai_messages,
                 input.tool_definitions,
                 Some(input.context_window),
+                Some(self.session_manager.clone()),
             )
             .await
     }
 
+    /// Build the exact model-visible send input of one request attempt.
+    ///
+    /// Every emitted message carries the typed provenance of the source that
+    /// produced it, so recorded context facts never classify message text.
     pub(super) async fn build_ai_messages_for_send(
         messages: &[Message],
         provider: &str,
@@ -2335,18 +2355,21 @@ impl ExecutionEngine {
         workspace_services: Option<&crate::agentic::workspace::WorkspaceServices>,
         current_turn_id: &str,
         attach_images: bool,
-        prepended_reminders: &[&str],
-    ) -> OpenBitFunResult<Vec<AIMessage>> {
+        prepended_reminders: &PrependedPromptReminders,
+    ) -> OpenBitFunResult<PreparedSendInput> {
         let limits = ImageLimits::for_provider(provider);
         let image_context =
             ToolUseContext::for_tool_listing(workspace.cloned(), workspace_services.cloned());
 
-        let trimmed_reminders = prepended_reminders
-            .iter()
-            .map(|text| text.trim())
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>();
+        let trimmed_reminders = super::context_composition::ordered_reminder_sources(
+            prepended_reminders,
+        )
+        .into_iter()
+        .map(|(category, text)| (category, text.trim()))
+        .filter(|(_, text)| !text.is_empty())
+        .collect::<Vec<_>>();
         let mut result = Vec::with_capacity(messages.len() + trimmed_reminders.len());
+        let mut categories = Vec::with_capacity(messages.len() + trimmed_reminders.len());
         let mut attached_image_count = 0usize;
         let first_non_system_index = messages
             .iter()
@@ -2362,8 +2385,13 @@ impl ExecutionEngine {
 
         for (msg_idx, msg) in messages.iter().enumerate() {
             if !prepended_reminders_injected && msg_idx == first_non_system_index {
-                for reminder in &trimmed_reminders {
-                    result.push(AIMessage::user(render_system_reminder(reminder)));
+                for (category, reminder) in &trimmed_reminders {
+                    Self::push_send_message(
+                        &mut result,
+                        &mut categories,
+                        AIMessage::user(render_system_reminder(reminder)),
+                        *category,
+                    );
                 }
                 prepended_reminders_injected = true;
             }
@@ -2373,6 +2401,7 @@ impl ExecutionEngine {
             {
                 continue;
             }
+            let category = super::context_composition::send_category_for_message(msg);
             let keep_this_message_images = attach_images && keep_image_messages.contains(&msg_idx);
             match &msg.content {
                 MessageContent::Multimodal { text, images } => {
@@ -2382,7 +2411,12 @@ impl ExecutionEngine {
                         let mut text_message = msg.clone();
                         text_message.content =
                             MessageContent::Text(Self::render_multimodal_as_text(text, images));
-                        result.push(AIMessage::from(&text_message));
+                        Self::push_send_message(
+                            &mut result,
+                            &mut categories,
+                            AIMessage::from(&text_message),
+                            category,
+                        );
                         continue;
                     }
 
@@ -2430,7 +2464,16 @@ impl ExecutionEngine {
                             let multimodal = build_multimodal_message_with_images(
                                 &prompt, &processed, provider,
                             )?;
-                            result.extend(multimodal);
+                            // One domain message may expand into several provider
+                            // messages; each keeps the same typed provenance.
+                            for message in multimodal {
+                                Self::push_send_message(
+                                    &mut result,
+                                    &mut categories,
+                                    message,
+                                    category,
+                                );
+                            }
                         }
                         Err(err) => {
                             if matches!(&err, OpenBitFunError::Validation(msg) if msg.starts_with("Too many images in one request"))
@@ -2452,7 +2495,12 @@ impl ExecutionEngine {
                                 unavailable.content = MessageContent::Text(format!(
                                     "{text}\n\n[Image pixels from this older message are unavailable. Ask for a new attachment if the current task requires inspecting them.]"
                                 ));
-                                result.push(AIMessage::from(&unavailable));
+                                Self::push_send_message(
+                                    &mut result,
+                                    &mut categories,
+                                    AIMessage::from(&unavailable),
+                                    category,
+                                );
                             } else {
                                 return Err(err);
                             }
@@ -2469,7 +2517,7 @@ impl ExecutionEngine {
                         {
                             ai.content = Some(format!("{}\n\n[Tool image pixels were not sent: the resolved model does not support image inputs.]", ai.content.as_deref().unwrap_or("")));
                         }
-                        result.push(ai);
+                        Self::push_send_message(&mut result, &mut categories, ai, category);
                         continue;
                     }
                     let mut ai = AIMessage::from(msg.clone());
@@ -2497,19 +2545,43 @@ impl ExecutionEngine {
                             }
                         }
                     }
-                    result.push(ai);
+                    Self::push_send_message(&mut result, &mut categories, ai, category);
                 }
-                _ => result.push(AIMessage::from(msg)),
+                _ => Self::push_send_message(
+                    &mut result,
+                    &mut categories,
+                    AIMessage::from(msg),
+                    category,
+                ),
             }
         }
 
         if !prepended_reminders_injected {
-            for reminder in trimmed_reminders {
-                result.push(AIMessage::user(render_system_reminder(reminder)));
+            for (category, reminder) in trimmed_reminders {
+                Self::push_send_message(
+                    &mut result,
+                    &mut categories,
+                    AIMessage::user(render_system_reminder(reminder)),
+                    category,
+                );
             }
         }
 
-        Ok(result)
+        Ok(PreparedSendInput {
+            messages: result,
+            categories,
+        })
+    }
+
+    /// Keep the prepared messages and their typed provenance in lockstep.
+    fn push_send_message(
+        messages: &mut Vec<AIMessage>,
+        categories: &mut Vec<super::context_composition::SendCategory>,
+        message: AIMessage,
+        category: super::context_composition::SendCategory,
+    ) {
+        messages.push(message);
+        categories.push(category);
     }
 
     fn render_multimodal_as_text(text: &str, images: &[ImageContextData]) -> String {
@@ -4562,11 +4634,10 @@ impl ExecutionEngine {
 
             // L2: Emergency truncation — if tokens still exceed context_window
             // after all compression layers, drop oldest API rounds until we fit.
-            let send_prepended_reminders = turn_prompt_scaffold
-                .prepended_prompt_reminders
-                .ordered_reminders();
-            let send_prepended_reminder_tokens =
-                Self::prepended_reminder_tokens_for_pressure(&send_prepended_reminders);
+            let send_prepended_reminders = &turn_prompt_scaffold.prepended_prompt_reminders;
+            let send_prepended_reminder_tokens = Self::prepended_reminder_tokens_for_pressure(
+                &send_prepended_reminders.ordered_reminders(),
+            );
             let mut send_pressure = if send_pressure_reusable
                 && token_pressure.prepended_reminder_tokens == send_prepended_reminder_tokens
             {
@@ -4653,6 +4724,7 @@ impl ExecutionEngine {
                 model_config_id: model_id.clone(),
                 effective_model_name: ai_client.config.model.clone(),
                 model_request_context: model_request_context.clone(),
+                prepared_send_categories: None,
                 account_client_source: account_client_source.clone(),
                 channel_client_source: channel_client_source.clone(),
                 prepared_model: prepared_model.take(),
@@ -4724,7 +4796,7 @@ impl ExecutionEngine {
                 &model_fingerprint,
                 selected_pool.is_some(),
             );
-            let ai_messages = Self::build_ai_messages_for_send(
+            let prepared_send_input = Self::build_ai_messages_for_send(
                 &request_messages,
                 &ai_client.config.format,
                 context.workspace.as_ref(),
@@ -4734,6 +4806,9 @@ impl ExecutionEngine {
                 &send_prepended_reminders,
             )
             .await?;
+            // The recorded provenance belongs to this exact prepared input; the
+            // attempt loop only projects it, so it never re-derives categories.
+            round_context.prepared_send_categories = Some(prepared_send_input.categories);
 
             let round_lifecycle =
                 active_round_lifecycle.get_or_insert_with(ModelRoundLifecycle::new);
@@ -4744,11 +4819,11 @@ impl ExecutionEngine {
                 .execute_round_with_lifecycle(
                     ai_client.clone(),
                     round_context,
-                    ai_messages,
+                    prepared_send_input.messages,
                     tool_definitions.clone(),
                     Some(context_window),
                     round_lifecycle,
-                    Some(self.session_manager.as_ref()),
+                    Some(self.session_manager.clone()),
                     pool_attempt.as_ref(),
                 )
                 .await
@@ -5553,9 +5628,6 @@ impl ExecutionEngine {
                     context.session_id, context.dialog_turn_id, reason
                 );
 
-                let finalize_prepended_reminders = turn_prompt_scaffold
-                    .prepended_prompt_reminders
-                    .ordered_reminders();
                 let finalize_messages = super::model_pool::replay_safe_messages(
                     &messages,
                     &model_fingerprint,
@@ -5574,7 +5646,7 @@ impl ExecutionEngine {
                         execution_context_vars: &execution_context_vars,
                         primary_model_facts: &primary_model_facts,
                         model_request_context: &model_request_context,
-                        prepended_reminders: &finalize_prepended_reminders,
+                        prepended_reminders: &turn_prompt_scaffold.prepended_prompt_reminders,
                         messages: &finalize_messages,
                         reminder_text: finalize_reminder,
                         tool_definitions: tool_definitions.clone(),
@@ -5608,7 +5680,7 @@ impl ExecutionEngine {
                             execution_context_vars: &execution_context_vars,
                             primary_model_facts: &primary_model_facts,
                             model_request_context: &model_request_context,
-                            prepended_reminders: &finalize_prepended_reminders,
+                            prepended_reminders: &turn_prompt_scaffold.prepended_prompt_reminders,
                             messages: &finalize_messages,
                             reminder_text: finalize_reminder,
                             tool_definitions: tool_definitions.clone(),
@@ -5821,10 +5893,7 @@ impl ExecutionEngine {
                     model_request_context: model_request_context.clone(),
                     prepended_reminders: turn_prompt_scaffold
                         .prepended_prompt_reminders
-                        .ordered_reminders()
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect(),
+                        .clone(),
                     workspace: context.workspace.clone(),
                     workspace_services: context.workspace_services.clone(),
                     attach_images: primary_supports_image_understanding,
@@ -6129,10 +6198,11 @@ mod tests {
                 None,
                 "visual-turn",
                 true,
-                &[],
+                &PrependedPromptReminders::default(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .messages;
             assert_eq!(
                 messages[0].content.as_deref(),
                 Some(observation.to_string().as_str())
@@ -6168,10 +6238,11 @@ mod tests {
             None,
             "visual-turn",
             false,
-            &[],
+            &PrependedPromptReminders::default(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .messages;
         assert!(text_only[0].tool_image_attachments.is_none());
         // Provider projection must not strip pixels from immutable stored history.
         let crate::agentic::core::MessageContent::ToolResult {
@@ -6258,10 +6329,11 @@ mod tests {
                 None,
                 "continued-turn",
                 true,
-                &[],
+                &PrependedPromptReminders::default(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .messages;
             let client = if attempt == 0 {
                 uncapped.as_ref()
             } else {
@@ -6496,10 +6568,11 @@ mod tests {
                 None,
                 "turn",
                 true,
-                &[],
+                &PrependedPromptReminders::default(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .messages;
             assert_eq!(native.len(), 2);
             for (message, expected_count) in native.into_iter().zip([5, 1]) {
                 let parts: serde_json::Value =
@@ -6526,10 +6599,11 @@ mod tests {
             None,
             "turn",
             false,
-            &[],
+            &PrependedPromptReminders::default(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .messages;
         assert_eq!(text_only.len(), 2);
         for (message, expected_images) in text_only
             .into_iter()
@@ -6570,6 +6644,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_send_input_keeps_typed_provenance_aligned_with_the_request() {
+        use crate::agentic::execution::context_composition::SendCategory;
+        use crate::agentic::core::InternalReminderKind;
+
+        let system = Message::system("system prompt".into());
+        let mut skipped = Message::user("verification screenshot".into());
+        skipped.metadata.semantic_kind =
+            Some(crate::agentic::core::MessageSemanticKind::ComputerUseVerificationScreenshot);
+        let mut stale = Message::user("<system-reminder>continue</system-reminder>".into());
+        stale.metadata.internal_reminder_kind = Some(InternalReminderKind::InterruptedContinue);
+        stale = stale.with_turn_id("other-turn".to_string());
+        let user = Message::user("Fix the failing build".into()).with_turn_id("turn-1".into());
+        let mut summary = Message::user("Earlier conversation summary".into());
+        summary.metadata.semantic_kind =
+            Some(crate::agentic::core::MessageSemanticKind::CompressionSummary);
+        let mut rules = Message::user("Activated repository instructions".into());
+        rules.metadata.internal_reminder_kind = Some(InternalReminderKind::ConditionalInstructions);
+        let assistant = Message::assistant("Working on it".into());
+
+        let prepared = ExecutionEngine::build_ai_messages_for_send(
+            &[system, skipped, stale, user, summary, rules, assistant],
+            "openai",
+            None,
+            None,
+            "turn-1",
+            false,
+            &PrependedPromptReminders {
+                runtime_context: Some("Runtime environment".into()),
+                user_context: Some("Repository instructions".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("prepared send input");
+
+        assert!(prepared.is_aligned());
+        assert_eq!(
+            prepared.categories,
+            vec![
+                SendCategory::SystemPrompt,
+                // The two prepended reminders are injected before the first
+                // non-system message, in the typed send order.
+                SendCategory::SystemPrompt,
+                SendCategory::Rules,
+                SendCategory::Conversation,
+                SendCategory::SummarizedConversation,
+                SendCategory::Rules,
+                SendCategory::Conversation,
+            ],
+            "skipped messages contribute no message and no category"
+        );
+        assert_eq!(prepared.messages.len(), 7);
+        assert!(prepared
+            .messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .all(|content| !content.contains("verification screenshot")
+                && !content.contains("continue")));
+
+        // The legacy degradation path only maps roles, never message text.
+        let legacy = crate::agentic::execution::context_composition::legacy_send_categories(
+            &prepared.messages,
+        );
+        assert_eq!(legacy.len(), prepared.messages.len());
+        assert_eq!(legacy[0], SendCategory::SystemPrompt);
+        assert!(legacy[1..]
+            .iter()
+            .all(|category| *category == SendCategory::Conversation));
+    }
+
+    #[tokio::test]
     async fn new_images_keep_earlier_sent_messages_unchanged_between_elision_batches() {
         let image = crate::agentic::image_analysis::attachments::test_image();
         let image_message = |index: usize| {
@@ -6585,10 +6730,11 @@ mod tests {
                     None,
                     "turn",
                     true,
-                    &["stable reminder"],
+                    &PrependedPromptReminders::default(),
                 )
                 .await
-                .unwrap(),
+                .unwrap()
+                .messages,
             )
             .unwrap()
         };

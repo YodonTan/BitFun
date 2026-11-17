@@ -1,9 +1,16 @@
+use openbitfun_core_types::{
+    UsageContextBreakdown, UsageRequestInputSource, UsageRequestSnapshot, UsageRequestUsageState,
+    UsageSummaryState, REQUEST_CONTEXT_ESTIMATION_VERSION, REQUEST_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
+};
 use openbitfun_services_core::session::{
-    build_session_index_snapshot, refresh_session_metadata_from_turns, remove_session_index_entry,
-    try_refresh_session_metadata_for_saved_turn, upsert_session_index_entry, DialogTurnData,
-    DialogTurnKind, ModelRoundData, SessionContextUsage, SessionContextUsageSource, SessionKind,
-    SessionMetadata, StoredSessionIndexFile, TextItemData, ToolCallData, ToolItemData, TurnStatus,
-    UserMessageData,
+    apply_last_recorded_request_snapshot, build_branched_session_metadata,
+    build_session_index_snapshot, build_session_metadata, refresh_session_metadata_from_turns,
+    remove_session_index_entry, try_refresh_session_metadata_for_saved_turn,
+    upsert_session_index_entry, BranchSessionLineage, BranchSessionMetadataFacts, DialogTurnData,
+    DialogTurnKind, ModelRoundData, SessionBranchBoundary, SessionContextUsage,
+    SessionContextUsageSource, SessionKind, SessionMemoryMode, SessionMetadata,
+    SessionMetadataBuildFacts, StoredSessionIndexFile, TextItemData, ToolCallData, ToolItemData,
+    TurnStatus, UserMessageData,
 };
 
 fn metadata(session_id: &str) -> SessionMetadata {
@@ -13,6 +20,497 @@ fn metadata(session_id: &str) -> SessionMetadata {
         "agent".to_string(),
         "model".to_string(),
     )
+}
+
+fn recorded_snapshot(session_id: &str) -> UsageRequestSnapshot {
+    UsageRequestSnapshot {
+        schema_version: REQUEST_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
+        request: openbitfun_core_types::UsageRequestRef {
+            execution_host_id: "local".to_string(),
+            workspace_id: Some("workspace-1".to_string()),
+            session_id: session_id.to_string(),
+            turn_id: "turn-1".to_string(),
+            round_id: "round-1".to_string(),
+            attempt_id: "round-1:attempt:1".to_string(),
+            attempt_index: 1,
+            started_at: 1_000,
+        },
+        captured_at: 10,
+        input_source: UsageRequestInputSource::ModelRequest,
+        input_total: Some(120_000),
+        context_window: Some(200_000),
+        cached_input_tokens: Some(4_000),
+        usage_state: UsageRequestUsageState::ProviderReported,
+        estimated_total: Some(118_000),
+        estimation_version: Some(REQUEST_CONTEXT_ESTIMATION_VERSION),
+        summary_state: UsageSummaryState::Ready,
+        categories: Some(UsageContextBreakdown {
+            system_prompt: 10_000,
+            conversation: 108_000,
+            ..Default::default()
+        }),
+        unavailable_reason: None,
+    }
+}
+
+fn pending_snapshot(session_id: &str) -> UsageRequestSnapshot {
+    UsageRequestSnapshot {
+        input_source: UsageRequestInputSource::ModelRequest,
+        input_total: None,
+        cached_input_tokens: None,
+        usage_state: UsageRequestUsageState::Estimated,
+        estimated_total: None,
+        estimation_version: None,
+        summary_state: UsageSummaryState::Pending,
+        categories: None,
+        ..recorded_snapshot(session_id)
+    }
+}
+
+fn build_facts<'a>(
+    session_id: &'a str,
+    existing: Option<&'a SessionMetadata>,
+) -> SessionMetadataBuildFacts<'a> {
+    SessionMetadataBuildFacts {
+        session_id,
+        session_name: session_id,
+        agent_type: "Standard",
+        last_user_dialog_agent_type: None,
+        last_submitted_agent_type: None,
+        created_by: None,
+        session_kind: SessionKind::EphemeralChild,
+        model_name: None,
+        created_at_ms: 100,
+        last_active_at_ms: 200,
+        turn_count: 0,
+        snapshot_session_id: None,
+        workspace_path: "D:/workspace/project",
+        project_workspace_path: None,
+        execution_target: None,
+        workspace_hostname: None,
+        workspace_id: None,
+        project_workspace_id: None,
+        new_session_memory_mode: SessionMemoryMode::Enabled,
+        existing,
+    }
+}
+
+#[test]
+fn legacy_metadata_without_a_recorded_snapshot_reads_none() {
+    let mut legacy = serde_json::to_value(metadata("session-1")).unwrap();
+    assert!(legacy.get("lastRecordedRequestSnapshot").is_none());
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("lastRecordedRequestSnapshot");
+
+    let restored: SessionMetadata = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(restored.last_recorded_request_snapshot.is_none());
+    assert_eq!(serde_json::to_value(&restored).unwrap(), legacy);
+}
+
+#[test]
+fn metadata_rebuild_preserves_the_snapshot_only_for_the_same_session() {
+    let mut existing = metadata("session-1");
+    existing.last_recorded_request_snapshot = Some(recorded_snapshot("session-1"));
+
+    let rebuilt = build_session_metadata(build_facts("session-1", Some(&existing)));
+    assert_eq!(
+        rebuilt.last_recorded_request_snapshot,
+        existing.last_recorded_request_snapshot
+    );
+
+    // A new, child, or forked Session starts without any inherited snapshot.
+    let forked = build_session_metadata(build_facts("session-2", None));
+    assert!(forked.last_recorded_request_snapshot.is_none());
+}
+
+#[test]
+fn forked_session_does_not_inherit_the_source_snapshot() {
+    let mut source = metadata("source");
+    source.last_recorded_request_snapshot = Some(recorded_snapshot("source"));
+    let branched_turns = [turn("target", 0, 1, 0)];
+    let branch_lineage = BranchSessionLineage {
+        base_session_name: "Source".to_string(),
+        ordinal: 1,
+    };
+
+    let branched = build_branched_session_metadata(BranchSessionMetadataFacts {
+        source_metadata: &source,
+        target_session_id: "target".to_string(),
+        target_session_name: "Target".to_string(),
+        target_agent_type: "agent".to_string(),
+        source_session_id: "source",
+        source_turn_id: "turn-0",
+        source_turn_index: 0,
+        boundary: SessionBranchBoundary::ThroughTurn,
+        branched_turns: &branched_turns,
+        branch_lineage: &branch_lineage,
+        now_ms: 42,
+    });
+
+    assert!(branched.last_recorded_request_snapshot.is_none());
+}
+
+#[test]
+fn same_attempt_pending_summary_upgrades_to_ready() {
+    let mut meta = metadata("session-1");
+    let mut pending = pending_snapshot("session-1");
+    pending.captured_at = 10;
+    assert!(apply_last_recorded_request_snapshot(&mut meta, pending.clone()));
+    let recorded = meta.last_recorded_request_snapshot.clone().unwrap();
+    assert_eq!(recorded.summary_state, UsageSummaryState::Pending);
+    assert!(recorded.categories.is_none());
+    assert!(recorded.input_total.is_none());
+
+    let mut ready = pending;
+    ready.summary_state = UsageSummaryState::Ready;
+    ready.estimated_total = Some(118_000);
+    ready.estimation_version = Some(REQUEST_CONTEXT_ESTIMATION_VERSION);
+    ready.categories = Some(UsageContextBreakdown {
+        conversation: 118_000,
+        ..Default::default()
+    });
+    ready.captured_at = 20;
+    assert!(apply_last_recorded_request_snapshot(&mut meta, ready));
+
+    let recorded = meta.last_recorded_request_snapshot.clone().unwrap();
+    assert_eq!(recorded.summary_state, UsageSummaryState::Ready);
+    assert_eq!(recorded.estimated_total, Some(118_000));
+    assert_eq!(
+        recorded.categories.as_ref().unwrap().conversation,
+        118_000
+    );
+    assert_eq!(recorded.captured_at, 20);
+    assert!(
+        recorded.input_total.is_none(),
+        "an estimated capture must not fabricate a provider total"
+    );
+    assert!(
+        !apply_last_recorded_request_snapshot(&mut meta, recorded),
+        "re-applying the recorded snapshot changes nothing"
+    );
+}
+
+#[test]
+fn provider_reported_total_is_never_downgraded_by_a_later_estimate() {
+    let mut meta = metadata("session-1");
+    assert!(apply_last_recorded_request_snapshot(
+        &mut meta,
+        recorded_snapshot("session-1")
+    ));
+
+    let mut estimate = recorded_snapshot("session-1");
+    estimate.usage_state = UsageRequestUsageState::Estimated;
+    estimate.input_source = UsageRequestInputSource::LegacyRecord;
+    estimate.input_total = None;
+    estimate.cached_input_tokens = None;
+    estimate.estimated_total = Some(119_000);
+    estimate.captured_at = 20;
+    assert!(apply_last_recorded_request_snapshot(&mut meta, estimate));
+
+    let recorded = meta.last_recorded_request_snapshot.clone().unwrap();
+    assert_eq!(recorded.usage_state, UsageRequestUsageState::ProviderReported);
+    assert_eq!(recorded.input_source, UsageRequestInputSource::ModelRequest);
+    assert_eq!(recorded.input_total, Some(120_000));
+    assert_eq!(recorded.cached_input_tokens, Some(4_000));
+    assert_eq!(recorded.estimated_total, Some(119_000));
+    assert_eq!(recorded.captured_at, 20);
+
+    // A later capture without a usable summary cannot erase a ready one either.
+    let mut unavailable = recorded.clone();
+    unavailable.summary_state = UsageSummaryState::Unavailable;
+    unavailable.estimated_total = None;
+    unavailable.estimation_version = None;
+    unavailable.categories = None;
+    unavailable.captured_at = 30;
+    assert!(apply_last_recorded_request_snapshot(&mut meta, unavailable));
+    let recorded = meta.last_recorded_request_snapshot.clone().unwrap();
+    assert_eq!(recorded.summary_state, UsageSummaryState::Ready);
+    assert_eq!(recorded.estimated_total, Some(119_000));
+    assert!(recorded.categories.is_some());
+    assert_eq!(recorded.captured_at, 30);
+}
+
+#[test]
+fn older_attempt_is_rejected_and_a_newer_attempt_replaces() {
+    let mut meta = metadata("session-1");
+    let mut current = recorded_snapshot("session-1");
+    current.request.attempt_id = "round-1:attempt:2".to_string();
+    current.request.attempt_index = 2;
+    current.request.started_at = 2_000;
+    current.captured_at = 30;
+    assert!(apply_last_recorded_request_snapshot(&mut meta, current));
+
+    let mut older = recorded_snapshot("session-1");
+    older.captured_at = 40;
+    assert!(!apply_last_recorded_request_snapshot(&mut meta, older));
+    assert_eq!(
+        meta.last_recorded_request_snapshot
+            .as_ref()
+            .unwrap()
+            .request
+            .attempt_id,
+        "round-1:attempt:2"
+    );
+
+    let mut same_order = recorded_snapshot("session-1");
+    same_order.request.attempt_id = "round-1:attempt:2b".to_string();
+    same_order.request.started_at = 2_000;
+    same_order.captured_at = 50;
+    assert!(
+        !apply_last_recorded_request_snapshot(&mut meta, same_order),
+        "an equal ordering of a different attempt is not newer"
+    );
+
+    let mut newest = recorded_snapshot("session-1");
+    newest.request.attempt_id = "round-1:attempt:3".to_string();
+    newest.request.attempt_index = 3;
+    newest.request.started_at = 3_000;
+    newest.captured_at = 60;
+    assert!(apply_last_recorded_request_snapshot(&mut meta, newest));
+    let recorded = meta.last_recorded_request_snapshot.clone().unwrap();
+    assert_eq!(recorded.request.attempt_id, "round-1:attempt:3");
+    assert_eq!(recorded.captured_at, 60);
+}
+
+#[test]
+fn snapshot_for_another_session_is_rejected() {
+    let mut meta = metadata("session-1");
+    assert!(!apply_last_recorded_request_snapshot(
+        &mut meta,
+        recorded_snapshot("session-2")
+    ));
+    assert!(meta.last_recorded_request_snapshot.is_none());
+
+    assert!(apply_last_recorded_request_snapshot(
+        &mut meta,
+        recorded_snapshot("session-1")
+    ));
+    let before = serde_json::to_value(&meta).unwrap();
+    assert!(!apply_last_recorded_request_snapshot(
+        &mut meta,
+        recorded_snapshot("session-2")
+    ));
+    assert_eq!(serde_json::to_value(&meta).unwrap(), before);
+}
+
+#[test]
+fn unknown_capture_is_stored_without_a_fabricated_zero() {
+    let mut meta = metadata("session-1");
+    let mut unknown = recorded_snapshot("session-1");
+    unknown.input_source = UsageRequestInputSource::Unknown;
+    unknown.input_total = None;
+    unknown.cached_input_tokens = None;
+    unknown.usage_state = UsageRequestUsageState::Unknown;
+    unknown.estimated_total = None;
+    unknown.estimation_version = None;
+    unknown.summary_state = UsageSummaryState::Unavailable;
+    unknown.categories = None;
+    unknown.unavailable_reason = Some("usage_unavailable".to_string());
+
+    assert!(apply_last_recorded_request_snapshot(&mut meta, unknown));
+    let recorded = meta.last_recorded_request_snapshot.clone().unwrap();
+    assert_eq!(recorded.usage_state, UsageRequestUsageState::Unknown);
+    assert_eq!(recorded.input_total, None);
+    assert_eq!(recorded.categories, None);
+
+    let value = serde_json::to_value(&meta).unwrap();
+    assert_eq!(value["lastRecordedRequestSnapshot"]["usageState"], "unknown");
+    assert!(value["lastRecordedRequestSnapshot"]
+        .get("inputTotal")
+        .is_none());
+    assert!(value["lastRecordedRequestSnapshot"].get("categories").is_none());
+    let restored: SessionMetadata = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        restored.last_recorded_request_snapshot,
+        meta.last_recorded_request_snapshot
+    );
+}
+
+#[test]
+fn unknown_snapshot_fields_are_ignored_without_losing_the_record() {
+    let mut value = serde_json::to_value(metadata("session-1")).unwrap();
+    value["lastRecordedRequestSnapshot"] = serde_json::json!({
+        "schemaVersion": 1,
+        "request": {
+            "executionHostId": "peer-host",
+            "sessionId": "session-1",
+            "turnId": "turn-9",
+            "roundId": "round-9",
+            "attemptId": "round-9:attempt:1",
+            "attemptIndex": 1,
+            "startedAt": 9,
+            "futureRefField": "ignored"
+        },
+        "capturedAt": 9,
+        "inputSource": "future_source",
+        "usageState": "future_state",
+        "summaryState": "unavailable",
+        "futureSnapshotField": { "nested": 1 }
+    });
+
+    let restored: SessionMetadata = serde_json::from_value(value).unwrap();
+    let recorded = restored.last_recorded_request_snapshot.clone().unwrap();
+    assert_eq!(recorded.request.execution_host_id, "peer-host");
+    assert_eq!(recorded.usage_state, UsageRequestUsageState::Unknown);
+    assert_eq!(recorded.input_source, UsageRequestInputSource::Unknown);
+    assert_eq!(recorded.input_total, None);
+    assert_eq!(recorded.categories, None);
+
+    let encoded = serde_json::to_value(&restored).unwrap();
+    assert_eq!(encoded["lastRecordedRequestSnapshot"]["usageState"], "unknown");
+    assert!(encoded["lastRecordedRequestSnapshot"]
+        .get("inputTotal")
+        .is_none());
+}
+
+#[test]
+fn malformed_recorded_snapshot_keeps_the_rest_of_the_session_metadata() {
+    let malformed_payloads = [
+        // Missing the request identity entirely.
+        serde_json::json!({
+            "schemaVersion": 1,
+            "capturedAt": 9,
+            "inputSource": "model_request",
+            "usageState": "provider_reported",
+            "summaryState": "ready"
+        }),
+        // The request identity is not an object.
+        serde_json::json!({
+            "schemaVersion": 1,
+            "request": "not-an-object",
+            "capturedAt": 9,
+            "inputSource": "model_request",
+            "usageState": "provider_reported",
+            "summaryState": "ready"
+        }),
+        // A numeric field carries the wrong scalar type.
+        serde_json::json!({
+            "schemaVersion": 1,
+            "request": {
+                "executionHostId": "local",
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+                "roundId": "round-1",
+                "attemptId": "round-1:attempt:1",
+                "attemptIndex": 1,
+                "startedAt": 10
+            },
+            "capturedAt": 9,
+            "inputSource": "model_request",
+            "inputTotal": "not-a-number",
+            "usageState": "provider_reported",
+            "summaryState": "ready"
+        }),
+        // A future shape that no longer carries the fields this build requires.
+        serde_json::json!({ "schemaVersion": 2, "futureShape": true }),
+        // Values that are not even snapshot objects.
+        serde_json::json!("session-request-snapshot"),
+        serde_json::Value::Null,
+    ];
+
+    for payload in malformed_payloads {
+        let mut value = serde_json::to_value(metadata("session-1")).unwrap();
+        value["sessionName"] = serde_json::json!("Preserved Session");
+        value["turnCount"] = serde_json::json!(7);
+        value["currentContextUsage"] = serde_json::json!({
+            "turnId": "turn-3",
+            "inputTokens": 42_000,
+            "outputTokens": 1_500,
+            "totalTokens": 43_500,
+            "timestamp": 123,
+            "source": "model_request"
+        });
+        value["lastRecordedRequestSnapshot"] = payload.clone();
+
+        let restored: SessionMetadata = serde_json::from_value(value)
+            .expect("one unreadable snapshot must not fail the whole Session");
+        assert_eq!(restored.session_id, "session-1");
+        assert_eq!(restored.session_name, "Preserved Session");
+        assert_eq!(restored.turn_count, 7);
+        assert_eq!(
+            restored
+                .current_context_usage
+                .as_ref()
+                .expect("unrelated context usage stays readable")
+                .turn_id,
+            "turn-3"
+        );
+        assert!(
+            restored.last_recorded_request_snapshot.is_none(),
+            "rejected payload must degrade to None: {payload}"
+        );
+    }
+}
+
+#[test]
+fn rejected_recorded_snapshot_is_not_rewritten_into_a_fabricated_shape() {
+    let mut value = serde_json::to_value(metadata("session-1")).unwrap();
+    value["lastRecordedRequestSnapshot"] = serde_json::json!({
+        "schemaVersion": 1,
+        "capturedAt": 9
+    });
+
+    let restored: SessionMetadata = serde_json::from_value(value).unwrap();
+    assert!(restored.last_recorded_request_snapshot.is_none());
+
+    let encoded = serde_json::to_value(&restored).unwrap();
+    assert!(
+        encoded.get("lastRecordedRequestSnapshot").is_none(),
+        "a rejected snapshot stays absent instead of being rewritten"
+    );
+    assert_eq!(encoded["sessionId"], "session-1");
+}
+
+#[test]
+fn valid_recorded_snapshot_round_trips_unchanged_through_the_tolerant_reader() {
+    let mut meta = metadata("session-1");
+    meta.last_recorded_request_snapshot = Some(recorded_snapshot("session-1"));
+    let value = serde_json::to_value(&meta).unwrap();
+    assert!(value.get("lastRecordedRequestSnapshot").is_some());
+
+    let restored: SessionMetadata = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        restored.last_recorded_request_snapshot,
+        meta.last_recorded_request_snapshot
+    );
+    assert_eq!(serde_json::to_value(&restored).unwrap(), value);
+}
+
+#[test]
+fn snake_case_alias_still_reads_a_valid_recorded_snapshot() {
+    let mut legacy = serde_json::to_value(metadata("session-1")).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("lastRecordedRequestSnapshot");
+    legacy["last_recorded_request_snapshot"] =
+        serde_json::to_value(recorded_snapshot("session-1")).unwrap();
+
+    let restored: SessionMetadata = serde_json::from_value(legacy).unwrap();
+    let recorded = restored
+        .last_recorded_request_snapshot
+        .expect("the snake_case alias keeps reading the recorded snapshot");
+    assert_eq!(recorded.request.attempt_id, "round-1:attempt:1");
+}
+
+#[test]
+fn turn_refresh_keeps_the_recorded_snapshot_as_before() {
+    let mut meta = metadata("session-1");
+    meta.last_recorded_request_snapshot = Some(recorded_snapshot("session-1"));
+
+    refresh_session_metadata_from_turns(
+        &mut meta,
+        "D:/workspace/project",
+        &[turn("session-1", 0, 1, 0)],
+        42,
+    );
+
+    assert_eq!(
+        meta.last_recorded_request_snapshot,
+        Some(recorded_snapshot("session-1"))
+    );
 }
 
 #[test]

@@ -411,6 +411,9 @@ pub fn build_branched_session_metadata(facts: BranchSessionMetadataFacts<'_>) ->
         metadata.current_context_usage = None;
     }
     metadata.relationship = None;
+    // A branch is a different Session; it never inherits the source's recorded
+    // request snapshot.
+    metadata.last_recorded_request_snapshot = None;
     metadata.todos = None;
     metadata.review_action_state = None;
     metadata.deep_review_run_manifest = None;

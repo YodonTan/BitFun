@@ -8,6 +8,8 @@ vi.mock('@/infrastructure/api/service-api/AgentAPI', () => ({ agentAPI: {
   onTextChunk: (listener: (event: any) => void) => { fixture.text = listener; return () => {}; },
   onToolEvent: (listener: (event: any) => void) => { fixture.tool = listener; return () => {}; },
   onPromptSuggestion: () => () => {},
+  onRequestContextSnapshotUpdated: () => () => {},
+  onTokenUsageUpdated: () => () => {},
 } }));
 import { agenticEventListener } from './AgenticEventListener';
 afterEach(async () => { await agenticEventListener.stopListening(); fixture.surface = 'local'; });
@@ -35,4 +37,14 @@ it('routes peer prompt suggestions to the registered handler', async () => {
   const payload = { sessionId: 'peer-session', sourceTurnId: 'turn-1', suggestion: 'Run the tests' };
   expect(agenticEventListener.dispatchExternal('agentic://prompt-suggestion', payload)).toBe(true);
   expect(onPromptSuggestion).toHaveBeenCalledExactlyOnceWith(payload);
+});
+it('routes a peer recorded request snapshot to its own handler', async () => {
+  const onRequestContextSnapshotUpdated = vi.fn();
+  const onTokenUsageUpdated = vi.fn();
+  await agenticEventListener.startListening({ onRequestContextSnapshotUpdated, onTokenUsageUpdated });
+  const payload = { sessionId: 'peer-session', turnId: 'turn-1', snapshot: { schemaVersion: 1 } };
+  expect(agenticEventListener.dispatchExternal('agentic://request-context-snapshot-updated', payload)).toBe(true);
+  expect(onRequestContextSnapshotUpdated).toHaveBeenCalledExactlyOnceWith(payload);
+  // A recorded context snapshot is not a billing event.
+  expect(onTokenUsageUpdated).not.toHaveBeenCalled();
 });

@@ -102,6 +102,7 @@ describe('PeerConnectionManager attach', () => {
             btw_initial_model_selection_v1: true,
             btw_model_pool_selection_v1: true,
             magpie_discovery_v1: true,
+            session_request_context_snapshot_v1: true,
           },
         },
       }),
@@ -122,6 +123,28 @@ describe('PeerConnectionManager attach', () => {
     expect(caps.btwInitialModelSelectionV1).toBe(true);
     expect(caps.btwModelPoolSelectionV1).toBe(true);
     expect(caps.magpieDiscoveryV1).toBe(true);
+    expect(caps.requestContextSnapshotV1).toBe(true);
+  });
+
+  it('leaves the recorded snapshot mode off for a host that does not advertise it', async () => {
+    const manager = new PeerConnectionManager({
+      deviceRpc: async () => JSON.stringify({
+        resp: 'host_invoke_result',
+        ok: true,
+        value: { host_type: 'desktop', capabilities: { cancel_tool: true, tool_catalog: true } },
+      }),
+      getControllerDeviceId: async () => 'controller-1',
+    });
+
+    const connection = await manager.connect('peer-1', 'Studio');
+
+    // A brand-new mode is never resolved through host kind: an older Desktop
+    // must not receive the unnegotiated read.
+    expect(connection.getState().capabilities.requestContextSnapshotV1).toBe(false);
+    expect(capabilitiesEqual(
+      { ...connection.getState().capabilities, requestContextSnapshotV1: true },
+      connection.getState().capabilities,
+    )).toBe(false);
   });
 
   it('parses host_type into hostKind for desktop and cli', async () => {

@@ -219,9 +219,10 @@ impl CompressionJob {
             self.workspace_services.as_ref(),
             &self.turn_id,
             self.attach_images,
-            &self.reminders.ordered_reminders(),
+            &self.reminders,
         )
-        .await?;
+        .await?
+        .messages;
         messages.push(AIMessage::user(self.compressor.build_compact_prompt()));
         super::super::compression_request::request_summary(
             self.client.clone(),

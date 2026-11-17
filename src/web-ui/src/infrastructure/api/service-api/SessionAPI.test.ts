@@ -50,6 +50,32 @@ describe('SessionAPI paged metadata reads', () => {
     });
   });
 
+  it('asks for the recorded request snapshot alone, or one explicit preview of a fixed request', async () => {
+    invokeMock.mockResolvedValue({ requestSnapshot: { snapshot: { schemaVersion: 1 } } });
+    const request = {
+      executionHostId: 'local', workspaceId: 'workspace-1', sessionId: 'session-1', turnId: 'turn-1',
+      roundId: 'round-1', attemptId: 'round-1:attempt:1', attemptIndex: 1, startedAt: 100,
+    };
+
+    // An empty selection is the fast metadata path: no report, no estimate.
+    await sessionAPI.getSessionUsageReport({
+      sessionId: 'session-1', workspaceId: 'workspace-1', includeHiddenSubagents: false, requestSnapshot: {},
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('get_session_usage_report', {
+      request: { session_id: 'session-1', workspace_id: 'workspace-1', include_hidden_subagents: false,
+        request_snapshot: {} },
+    });
+
+    await sessionAPI.getSessionUsageReport({
+      sessionId: 'session-1', workspaceId: 'workspace-1', includeHiddenSubagents: false,
+      requestSnapshot: { request, category: 'rules' },
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('get_session_usage_report', {
+      request: { session_id: 'session-1', workspace_id: 'workspace-1', include_hidden_subagents: false,
+        request_snapshot: { request, category: 'rules' } },
+    });
+  });
+
   it('does not send a local workspace request to an equal ID on a newly selected peer', async () => {
     const pending = sessionAPI.listSessionsPage({ workspaceId: 'same-workspace-id', limit: 5 });
     activateSurface('peer-with-the-same-workspace');

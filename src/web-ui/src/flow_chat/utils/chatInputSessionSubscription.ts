@@ -45,6 +45,12 @@ export function chatInputSessionSubscriptionKey(session: Session): string {
     `${session.remoteConnectionId ?? ''}|${session.remoteSshHost ?? ''}|${session.lastSubmittedMode ?? ''}|` +
     `${session.currentAcpContextUsage?.used ?? ''}|${session.currentAcpContextUsage?.size ?? ''}|` +
     `${session.currentTokenUsage?.inputTokens ?? ''}|${session.maxContextTokens ?? ''}|` +
+    // The context ring reads the recorded request snapshot, so its identity and
+    // summary/usage state must invalidate the composer when they change.
+    `${session.requestContextSnapshot?.request.attemptId ?? ''}|` +
+    `${session.requestContextSnapshot?.request.startedAt ?? ''}|` +
+    `${session.requestContextSnapshot?.usageState ?? ''}|` +
+    `${session.requestContextSnapshot?.summaryState ?? ''}|` +
     `${session.needsUserAttention ? '1' : '0'}|${session.dialogTurns.length}|` +
     `${session.totalTurnCount ?? ''}|${session.turnCatalog?.totalTurnCount ?? ''}|` +
     `${JSON.stringify(session.config.dispatchTarget ?? null)}|` +

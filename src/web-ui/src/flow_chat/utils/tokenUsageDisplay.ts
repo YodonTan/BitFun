@@ -4,6 +4,11 @@ import { LONG_CONTEXT_WARNING_THRESHOLD_TOKENS } from '@/shared/constants/modelC
 import { i18nService } from '@/infrastructure/i18n';
 import { automaticMaxOutputTokens } from '@/shared/utils/modelOutputTokens';
 import { formatTokenCount } from '@/shared/utils/tokenUsageFormatting';
+import type {
+  UsageContextBreakdown,
+  UsageRequestSnapshot,
+  UsageRequestUsageState,
+} from '@/infrastructure/api/service-api/SessionAPI';
 
 export const DEFAULT_MAX_CONTEXT_TOKENS = 128128;
 
@@ -13,6 +18,11 @@ export interface ContextUsageDisplay {
   current: number;
   max: number;
   source: ContextUsageSource;
+  /**
+   * How the total was obtained when it came from a recorded request snapshot.
+   * Undefined means the value is a legacy reading with no recorded snapshot.
+   */
+  snapshotState?: UsageRequestUsageState;
 }
 
 export interface TranslationFn {
@@ -197,6 +207,22 @@ export function getSessionContextUsageDisplay(session?: Session): ContextUsageDi
     };
   }
 
+  const snapshotView = resolveRequestContextSnapshotView(
+    session.requestContextSnapshot,
+    session.maxContextTokens,
+  );
+  // A recorded request snapshot is the authoritative reading for the default
+  // context panel. When it carries no total, render nothing instead of a
+  // legacy number that belongs to a different request.
+  if (snapshotView.snapshot) {
+    return {
+      current: snapshotView.used ?? 0,
+      max: snapshotView.max ?? DEFAULT_MAX_CONTEXT_TOKENS,
+      source: 'agent_prompt',
+      snapshotState: snapshotView.usageState,
+    };
+  }
+
   if (session.currentAcpContextUsage) {
     return {
       current: session.currentAcpContextUsage.used,
@@ -233,7 +259,107 @@ export function buildContextUsageTooltip(params: {
 export function formatElapsedDuration(durationMs: number): string {
   return formatDuration(durationMs);
 }
+export const REQUEST_CONTEXT_SNAPSHOT_CATEGORIES = [
+  'systemPrompt', 'toolDefinitions', 'rules', 'skills', 'mcpTools',
+  'subagentDefinitions', 'summarizedConversation', 'conversation',
+] as const satisfies readonly (keyof UsageContextBreakdown)[];
 
+export type RequestContextSnapshotCategory = (typeof REQUEST_CONTEXT_SNAPSHOT_CATEGORIES)[number];
+
+export type RequestContextCategoryState = 'ready' | 'pending' | 'unavailable' | 'absent';
+
+/**
+ * Presentation of one recorded request snapshot.
+ *
+ * The total is never derived from the categories: for a provider-reported
+ * request it is `inputTotal` (U) and the category rows are the same-attempt
+ * estimated proportions scaled to that total. For an estimated request the
+ * total is `estimatedTotal` and the caller must label it as an estimate.
+ */
+export interface RequestContextSnapshotView {
+  usageState: UsageRequestUsageState;
+  /** The total the panel may present; undefined when nothing was recorded. */
+  used?: number;
+  max?: number;
+  /** Category rows scaled onto the presented total. */
+  categories?: Array<{ key: RequestContextSnapshotCategory; value: number }>;
+  categoryState: RequestContextCategoryState;
+  snapshot?: UsageRequestSnapshot;
+  unavailableReason?: string;
+}
+
+const isSafeCount = (value: number | undefined): value is number => (
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+);
+
+function validCount(value: number | undefined): number | undefined {
+  return isSafeCount(value) ? value : undefined;
+}
+
+function positiveCount(value: number | undefined): number | undefined {
+  return isSafeCount(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * Resolve the displayed reading of one recorded snapshot.
+ *
+ * `fallbackMaxTokens` is the Session's own context window and is only used when
+ * the snapshot does not carry one; nothing is fabricated when neither is known.
+ */
+export function resolveRequestContextSnapshotView(
+  snapshot: UsageRequestSnapshot | undefined,
+  fallbackMaxTokens?: number,
+): RequestContextSnapshotView {
+  if (!snapshot) {
+    return { usageState: 'unknown', categoryState: 'absent' };
+  }
+
+  const categories = snapshot.categories;
+  const estimatedTotal = positiveCount(snapshot.estimatedTotal);
+  const inputTotal = validCount(snapshot.inputTotal);
+  // A zero total recorded by a legacy ledger means "not recorded", not a
+  // measurement. A model request's own provider report may legitimately be 0.
+  const zeroIsMeasurement = snapshot.inputSource === 'model_request';
+  const used = snapshot.usageState === 'provider_reported'
+    ? (zeroIsMeasurement ? inputTotal : positiveCount(inputTotal))
+    : snapshot.usageState === 'estimated'
+      ? estimatedTotal
+      : undefined;
+  const max = positiveCount(snapshot.contextWindow)
+    ?? positiveCount(categories?.contextWindow)
+    ?? positiveCount(fallbackMaxTokens);
+
+  let categoryState: RequestContextCategoryState = 'absent';
+  let rows: Array<{ key: RequestContextSnapshotCategory; value: number }> | undefined;
+  if (snapshot.summaryState === 'pending') {
+    categoryState = 'pending';
+  } else if (snapshot.summaryState === 'unavailable') {
+    categoryState = 'unavailable';
+  } else if (categories && REQUEST_CONTEXT_SNAPSHOT_CATEGORIES.every(key => isSafeCount(categories[key]))) {
+    categoryState = 'ready';
+    // Provider totals win over the estimated sum: scale the same-attempt
+    // per-category estimates onto U instead of presenting Σcategories as U.
+    const scale = snapshot.usageState === 'provider_reported' && used !== undefined && estimatedTotal
+      ? used / estimatedTotal
+      : 1;
+    rows = REQUEST_CONTEXT_SNAPSHOT_CATEGORIES.map(key => ({
+      key,
+      value: Math.max(0, Math.round(categories[key] * scale)),
+    }));
+  } else if (used !== undefined) {
+    categoryState = 'unavailable';
+  }
+
+  return {
+    usageState: snapshot.usageState,
+    used,
+    max,
+    categories: rows,
+    categoryState,
+    snapshot,
+    unavailableReason: snapshot.unavailableReason,
+  };
+}
 export function buildModelRoundCompletionMeta(params: {
   completedAt?: number;
   durationMs?: number;

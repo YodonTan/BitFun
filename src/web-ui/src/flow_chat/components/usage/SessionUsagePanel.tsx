@@ -1,8 +1,11 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useI18n } from '@/infrastructure/i18n';
 import { MarkdownRenderer } from '@/infrastructure/markdown';
 import { Empty, Icon, IconButton, LoadingState, PageHeader, ScrollArea, Tooltip } from '@openbitfun/ui';
-import type { SessionUsageReport, UsageContextEstimate } from '@/infrastructure/api/service-api/SessionAPI';
+import type {
+  SessionUsageReport,
+  UsageRequestSnapshot,
+} from '@/infrastructure/api/service-api/SessionAPI';
 import {
   buildSessionUsageExportMarkdown,
   isUnusedSession,
@@ -14,7 +17,50 @@ import { SessionUsageSummary } from './SessionUsageSummary';
 import { SessionUsageEmptyState } from './SessionUsageEmptyState';
 import { useContextPreview } from './useContextPreview';
 import type { SessionUsagePanelTab } from './sessionUsagePanelTypes';
+import { flowChatStore } from '../../store/FlowChatStore';
+import {
+  readRequestContextSnapshot,
+  surfaceSupportsRequestContextSnapshot,
+} from '../../services/requestContextSnapshotService';
 import './SessionUsagePanel.scss';
+
+/** Same recorded request, by the identity core compares. */
+function sameRequestIdentity(a: UsageRequestSnapshot, b: UsageRequestSnapshot): boolean {
+  return a.request.executionHostId === b.request.executionHostId
+    && (a.request.workspaceId ?? '') === (b.request.workspaceId ?? '')
+    && a.request.sessionId === b.request.sessionId
+    && a.request.turnId === b.request.turnId
+    && a.request.roundId === b.request.roundId
+    && a.request.attemptId === b.request.attemptId;
+}
+
+/** Newest attempt wins; a same-attempt answer may replace, never regress. */
+function isSnapshotNewerOrEqual(candidate: UsageRequestSnapshot, current: UsageRequestSnapshot): boolean {
+  if (sameRequestIdentity(candidate, current)) return true;
+  if (candidate.request.startedAt !== current.request.startedAt) {
+    return candidate.request.startedAt > current.request.startedAt;
+  }
+  // A different request with the same order is not newer: the store rejects it,
+  // so a same-order snapshot from another Turn may not replace this reading.
+  return candidate.request.attemptIndex > current.request.attemptIndex;
+}
+
+/**
+ * The better of two readings of one session. The store owns the identity/order
+ * compare-and-set, so a late report or a slow read may never overwrite the
+ * newer reading an event already delivered.
+ */
+function preferredSnapshot(
+  incoming: UsageRequestSnapshot | undefined,
+  current: UsageRequestSnapshot | undefined,
+): UsageRequestSnapshot | undefined {
+  if (!incoming) return current;
+  if (!current) return incoming;
+  if (sameRequestIdentity(incoming, current)) {
+    return incoming.capturedAt >= current.capturedAt ? incoming : current;
+  }
+  return isSnapshotNewerOrEqual(incoming, current) ? incoming : current;
+}
 
 interface SessionUsagePanelProps {
   report?: SessionUsageReport;
@@ -47,12 +93,81 @@ export const SessionUsagePanel: React.FC<SessionUsagePanelProps> = ({
   const { t } = useI18n('flow-chat');
   const reportTitle = t('usage.panel.report');
   const [copied, setCopied] = useState(false);
-  const [previewEstimate, setPreviewEstimate] = useState<UsageContextEstimate>();
-  useEffect(() => setPreviewEstimate(undefined), [report]);
+  const effectiveSessionId = sessionId ?? report?.sessionId;
+  const effectiveWorkspaceId = workspaceId ?? report?.workspace.workspaceId;
+  /**
+   * The context section reads the recorded snapshot, never a rebuilt estimate.
+   * The report's own echo and the store's live reading are merged by request
+   * identity and attempt order, so the panel shows the same reading as the ring
+   * and the overview even when an event lands after the panel opened.
+   */
+  const [snapshot, setSnapshot] = useState<UsageRequestSnapshot | undefined>(
+    () => report?.requestSnapshot?.snapshot
+      ?? (effectiveSessionId
+        ? flowChatStore.getState().sessions.get(effectiveSessionId)?.requestContextSnapshot
+        : undefined),
+  );
+  /** The session the state belongs to: an answer for a previous one is dropped. */
+  const snapshotSessionRef = useRef(effectiveSessionId);
+  snapshotSessionRef.current = effectiveSessionId;
+
+  const acceptSnapshot = useCallback((
+    candidate: UsageRequestSnapshot | undefined,
+    sessionId: string | undefined,
+  ) => {
+    if (!sessionId || sessionId !== snapshotSessionRef.current) return;
+    setSnapshot(current => preferredSnapshot(
+      candidate,
+      // A reading kept from a previous session is not a baseline to compare with.
+      current?.request.sessionId === sessionId ? current : undefined,
+    ));
+  }, []);
+
+  useEffect(() => {
+    const currentSessionId = effectiveSessionId;
+    snapshotSessionRef.current = currentSessionId;
+    const resolved = preferredSnapshot(
+      report?.requestSnapshot?.snapshot,
+      currentSessionId
+        ? flowChatStore.getState().sessions.get(currentSessionId)?.requestContextSnapshot
+        : undefined,
+    );
+    // A session with no reading clears the previous one instead of keeping its
+    // numbers on screen.
+    setSnapshot(current => preferredSnapshot(
+      resolved,
+      current?.request.sessionId === currentSessionId ? current : undefined,
+    ));
+    if (resolved || !currentSessionId || !surfaceSupportsRequestContextSnapshot()) return;
+    let live = true;
+    void readRequestContextSnapshot({
+      sessionId: currentSessionId,
+      workspaceId: effectiveWorkspaceId,
+    }).then(result => {
+      if (!live) return;
+      acceptSnapshot(
+        result.snapshot ?? flowChatStore.getState().sessions.get(currentSessionId)?.requestContextSnapshot,
+        currentSessionId,
+      );
+    }, () => undefined);
+    return () => { live = false; };
+  }, [report, effectiveSessionId, effectiveWorkspaceId, acceptSnapshot]);
+
+  // Follow the same stored reading the ring and the overview use.
+  useEffect(() => {
+    if (!effectiveSessionId) return;
+    const sessionId = effectiveSessionId;
+    return flowChatStore.subscribeSelector(
+      state => state.sessions.get(sessionId)?.requestContextSnapshot,
+      stored => acceptSnapshot(stored, sessionId),
+    );
+  }, [effectiveSessionId, acceptSnapshot]);
+
   const { previewLoading, previewContext: handlePreviewContext } = useContextPreview({
-    sessionId: sessionId ?? report?.sessionId, reportSessionId: report?.sessionId,
-    workspaceId: workspaceId ?? report?.workspace.workspaceId,
-    estimate: previewEstimate, onEstimate: setPreviewEstimate,
+    sessionId: effectiveSessionId,
+    reportSessionId: report?.sessionId,
+    workspaceId: effectiveWorkspaceId,
+    request: snapshot?.request,
   });
   const [redactExportPaths, setRedactExportPaths] = useState(getUsageExportRedactPathsPreference);
 
@@ -145,8 +260,8 @@ export const SessionUsagePanel: React.FC<SessionUsagePanelProps> = ({
         />
       </div>
 
-      <SessionUsageSummary report={previewEstimate ? { ...report, contextEstimate: previewEstimate } : report} workspaceName={workspaceName}
-        onPreviewContext={handlePreviewContext} previewLoading={previewLoading} />
+      <SessionUsageSummary report={report} snapshot={snapshot} fallbackContextWindow={report.context?.contextWindow}
+        workspaceName={workspaceName} onPreviewContext={handlePreviewContext} previewLoading={previewLoading} />
     </ScrollArea>
   );
 };

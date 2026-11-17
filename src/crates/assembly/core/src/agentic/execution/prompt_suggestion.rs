@@ -22,6 +22,7 @@ use crate::infrastructure::ai::AIClient;
 use crate::service::config::{subscribe_config_updates, ConfigUpdateEvent};
 use crate::util::types::{Message as AIMessage, ToolDefinition};
 use log::{debug, info, warn};
+use openbitfun_agent_runtime::prompt::PrependedPromptReminders;
 use openbitfun_agent_runtime::prompt_suggestion::{
     prompt_suggestion_instruction, prompt_suggestion_text, PromptSuggestionRuntime,
 };
@@ -42,7 +43,7 @@ pub(super) struct PromptSuggestionRequest {
     pub ai_client: Arc<AIClient>,
     pub tool_definitions: Option<Vec<ToolDefinition>>,
     pub model_request_context: ModelRequestContext,
-    pub prepended_reminders: Vec<String>,
+    pub prepended_reminders: PrependedPromptReminders,
     pub workspace: Option<WorkspaceBinding>,
     pub workspace_services: Option<WorkspaceServices>,
     pub attach_images: bool,
@@ -71,11 +72,6 @@ async fn prompt_suggestion_enabled() -> bool {
 pub(super) async fn build_prompt_suggestion_messages(
     request: &PromptSuggestionRequest,
 ) -> crate::util::errors::OpenBitFunResult<Vec<AIMessage>> {
-    let reminders = request
-        .prepended_reminders
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
     let mut ai_messages = ExecutionEngine::build_ai_messages_for_send(
         &request.messages,
         &request.ai_client.config.format,
@@ -83,9 +79,10 @@ pub(super) async fn build_prompt_suggestion_messages(
         request.workspace_services.as_ref(),
         &request.turn_id,
         request.attach_images,
-        &reminders,
+        &request.prepended_reminders,
     )
-    .await?;
+    .await?
+    .messages;
     ai_messages.push(AIMessage::user(prompt_suggestion_instruction().to_string()));
     Ok(ai_messages)
 }
@@ -581,7 +578,7 @@ mod tests {
                 prompt_cache_route_key: Some("same-conversation".into()),
                 ..Default::default()
             },
-            prepended_reminders: Vec::new(),
+            prepended_reminders: PrependedPromptReminders::default(),
             workspace: None,
             workspace_services: None,
             attach_images: false,
@@ -738,8 +735,10 @@ mod tests {
             Message::assistant("The build is fixed.".to_string())
                 .with_turn_id("turn-1".to_string()),
         ];
-        let reminders = vec!["skill listing".to_string()];
-        let reminder_refs = reminders.iter().map(String::as_str).collect::<Vec<_>>();
+        let reminders = PrependedPromptReminders {
+            skill_listing: Some("skill listing".to_string()),
+            ..Default::default()
+        };
         let round_messages = ExecutionEngine::build_ai_messages_for_send(
             &messages,
             &ai_client.config.format,
@@ -747,10 +746,11 @@ mod tests {
             None,
             "turn-1",
             false,
-            &reminder_refs,
+            &reminders,
         )
         .await
-        .expect("round messages");
+        .expect("round messages")
+        .messages;
 
         let request = PromptSuggestionRequest {
             session_id: "session-1".to_string(),

@@ -7454,6 +7454,61 @@ impl SessionManager {
         .await
     }
 
+    /// Record the latest observed model request facts for one session.
+    ///
+    /// This is a write path owned by the model round, never by a read path. It
+    /// applies exactly the same mutation, visibility and persistence gates as
+    /// `persist_current_context_usage`, then merges through the owner-side
+    /// compare-and-set so an older attempt can never replace a newer one.
+    /// Returns whether the snapshot was applied to persisted metadata.
+    pub(crate) async fn persist_last_recorded_request_snapshot(
+        &self,
+        session_id: &str,
+        snapshot: openbitfun_core_types::UsageRequestSnapshot,
+    ) -> bool {
+        let mutation_guard = match self.acquire_session_mutation(session_id).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                warn!(
+                    "Skipping recorded request snapshot: session_id={}, error={}",
+                    session_id, error
+                );
+                return false;
+            }
+        };
+        let should_persist_snapshot = self.sessions.get(session_id).is_some_and(|session| {
+            !session.agent_type.starts_with("acp:")
+                && session
+                    .dialog_turn_ids
+                    .iter()
+                    .any(|turn_id| turn_id == &snapshot.request.turn_id)
+                && self.should_persist_session(&session)
+        });
+        if !should_persist_snapshot || !self.config.enable_persistence {
+            return false;
+        }
+
+        let mut applied = false;
+        let result = self
+            .update_persisted_session_metadata(session_id, |metadata| {
+                applied = openbitfun_services_core::session::apply_last_recorded_request_snapshot(
+                    metadata, snapshot,
+                );
+            })
+            .await;
+        drop(mutation_guard);
+        match result {
+            Ok(()) => applied,
+            Err(error) => {
+                warn!(
+                    "Failed to persist recorded request snapshot: session_id={}, error={}",
+                    session_id, error
+                );
+                false
+            }
+        }
+    }
+
     pub async fn merge_session_relationship(
         &self,
         session_id: &str,
@@ -12375,6 +12430,114 @@ mod tests {
             .expect("metadata should exist");
         assert_eq!(metadata.current_context_usage, Some(usage));
     }
+    fn recorded_request_snapshot(
+        session_id: &str,
+        attempt_id: &str,
+        attempt_index: u32,
+        started_at: i64,
+    ) -> openbitfun_core_types::UsageRequestSnapshot {
+        openbitfun_core_types::UsageRequestSnapshot {
+            schema_version: openbitfun_core_types::REQUEST_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
+            request: openbitfun_core_types::UsageRequestRef {
+                execution_host_id: "local".to_string(),
+                workspace_id: None,
+                session_id: session_id.to_string(),
+                turn_id: "turn-1".to_string(),
+                round_id: "round-1".to_string(),
+                attempt_id: attempt_id.to_string(),
+                attempt_index,
+                started_at,
+            },
+            captured_at: 1,
+            input_source: openbitfun_core_types::UsageRequestInputSource::ModelRequest,
+            input_total: Some(100),
+            context_window: None,
+            cached_input_tokens: None,
+            usage_state: openbitfun_core_types::UsageRequestUsageState::ProviderReported,
+            estimated_total: None,
+            estimation_version: None,
+            summary_state: openbitfun_core_types::UsageSummaryState::Pending,
+            categories: None,
+            unavailable_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn recorded_request_snapshot_persistence_honors_session_gates_and_cas() {
+        let workspace = TestWorkspace::new();
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(workspace.path_manager()).expect("persistence manager"),
+        );
+        let manager = test_manager(persistence_manager.clone());
+        let session = manager
+            .create_session(
+                "Recorded request snapshot".to_string(),
+                "Standard".to_string(),
+                SessionConfig {
+                    tool_presentation_mode: Default::default(),
+                    workspace_path: Some(workspace.path().to_string_lossy().to_string()),
+                    ..SessionConfig::default()
+                },
+            )
+            .await
+            .expect("session should create");
+
+        // An invisible turn is never written.
+        assert!(
+            !manager
+                .persist_last_recorded_request_snapshot(
+                    &session.session_id,
+                    recorded_request_snapshot(&session.session_id, "round-1:attempt:1", 1, 10),
+                )
+                .await
+        );
+
+        manager
+            .sessions
+            .get_mut(&session.session_id)
+            .expect("session should be active")
+            .dialog_turn_ids
+            .push("turn-1".to_string());
+
+        let newest = recorded_request_snapshot(&session.session_id, "round-1:attempt:2", 2, 20);
+        assert!(
+            manager
+                .persist_last_recorded_request_snapshot(&session.session_id, newest.clone())
+                .await
+        );
+        // An older attempt never replaces a newer recorded request.
+        assert!(
+            !manager
+                .persist_last_recorded_request_snapshot(
+                    &session.session_id,
+                    recorded_request_snapshot(&session.session_id, "round-1:attempt:1", 1, 10),
+                )
+                .await
+        );
+        // Re-applying the same snapshot changes nothing.
+        assert!(
+            !manager
+                .persist_last_recorded_request_snapshot(&session.session_id, newest.clone())
+                .await
+        );
+
+        let metadata = persistence_manager
+            .load_session_metadata(workspace.path(), &session.session_id)
+            .await
+            .expect("metadata should load")
+            .expect("metadata should exist");
+        assert_eq!(
+            metadata
+                .last_recorded_request_snapshot
+                .expect("snapshot recorded")
+                .request
+                .attempt_id,
+            "round-1:attempt:2"
+        );
+        // The write path never mutates the cumulative context usage.
+        assert!(metadata.current_context_usage.is_none());
+    }
+
 
     #[tokio::test]
     async fn interrupted_turn_reopens_same_turn_from_snapshot_with_generation_cas() {

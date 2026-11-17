@@ -3,13 +3,12 @@ import { useUsageSeriesHighlight } from './useUsageSeriesHighlight';
 import { Empty, Icon, IconButton, OverflowText, PageHeader, Tooltip } from '@openbitfun/ui';
 import { ChartPie, ExternalLink } from 'lucide-react';
 import { useI18n } from '@/infrastructure/i18n';
-import type { SessionUsageReport, UsageContextBreakdown, UsageContextCategory } from '@/infrastructure/api/service-api/SessionAPI';
+import type { SessionUsageReport, UsageContextCategory, UsageRequestSnapshot } from '@/infrastructure/api/service-api/SessionAPI';
+import {
+  REQUEST_CONTEXT_SNAPSHOT_CATEGORIES,
+  resolveRequestContextSnapshotView,
+} from '../../utils/tokenUsageDisplay';
 import { formatTokenCount, formatUsagePercent } from './usageReportUtils';
-
-const CONTEXT_CATEGORIES = [
-  'systemPrompt', 'toolDefinitions', 'rules', 'skills', 'mcpTools',
-  'subagentDefinitions', 'summarizedConversation', 'conversation',
-] as const satisfies readonly (keyof UsageContextBreakdown)[];
 
 const isCount = (value: number | undefined): value is number => (
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
@@ -58,40 +57,44 @@ function UsageLegend({ rows, highlight, className = '', showShares = true }: {
 }
 
 /** Context composition and cumulative provider usage intentionally have independent denominators. */
-export function SessionUsageSummary({ report, workspaceName, onPreviewContext, previewLoading }: {
+export function SessionUsageSummary({ report, snapshot, fallbackContextWindow, workspaceName, onPreviewContext, previewLoading }: {
   report: SessionUsageReport;
+  /** Recorded request snapshot the context section reads; never a rebuilt estimate. */
+  snapshot?: UsageRequestSnapshot;
+  /** Context window reported by the cumulative report, used only as a fallback. */
+  fallbackContextWindow?: number;
   workspaceName: string;
   onPreviewContext: (category: UsageContextCategory) => void;
-  previewLoading: UsageContextCategory | null;
+  previewLoading: string | null;
 }) {
   const { t } = useI18n('flow-chat');
-  const context = report.contextEstimate?.composition;
-  const hasContext = !!context && CONTEXT_CATEGORIES.every(key => isCount(context[key]));
-  const contextTotal = hasContext ? CONTEXT_CATEGORIES.reduce((sum, key) => sum + context[key], 0) : 0;
-  const hasContextTotal = hasContext && Number.isSafeInteger(contextTotal);
-  const contextWindow = isCount(context?.contextWindow) && context.contextWindow > 0
-    ? context.contextWindow : undefined;
-  const hasContextDistribution = hasContextTotal && contextWindow !== undefined && contextTotal <= contextWindow;
+  const contextView = resolveRequestContextSnapshotView(snapshot, fallbackContextWindow);
+  const contextValues = new Map((contextView.categories ?? []).map(row => [row.key, row.value]));
+  const hasContextTotal = contextView.used !== undefined;
+  const contextWindow = contextView.max;
+  const hasContextDistribution = contextView.categoryState === 'ready' && hasContextTotal
+    && contextWindow !== undefined && contextView.used! <= contextWindow;
   let offset = 0;
-  const contextRows: Array<UsageSeries & { offset: number }> = CONTEXT_CATEGORIES.map(key => {
-    const share = hasContextDistribution ? context![key] / contextWindow : undefined;
-    const row = { key, label: t(`usage.context.categories.${key}`), value: hasContext ? context![key] : undefined, share, offset,
-      action: key !== 'summarizedConversation' && key !== 'conversation' ? (
+  const contextRows: Array<UsageSeries & { offset: number }> = [...REQUEST_CONTEXT_SNAPSHOT_CATEGORIES].map(key => {
+    const value = contextValues.get(key);
+    const share = hasContextDistribution && value !== undefined ? value / contextWindow! : undefined;
+    const row = { key, label: t(`usage.context.categories.${key}`), value, share, offset,
+      action: value !== undefined && key !== 'summarizedConversation' && key !== 'conversation' ? (
         <Tooltip content={t('usage.context.previewCategory', { category: t(`usage.context.categories.${key}`) })}>
           <IconButton size="xs" icon={<Icon glyph={ExternalLink} size="xs" />}
             aria-label={t('usage.context.previewCategory', { category: t(`usage.context.categories.${key}`) })}
             loading={previewLoading === key} disabled={previewLoading !== null && previewLoading !== key}
-            onClick={() => onPreviewContext(key)} />
+            onClick={() => onPreviewContext(key as UsageContextCategory)} />
         </Tooltip>
       ) : undefined };
     offset += (share ?? 0) * 100;
     return row;
   });
   if (hasContextDistribution) {
-    const unused = contextWindow - contextTotal;
+    const unused = contextWindow! - contextView.used!;
     contextRows.push({
       key: 'unused', label: t('usage.context.unused'), value: unused,
-      share: unused / contextWindow, offset,
+      share: unused / contextWindow!, offset,
     });
   }
   const { inputTokens, outputTokens, totalTokens, cachedTokens, cacheCoverage } = report.tokens;
@@ -181,11 +184,12 @@ export function SessionUsageSummary({ report, workspaceName, onPreviewContext, p
         <div className="session-usage-panel__summary-fact" data-openbitfun-product-component="session-usage-panel" data-openbitfun-product-part="summaryFact">
           <dt>{t('usage.context.label')}</dt>
           <dd>
-            <Tooltip content={t('usage.context.estimateHelp')}>
+            <Tooltip content={contextView.usageState === 'estimated'
+              ? t('usage.context.estimatedNotReported') : t('usage.context.estimateHelp')}>
               <OverflowText>{hasContextTotal || contextWindow !== undefined
                 ? t('usage.context.usageOfCapacity', {
                   used: hasContextTotal
-                    ? t('usage.context.approximateTokens', { value: formatTokenCount(contextTotal, t) })
+                    ? t('usage.context.approximateTokens', { value: formatTokenCount(contextView.used, t) })
                     : t('usage.unavailable'),
                   size: formatTokenCount(contextWindow, t),
                 })
@@ -196,10 +200,24 @@ export function SessionUsageSummary({ report, workspaceName, onPreviewContext, p
       </dl>
       {tokenUsage}
       <section className="session-usage-panel__summary session-usage-panel__context" data-openbitfun-product-component="session-usage-panel" data-openbitfun-product-part="section" aria-label={t('usage.context.title')}>
-        <PageHeader level={3} size="sm" title={t('usage.context.title')} action={
-          <Tooltip content={t('usage.context.estimateHelp')}><span className="session-usage-panel__chart-meta">{t('usage.context.estimated')}</span></Tooltip>
-        } />
-        {hasContextTotal ? (
+        <PageHeader level={3} size="sm" title={t('usage.context.title')} action={contextHeaderLabel()} />
+        {contextView.categoryState === 'pending' ? (
+          <p className="session-usage-panel__section-help" role="status"
+            data-openbitfun-product-component="session-usage-panel" data-openbitfun-product-part="contextPending">
+            {t('usage.context.pendingClassification')}
+          </p>
+        ) : null}
+        {contextView.categoryState === 'unavailable' || (contextView.usageState === 'unknown' && !!snapshot) ? (
+          <Empty icon={<Icon glyph={ChartPie} />}
+            title={contextView.usageState === 'unknown'
+              ? t('usage.context.unknownUsage')
+              : t('usage.context.summaryUnavailable')}
+            description={contextView.unavailableReason} />
+        ) : null}
+        {contextView.categoryState === 'absent' && !snapshot ? (
+          <Empty icon={<Icon glyph={ChartPie} />} title={t('usage.context.noRecordedRequest')} />
+        ) : null}
+        {contextView.categoryState === 'ready' && hasContextTotal ? (
           <>
             {!hasContextDistribution && <p className="session-usage-panel__section-help">{t(contextWindow === undefined
               ? 'usage.context.capacityUnavailable' : 'usage.context.exceedsCapacity')}</p>}
@@ -215,15 +233,35 @@ export function SessionUsageSummary({ report, workspaceName, onPreviewContext, p
                   ))}
                 </svg>
                 <div className="session-usage-panel__donut-label">
-                  <strong>{formatUsagePercent((activeContext?.share ?? contextTotal / contextWindow) * 100, t)}</strong>
+                  <strong>{formatUsagePercent((activeContext?.share ?? contextView.used! / contextWindow!) * 100, t)}</strong>
                   <span>{activeContext ? activeContext.label : t('usage.context.utilization')}</span>
                 </div>
               </div>}
               <UsageLegend rows={contextRows} highlight={highlightContext} />
             </div>
           </>
-        ) : <Empty icon={<Icon glyph={ChartPie} />} title={t('usage.context.unavailable')} />}
+        ) : null}
+        {contextView.categoryState === 'ready' && !hasContextTotal ? (
+          <Empty icon={<Icon glyph={ChartPie} />} title={t('usage.context.unknownUsage')} />
+        ) : null}
       </section>
     </>
   );
+
+  function contextHeaderLabel(): ReactNode {
+    if (!snapshot) return undefined;
+    return (
+      <Tooltip content={contextView.usageState === 'estimated'
+        ? t('usage.context.estimatedNotReported') : t('usage.context.providerReported')}>
+        <span className="session-usage-panel__chart-meta"
+          data-openbitfun-product-component="session-usage-panel" data-openbitfun-product-part="contextSource">
+          {t(contextView.usageState === 'estimated'
+            ? 'usage.context.estimated'
+            : contextView.usageState === 'provider_reported'
+              ? 'usage.context.providerReportedShort'
+              : 'usage.context.unknownShort')}
+        </span>
+      </Tooltip>
+    );
+  }
 }

@@ -131,3 +131,21 @@ export function canQueryModelQuotaOnSurface(peerActive: boolean, capabilities: P
 export function canQueryGrokQuotaOnSurface(peerActive: boolean, capabilities: PeerHostCapabilities | null): boolean {
   return !peerActive || capabilities?.grokQuotaV1 === true;
 }
+
+/**
+ * Whether the rendered surface records request-context snapshots and answers
+ * the explicit snapshot read.
+ *
+ * The local surface always can: it runs this build. A peer host must advertise
+ * `session_request_context_snapshot_v1`. Unlike `cancelTool` or `toolCatalog`,
+ * a missing key is not resolved through `hostKind`, because no older Desktop or
+ * CLI host recorded snapshots — guessing support would send the unnegotiated
+ * mode to a host that cannot answer it.
+ */
+export function canReadRequestContextSnapshotOnSurface(
+  peerActive: boolean,
+  capabilities: PeerHostCapabilities | null,
+): boolean {
+  if (!peerActive) return true;
+  return capabilities?.requestContextSnapshotV1 === true;
+}
