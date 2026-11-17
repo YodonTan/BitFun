@@ -17,6 +17,7 @@ import { classifyPeerHostRefusal } from '@/infrastructure/peer-device/peerHostRe
 import { createLogger } from '@/shared/utils/logger';
 import { flowChatStore } from '../store/FlowChatStore';
 import { resolveSessionDriverId } from '../session-drivers/resolve';
+import { acpAgentTypeFromSession } from '../utils/acpSession';
 
 const log = createLogger('RequestContextSnapshot');
 
@@ -30,6 +31,16 @@ const log = createLogger('RequestContextSnapshot');
  */
 const DISPATCH_SNAPSHOT_OWNED_BY_TARGET =
   'This session runs on a dispatch target. Its recorded request snapshot arrives from the target host.';
+
+/**
+ * Why an external agent session has no recorded snapshot on this host.
+ *
+ * The ACP host answers the report with an explicit NotAvailable because it does
+ * not record requests for an `acp:` agent; asking would only produce a refusal
+ * that reads like a failure, so the surface says this up front.
+ */
+const ACP_SNAPSHOT_UNSUPPORTED =
+  'This session runs an external ACP agent, so the request context is owned by that agent and is not recorded here.';
 
 /**
  * `unsupported` means this surface cannot read the snapshot at all (an older
@@ -87,6 +98,19 @@ function echoMatchesRequest(
 }
 
 /**
+ * Re-read the ACP capability from the current store state.
+ *
+ * The session may not be hydrated when a read starts (startup races the read),
+ * so an ACP host refusal has to be re-classified with the session facts known
+ * at answer time instead of being reported as a failure.
+ */
+function acpSnapshotRefusal(sessionId: string): RequestContextSnapshotReadResult | undefined {
+  return acpAgentTypeFromSession(flowChatStore.getState().sessions.get(sessionId))
+    ? { status: 'unsupported', unavailableReason: ACP_SNAPSHOT_UNSUPPORTED }
+    : undefined;
+}
+
+/**
  * Read the latest recorded request-context snapshot of one Session.
  *
  * This is the default context overview's only read: it asks for the snapshot
@@ -101,6 +125,10 @@ export function readRequestContextSnapshot(
   if (!surfaceSupportsRequestContextSnapshot()) {
     return Promise.resolve({ status: 'unsupported' });
   }
+  // An external agent owns its own request context; the host would answer with
+  // an explicit refusal, which is a capability answer rather than a failure.
+  const acpRefusal = acpSnapshotRefusal(options.sessionId);
+  if (acpRefusal) return Promise.resolve(acpRefusal);
   const key = readKey(scope, options.sessionId);
   const existing = inFlightReads.get(key);
   if (existing) return existing;
@@ -109,6 +137,10 @@ export function readRequestContextSnapshot(
     .catch((error: unknown): RequestContextSnapshotReadResult => {
       // A surface switch during the read is control flow, not a failure.
       if (isSurfaceChangedError(error) || !scope.isCurrent()) return { status: 'stale' };
+      // The session may have hydrated while the host was answering: an ACP
+      // refusal is a capability answer, not a failure.
+      const lateAcpRefusal = acpSnapshotRefusal(options.sessionId);
+      if (lateAcpRefusal) return lateAcpRefusal;
       log.warn('Request context snapshot read failed', { sessionId: options.sessionId, error });
       return {
         status: classifyPeerHostRefusal(error) ? 'unsupported' : 'failed',
@@ -150,7 +182,9 @@ async function readSnapshot(
 
   const view = report.requestSnapshot;
   if (!view?.snapshot) {
-    return { status: 'unavailable' };
+    // The session may have hydrated while the report was in flight; a refused
+    // ACP read must not read as "nothing recorded".
+    return acpSnapshotRefusal(options.sessionId) ?? { status: 'unavailable' };
   }
   // A response that describes another Session belongs to a scope this surface
   // no longer renders. Host and workspace scope are enforced by the store's
@@ -201,6 +235,10 @@ export async function readRequestContextSnapshotPreview(params: {
   const session = flowChatStore.getState().sessions.get(params.sessionId);
   if (resolveSessionDriverId(params.sessionId, session) === 'dispatch') {
     return { status: 'unsupported', unavailableReason: DISPATCH_SNAPSHOT_OWNED_BY_TARGET };
+  }
+  // Same capability answer as the read path: the external agent owns the record.
+  if (acpAgentTypeFromSession(session)) {
+    return { status: 'unsupported', unavailableReason: ACP_SNAPSHOT_UNSUPPORTED };
   }
   const workspaceId = params.workspaceId
     || session?.workspaceId

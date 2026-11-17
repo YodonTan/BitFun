@@ -52,6 +52,8 @@ const MAX_REMEMBERED_EVICTIONS: usize = 16;
 const PREVIEW_EVICTED_REASON: &str = "source evicted";
 const PREVIEW_RESTART_REASON: &str = "preview unavailable after restart";
 const PREVIEW_OVERSIZE_REASON: &str = "source exceeded the retained size limit";
+/// `UsageContextCategory::Unknown` names no recorded source, so it has no preview.
+const PREVIEW_NO_CATEGORY_REASON: &str = "requested context category has no preview";
 const SNAPSHOT_NOT_CAPTURED_REASON: &str = "no captured input for this attempt";
 const PREVIEW_TRUNCATED_MARKER: &str = "\n\n[preview truncated]";
 
@@ -571,9 +573,18 @@ async fn complete_summary(
 /// Record the terminal state of one attempt against its captured input.
 ///
 /// The returned snapshot is the value to persist: a provider-reported input
-/// total when the adapter normalized one, a same-attempt estimate when only the
-/// summary is ready, otherwise an explicit unknown. A reported total is never
-/// inferred and a zero is never recorded as a reported total.
+/// `usage_prompt_token_count` is the attempt's own provider observation (the
+/// adapter-normalized `prompt_token_count`), and it is the only input that can
+/// make a snapshot `ProviderReported`. Context-compression data
+/// (`current_context_usage`, `SessionContextUsageSource::ContextCompression`,
+/// `ContextCompressionCompleted`) is never accepted here: it describes the
+/// compacted context, not what the provider reported for this request, so a
+/// snapshot never derives a reported total from it.
+///
+/// The returned snapshot is therefore a provider-reported input total when the
+/// adapter normalized one, a same-attempt estimate when only the summary is
+/// ready, otherwise an explicit unknown. A reported total is never inferred and
+/// a zero is never recorded as a reported total.
 pub(crate) fn activate_attempt(
     request: UsageRequestRef,
     usage_prompt_token_count: Option<u64>,
@@ -620,8 +631,11 @@ pub(crate) fn activate_attempt(
     };
 
     if let Some(prompt_token_count) = usage_prompt_token_count.filter(|count| *count > 0) {
-        // The adapter already normalized this to the whole request input,
-        // including cached tokens.
+        // The only assignment of `ProviderReported` in this module. The value is
+        // the attempt's provider usage observation, already normalized by the
+        // adapter to the whole request input (including cached tokens).
+        // Compression data never reaches this branch, and a zero is not an
+        // observation.
         snapshot.input_total = Some(prompt_token_count);
         snapshot.cached_input_tokens = cached_input_tokens;
         snapshot.usage_state = UsageRequestUsageState::ProviderReported;
@@ -672,10 +686,17 @@ pub(crate) fn record_summary_result(
 ///
 /// A preview never substitutes the current context: an evicted source, an
 /// earlier process, or a different attempt reports an explicit reason.
+/// `UsageContextCategory::Unknown` names no recorded source at all, so it is
+/// rejected before any lookup instead of answering with empty content.
 pub fn materialize_request_context_preview(
     request: &UsageRequestRef,
     category: UsageContextCategory,
 ) -> RequestContextPreview {
+    if category == UsageContextCategory::Unknown {
+        return RequestContextPreview::Unavailable {
+            reason: PREVIEW_NO_CATEGORY_REASON.to_string(),
+        };
+    }
     let key = RequestKey::of(request);
     let found = with_registry(|registry| {
         registry
@@ -1200,17 +1221,107 @@ mod tests {
         clear_registry();
         let request = session_request("session-inline", "round-1:attempt:1", 1, 10);
         begin_attempt(
-            conversation_input("some content"),
+            prepared(
+                vec![
+                    AIMessage::system("system body".into()),
+                    AIMessage::user("hello".into()),
+                ],
+                vec![SendCategory::SystemPrompt, SendCategory::Conversation],
+            ),
             request.clone(),
-            None,
-            None,
+            Some(Arc::new(vec![tool("read_file", "Read a file")])),
+            Some(128_000),
             activation(),
+        );
+
+        // `begin_attempt` returned without scanning anything: the source is
+        // registered, exactly one bounded job owns the numbers, and no category
+        // sum exists yet on the caller task.
+        assert!(
+            matches!(summary_slot(&request), Some(SummarySlot::Running)),
+            "the free permit admits one background job, nothing runs inline"
         );
         assert!(request_context_summary_is_live(&request));
         assert!(
             !summary_ready(&request),
             "the summary must not be computed on the caller"
         );
+
+        // The send path can activate immediately after registration.
+        let immediate = activate_attempt(request.clone(), Some(1_200), None);
+        assert_eq!(immediate.summary_state, UsageSummaryState::Pending);
+        assert!(immediate.categories.is_none());
+        assert!(immediate.estimated_total.is_none());
+        assert_eq!(
+            immediate.usage_state,
+            UsageRequestUsageState::ProviderReported
+        );
+        assert_eq!(immediate.input_total, Some(1_200));
+        assert_eq!(immediate.context_window, Some(128_000));
+
+        // The numbers only exist once the background job has run.
+        wait_for_summary(&request).await;
+        let upgraded = activated_snapshot(&request).expect("activation recorded");
+        assert_eq!(upgraded.summary_state, UsageSummaryState::Ready);
+        assert_eq!(upgraded.input_total, Some(1_200));
+        assert!(upgraded.categories.is_some_and(|categories| {
+            categories.system_prompt > 0 && categories.tool_definitions > 0
+        }));
+        clear_registry();
+    }
+
+    #[tokio::test]
+    async fn only_a_provider_observation_reports_a_total() {
+        let _guard = test_guard();
+        clear_registry();
+        // A compacted context is only ever an estimate: the category sum of the
+        // attempt, never a provider total and never cache data promoted to one.
+        let estimated = session_request("session-compressed", "round-1:attempt:1", 1, 10);
+        begin_attempt(
+            conversation_input("compressed transcript"),
+            estimated.clone(),
+            None,
+            None,
+            activation(),
+        );
+        force_ready(
+            &estimated,
+            UsageContextBreakdown {
+                summarized_conversation: 900,
+                conversation: 100,
+                ..Default::default()
+            },
+        );
+        let snapshot = activate_attempt(estimated, None, Some(900));
+        assert_eq!(snapshot.usage_state, UsageRequestUsageState::Estimated);
+        assert_eq!(snapshot.input_total, None, "no provider observation, no total");
+        assert_eq!(
+            snapshot.cached_input_tokens, None,
+            "compression or cache numbers alone are never an observation"
+        );
+        assert_eq!(snapshot.estimated_total, Some(1_000));
+
+        // A summary merged after activation also never creates a provider total.
+        let merged = session_request("session-compressed-2", "round-1:attempt:1", 1, 10);
+        begin_attempt(
+            conversation_input("compressed transcript"),
+            merged.clone(),
+            None,
+            None,
+            activation(),
+        );
+        let mut activated = activate_attempt(merged, None, None);
+        assert_eq!(activated.usage_state, UsageRequestUsageState::Unknown);
+        assert!(record_summary_result(
+            &mut activated,
+            UsageContextBreakdown {
+                summarized_conversation: 500,
+                ..Default::default()
+            },
+            500,
+        ));
+        assert_eq!(activated.usage_state, UsageRequestUsageState::Estimated);
+        assert_eq!(activated.input_total, None);
         clear_registry();
     }
 
@@ -1328,6 +1439,46 @@ mod tests {
         let content = render_category_preview(&source, None, UsageContextCategory::SystemPrompt);
         assert!(content.len() <= MAX_PREVIEW_BYTES);
         assert!(content.ends_with(PREVIEW_TRUNCATED_MARKER));
+    }
+
+    #[tokio::test]
+    async fn unknown_category_preview_is_explicitly_unavailable() {
+        let _guard = test_guard();
+        clear_registry();
+        let request = session_request("session-no-category", "round-1:attempt:1", 1, 10);
+        begin_attempt(
+            prepared(
+                vec![AIMessage::system("system body".into())],
+                vec![SendCategory::SystemPrompt],
+            ),
+            request.clone(),
+            None,
+            None,
+            activation(),
+        );
+        // A category that names no recorded source never answers with empty content.
+        assert_eq!(
+            materialize_request_context_preview(&request, UsageContextCategory::Unknown),
+            RequestContextPreview::Unavailable {
+                reason: PREVIEW_NO_CATEGORY_REASON.to_string()
+            }
+        );
+        // The reason does not depend on retention: an unknown reference gets it too.
+        assert_eq!(
+            materialize_request_context_preview(
+                &session_request("session-no-category", "round-1:attempt:2", 2, 20),
+                UsageContextCategory::Unknown
+            ),
+            RequestContextPreview::Unavailable {
+                reason: PREVIEW_NO_CATEGORY_REASON.to_string()
+            }
+        );
+        // A real category of the same request is unaffected.
+        match materialize_request_context_preview(&request, UsageContextCategory::SystemPrompt) {
+            RequestContextPreview::Available { content, .. } => assert_eq!(content, "system body"),
+            other => panic!("expected the system prompt preview, got {other:?}"),
+        }
+        clear_registry();
     }
 
     #[tokio::test]

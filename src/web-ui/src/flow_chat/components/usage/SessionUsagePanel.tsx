@@ -110,6 +110,19 @@ export const SessionUsagePanel: React.FC<SessionUsagePanelProps> = ({
   /** The session the state belongs to: an answer for a previous one is dropped. */
   const snapshotSessionRef = useRef(effectiveSessionId);
   snapshotSessionRef.current = effectiveSessionId;
+  /**
+   * Why the surface refused a recorded read (an external agent or a dispatch
+   * target owns the record). It belongs to one session and one reading, so it
+   * resets whenever either changes and is only shown with no snapshot.
+   */
+  const [snapshotUnavailableReason, setSnapshotUnavailableReason] = useState<string | undefined>();
+
+  useEffect(() => {
+    setSnapshotUnavailableReason(undefined);
+  }, [effectiveSessionId]);
+  useEffect(() => {
+    if (snapshot) setSnapshotUnavailableReason(undefined);
+  }, [snapshot]);
 
   const acceptSnapshot = useCallback((
     candidate: UsageRequestSnapshot | undefined,
@@ -144,11 +157,17 @@ export const SessionUsagePanel: React.FC<SessionUsagePanelProps> = ({
       sessionId: currentSessionId,
       workspaceId: effectiveWorkspaceId,
     }).then(result => {
-      if (!live) return;
-      acceptSnapshot(
-        result.snapshot ?? flowChatStore.getState().sessions.get(currentSessionId)?.requestContextSnapshot,
-        currentSessionId,
-      );
+      if (!live || currentSessionId !== snapshotSessionRef.current) return;
+      const candidate = result.snapshot
+        ?? flowChatStore.getState().sessions.get(currentSessionId)?.requestContextSnapshot;
+      if (candidate) {
+        acceptSnapshot(candidate, currentSessionId);
+        return;
+      }
+      // A refused read explains itself; a plain empty answer does not.
+      if (result.status === 'unsupported' && result.unavailableReason) {
+        setSnapshotUnavailableReason(result.unavailableReason);
+      }
     }, () => undefined);
     return () => { live = false; };
   }, [report, effectiveSessionId, effectiveWorkspaceId, acceptSnapshot]);
@@ -236,6 +255,15 @@ export const SessionUsagePanel: React.FC<SessionUsagePanelProps> = ({
   const workspaceName = effectiveWorkspacePath?.trim()
     ? getUsageFileNameFromPath(effectiveWorkspacePath.trim())
     : t('usage.unavailable');
+  /**
+   * Only the denominator may come from outside the snapshot, and only from the
+   * Session's configured model window. The legacy report composition
+   * (`context`/`contextEstimate`) never supplies a context number here: its
+   * values are a rebuild of the current prompt, not the recorded request.
+   */
+  const configuredContextWindow = effectiveSessionId
+    ? flowChatStore.getState().sessions.get(effectiveSessionId)?.maxContextTokens
+    : undefined;
   return (
     <ScrollArea data-openbitfun-product-component="session-usage-panel" data-openbitfun-product-part="root" className="session-usage-panel">
       <div className="session-usage-panel__intro">
@@ -260,7 +288,9 @@ export const SessionUsagePanel: React.FC<SessionUsagePanelProps> = ({
         />
       </div>
 
-      <SessionUsageSummary report={report} snapshot={snapshot} fallbackContextWindow={report.context?.contextWindow}
+      <SessionUsageSummary report={report} snapshot={snapshot}
+        snapshotUnavailableReason={snapshotUnavailableReason}
+        fallbackContextWindow={configuredContextWindow}
         workspaceName={workspaceName} onPreviewContext={handlePreviewContext} previewLoading={previewLoading} />
     </ScrollArea>
   );

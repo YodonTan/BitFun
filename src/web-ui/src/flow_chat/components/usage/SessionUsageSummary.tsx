@@ -57,11 +57,18 @@ function UsageLegend({ rows, highlight, className = '', showShares = true }: {
 }
 
 /** Context composition and cumulative provider usage intentionally have independent denominators. */
-export function SessionUsageSummary({ report, snapshot, fallbackContextWindow, workspaceName, onPreviewContext, previewLoading }: {
+export function SessionUsageSummary({ report, snapshot, snapshotUnavailableReason, fallbackContextWindow, workspaceName, onPreviewContext, previewLoading }: {
   report: SessionUsageReport;
   /** Recorded request snapshot the context section reads; never a rebuilt estimate. */
   snapshot?: UsageRequestSnapshot;
-  /** Context window reported by the cumulative report, used only as a fallback. */
+  /**
+   * Explicit reason the surface refused to read a recorded snapshot (an external
+   * agent owns the record, or a dispatch target does). Shown only when no
+   * snapshot exists, so the section explains the refusal instead of claiming
+   * that nothing was recorded.
+   */
+  snapshotUnavailableReason?: string;
+  /** The Session's configured model window, used only as a fallback denominator. */
   fallbackContextWindow?: number;
   workspaceName: string;
   onPreviewContext: (category: UsageContextCategory) => void;
@@ -215,7 +222,8 @@ export function SessionUsageSummary({ report, snapshot, fallbackContextWindow, w
             description={contextView.unavailableReason} />
         ) : null}
         {contextView.categoryState === 'absent' && !snapshot ? (
-          <Empty icon={<Icon glyph={ChartPie} />} title={t('usage.context.noRecordedRequest')} />
+          <Empty icon={<Icon glyph={ChartPie} />} title={t('usage.context.noRecordedRequest')}
+            description={snapshotUnavailableReason} />
         ) : null}
         {contextView.categoryState === 'ready' && hasContextTotal ? (
           <>

@@ -1688,6 +1688,48 @@ describe('Session usage report UI components', () => {
       .toContain('No recorded model request');
   });
 
+  it('never fills the context section from a legacy composition or a rebuilt estimate', () => {
+    act(() => {
+      flowChatStore.setState(state => ({ ...state, sessions: new Map() }) as never);
+    });
+    const composition = {
+      systemPrompt: 5000, toolDefinitions: 0, rules: 0, skills: 0, mcpTools: 0,
+      subagentDefinitions: 0, summarizedConversation: 0, conversation: 95_000, contextWindow: 100_000,
+    };
+    const report = usageReport();
+    // A legacy snapshot of the prompt is present, but this session recorded no
+    // request: none of these numbers may be presented as the context reading.
+    report.contextEstimate = { capturedAt: 1, composition } as never;
+    (report as { context?: unknown }).context = composition;
+    render(<SessionUsagePanel report={report} />);
+
+    expect(contextFact()).toBe('Unavailable');
+    expect(container.textContent).not.toContain('95K');
+    expect(container.textContent).not.toContain('100K');
+    expect(container.querySelector('.session-usage-panel__context')?.textContent)
+      .toContain('No recorded model request');
+  });
+
+  it('explains a refused read instead of claiming nothing was recorded', async () => {
+    // An external agent owns the record, so the surface refuses the read with an
+    // explicit reason. Showing only "no recorded request" would describe the
+    // wrong thing.
+    flowChatStore.setState(state => ({
+      ...state,
+      sessions: new Map([['session-1', { sessionId: 'session-1', config: { agentType: 'acp:claude-code' } }]]),
+    }) as never);
+    render(<SessionUsagePanel report={usageReport()} />);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    const context = container.querySelector('.session-usage-panel__context');
+    expect(context?.textContent).toContain('No recorded model request');
+    expect(context?.textContent).toContain('external ACP agent');
+
+    act(() => {
+      flowChatStore.setState(state => ({ ...state, sessions: new Map() }) as never);
+    });
+  });
+
   it('follows the stored reading an event delivers while the panel is open', () => {
     flowChatStore.setState(state => ({
       ...state,

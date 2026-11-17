@@ -137,6 +137,52 @@ describe('recorded request context snapshot reads', () => {
     expect(apiMocks.getSessionUsageReport).not.toHaveBeenCalled();
   });
 
+  it('answers an external ACP agent as unsupported instead of asking the host', async () => {
+    flowChatStore.setState(state => ({
+      ...state,
+      sessions: new Map([[sessionId, {
+        sessionId, workspaceId, config: { agentType: 'acp:claude-code', workspaceId },
+      } as unknown as Session]]),
+    }));
+
+    const read = await readRequestContextSnapshot({ sessionId });
+    const preview = await readRequestContextSnapshotPreview({
+      sessionId, request: requestRef(), category: 'systemPrompt',
+    });
+
+    // The host would refuse with an explicit NotAvailable; that is a capability
+    // answer, not a failure, so neither path even asks.
+    expect(read).toMatchObject({ status: 'unsupported' });
+    expect(read.unavailableReason).toContain('external ACP agent');
+    expect(preview).toMatchObject({ status: 'unsupported' });
+    expect(preview.unavailableReason).toContain('external ACP agent');
+    expect(apiMocks.getSessionUsageReport).not.toHaveBeenCalled();
+  });
+
+  it('re-classifies a refusal when the ACP session hydrates while the read is in flight', async () => {
+    // The session is unknown when the read starts, so the gate above cannot see
+    // that this is an external agent yet.
+    flowChatStore.setState(state => ({ ...state, sessions: new Map() }));
+    let reject!: (error: Error) => void;
+    apiMocks.getSessionUsageReport.mockReturnValue(new Promise((_, rejectRead) => { reject = rejectRead; }));
+
+    const pending = readRequestContextSnapshot({ sessionId, workspaceId });
+    flowChatStore.setState(state => ({
+      ...state,
+      sessions: new Map([[sessionId, {
+        sessionId, workspaceId, config: { agentType: 'acp:claude-code', workspaceId },
+      } as unknown as Session]]),
+    }));
+    reject(new Error('get_session_usage_report is not available for this session'));
+
+    const result = await pending;
+
+    // The host's NotAvailable is a capability answer, not a failure.
+    expect(result).toMatchObject({ status: 'unsupported' });
+    expect(result.unavailableReason).toContain('external ACP agent');
+    expect(result.status).not.toBe('failed');
+  });
+
   it('reports a host refusal as unsupported and an ordinary failure as failed', async () => {
     apiMocks.getSessionUsageReport.mockRejectedValueOnce(new Error(
       "command 'get_session_usage_report' is not supported on CLI peer host",

@@ -448,4 +448,40 @@ describe('recorded request context snapshot display', () => {
     expect(unknown.current).toBe(0);
     expect(unknown.snapshotState).toBe('unknown');
   });
+
+  it('never promotes a compression-derived context value to the recorded provider total', () => {
+    /*
+     * `currentTokenUsage`/`currentContextUsage` may be written by the
+     * compression path (`source: 'context_compression'`). That value describes a
+     * rebuilt prompt, not the request the host recorded, so it may only appear
+     * on the legacy display path — never as the snapshot's provider total.
+     */
+    const compressed = {
+      inputTokens: 9000, outputTokens: 100, totalTokens: 9100, timestamp: 5,
+      turnId: 'turn-1', source: 'context_compression' as const,
+    };
+    expect(getSessionContextUsageDisplay(makeSession({ currentTokenUsage: compressed }))).toEqual({
+      current: 9000, max: 4000, source: 'agent_prompt',
+    });
+
+    expect(getSessionContextUsageDisplay(makeSession({
+      currentTokenUsage: compressed, requestContextSnapshot: snapshot(),
+    }))).toEqual({
+      current: 500, max: 8000, source: 'agent_prompt', snapshotState: 'provider_reported',
+    });
+
+    const unknown = getSessionContextUsageDisplay(makeSession({
+      currentTokenUsage: compressed,
+      requestContextSnapshot: snapshot({ usageState: 'unknown' }),
+    }));
+    expect(unknown.current).toBe(0);
+    expect(unknown.snapshotState).toBe('unknown');
+
+    const estimated = getSessionContextUsageDisplay(makeSession({
+      currentTokenUsage: compressed,
+      requestContextSnapshot: snapshot({ inputTotal: undefined, usageState: 'estimated' }),
+    }));
+    expect(estimated.current).toBe(1000);
+    expect(estimated.snapshotState).toBe('estimated');
+  });
 });

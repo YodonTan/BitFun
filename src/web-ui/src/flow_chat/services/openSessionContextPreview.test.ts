@@ -187,6 +187,15 @@ describe('system prompt preview tabs', () => {
     await expect(openSessionContextPreview({ ...params, request })).resolves.toBe('stale');
     expect(tabs()).toHaveLength(1);
     expect(tabs()[0].content.data.initialContent).toBe('# Recorded request prompt');
+
+    // A rebuilt current-context payload in the same response is never a
+    // substitute for the recorded request's own content.
+    apiMocks.getSessionUsageReport.mockResolvedValue({ sessionId: params.sessionId,
+      contextEstimate: { contents: { systemPrompt: '# Rebuilt right now' }, capturedAt: 5 },
+      requestSnapshot: { snapshot: recorded } });
+    await expect(openSessionContextPreview({ ...params, request })).resolves.toBe('unavailable');
+    expect(tabs()).toHaveLength(1);
+    expect(tabs()[0].content.data.initialContent).toBe('# Recorded request prompt');
   });
 
 });
