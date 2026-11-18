@@ -465,6 +465,11 @@ workspace-icons = ["workspace-runtime", "openbitfun-services-core/workspace-icon
 # selected by `default`, `product-full` or `agent-runtime`. A future real narrow
 # consumer selects it explicitly in its own manifest.
 workspace-intelligence-control = ["openbitfun-services-core/workspace-intelligence-store"]
+# Internal cognition partition root slice. It compiles the host-local cognition
+# partition handle over the authoritative per-scope partition store and nothing
+# else; it is not selected by `default`, `product-full` or `agent-runtime`. A
+# future real narrow consumer selects it explicitly in its own manifest.
+workspace-intelligence-cognition = ["openbitfun-services-core/workspace-intelligence-cognition"]
 workspace-runtime = [
     "openbitfun-services-core/workspace-persistence",
     "dep:serde_yaml",

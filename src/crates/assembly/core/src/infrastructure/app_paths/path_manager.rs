@@ -302,6 +302,15 @@ impl PathManager {
             .join("control")
     }
 
+    /// Host-local authoritative cognition partition root for workspace intelligence.
+    /// Sibling of the control root and deliberately outside the memory database and
+    /// the memory workspace root, so the legacy memory reset cannot reach it.
+    pub fn workspace_intelligence_cognition_dir(&self) -> PathBuf {
+        self.user_data_dir()
+            .join("workspace-intelligence")
+            .join("cognition")
+    }
+
     /// Process-level ownership locks for local Agent Runtime deployments.
     pub fn agent_runtime_ownership_dir(&self) -> PathBuf {
         self.user_data_dir().join("agent-runtime").join("ownership")
@@ -890,6 +899,52 @@ mod tests {
         assert!(
             !control_dir.starts_with(&memories_database_parent),
             "the memory database directory must not be an ancestor of the control root"
+        );
+    }
+
+    /// P1 cognition partition root: WP1.3 core assembly.
+    ///
+    /// The cognition partition root is host-local config storage beside the
+    /// control root and is deliberately outside the memory database and the memory
+    /// workspace root, so the legacy memory reset cannot reach it. This test
+    /// proves path assembly and separation only: it does not run, and does not
+    /// claim, a legacy reset.
+    #[test]
+    fn workspace_intelligence_cognition_root_is_separate_from_memory_storage() {
+        let user_root =
+            std::env::temp_dir().join("openbitfun-workspace-intelligence-cognition-path-test");
+        let path_manager = PathManager::with_user_root_for_tests(user_root);
+        let cognition_dir = path_manager.workspace_intelligence_cognition_dir();
+
+        assert_eq!(
+            cognition_dir,
+            path_manager
+                .user_data_dir()
+                .join("workspace-intelligence")
+                .join("cognition")
+        );
+        assert_eq!(
+            cognition_dir.parent(),
+            path_manager.workspace_intelligence_control_dir().parent(),
+            "the cognition root must be a sibling of the control root"
+        );
+        assert_ne!(
+            cognition_dir,
+            path_manager.workspace_intelligence_control_dir(),
+            "the cognition root must not be the control root"
+        );
+        assert!(
+            !cognition_dir.starts_with(path_manager.memories_root_dir()),
+            "the cognition root must not live under the memory workspace root"
+        );
+        let memories_database_parent = path_manager
+            .memories_database_file()
+            .parent()
+            .expect("the memory database file must have a parent")
+            .to_path_buf();
+        assert!(
+            !cognition_dir.starts_with(&memories_database_parent),
+            "the memory database directory must not be an ancestor of the cognition root"
         );
     }
 

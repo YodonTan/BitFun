@@ -123,17 +123,25 @@ export const requiredContentRules = [
         regex: /#\[cfg\(feature = "workspace-intelligence-store"\)\]\s*pub mod workspace_intelligence_store;/,
         message: 'missing workspace-intelligence-store fact store source gate',
       },
+      {
+        regex: /#\[cfg\(feature = "workspace-intelligence-cognition"\)\]\s*pub mod workspace_intelligence_cognition;/,
+        message: 'missing workspace-intelligence-cognition partition store source gate',
+      },
     ],
   },
-  // P1 core control slice: WP1.1 core assembly + WP1.2a control-vs-control.
+  // P1 core slice: WP1.1 core assembly, WP1.2a control-vs-control, WP1.3 cognition.
   {
     path: 'src/crates/assembly/core/src/service/workspace_intelligence/mod.rs',
     reason:
-      'the workspace intelligence control slice must stay behind its explicit internal feature',
+      'the internal workspace intelligence control and cognition slices must stay behind their explicit internal features and out of the default, product-full, and agent-runtime assembly',
     patterns: [
       {
         regex: /#\[cfg\(feature = "workspace-intelligence-control"\)\]\s*pub\(crate\) mod control;/,
         message: 'missing workspace-intelligence-control source gate',
+      },
+      {
+        regex: /#\[cfg\(feature = "workspace-intelligence-cognition"\)\]\s*pub\(crate\) mod partition;/,
+        message: 'missing workspace-intelligence-cognition core partition source gate',
       },
     ],
   },

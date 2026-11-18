@@ -4245,6 +4245,7 @@ test('services-core capability profiles keep heavy owners out of the empty profi
     'system',
     'token_usage',
     'workspace_instructions',
+    'workspace_intelligence_cognition',
     'workspace_intelligence_store',
   ]) {
     assert.match(
@@ -4492,6 +4493,100 @@ test('workspace intelligence control slice stays internal and selects only the s
   );
   assert.equal(rule?.exact, true);
   assert.deepEqual(rule.requiredFeatureRefs, expectedReferences);
+});
+
+// P1 cognition partition root: WP1.3 cognition partition store + core selection.
+// The cognition slice stays internal: its services owner is the bundled SQLite
+// store plus content hashing, its core slice selects only that owner, and neither
+// enters the empty default, product-full, or agent-runtime assembly.
+test('workspace intelligence cognition selects only the partition store owner', async () => {
+  const servicesManifestPath = 'src/crates/services/services-core/Cargo.toml';
+  const servicesManifest = await readFile(
+    new URL(`../${servicesManifestPath}`, import.meta.url),
+    'utf8',
+  );
+  const servicesFeatures = parseManifestFeatures(servicesManifest);
+  const servicesReferences = ['dep:rusqlite', 'dep:sha2'];
+
+  // No second control generation: the partition state shares the existing
+  // bundled SQLite owner and content hashing and adds no other capability.
+  assert.deepEqual(servicesFeatures['workspace-intelligence-cognition'], servicesReferences);
+  assert.ok(!servicesFeatures.default.includes('workspace-intelligence-cognition'));
+
+  const servicesRule = coreClosedFeatureProfileRules.find(
+    (candidate) => candidate.manifestPath === servicesManifestPath
+      && candidate.featureName === 'workspace-intelligence-cognition',
+  );
+  assert.equal(servicesRule?.exact, true);
+  assert.deepEqual(servicesRule.requiredFeatureRefs, servicesReferences);
+  assert.match(servicesRule.reason, /without a second control generation/);
+
+  const coreManifestPath = 'src/crates/assembly/core/Cargo.toml';
+  const coreManifest = await readFile(new URL(`../${coreManifestPath}`, import.meta.url), 'utf8');
+  const coreFeatures = parseManifestFeatures(coreManifest);
+  const coreReferences = ['openbitfun-services-core/workspace-intelligence-cognition'];
+
+  assert.deepEqual(coreFeatures['workspace-intelligence-cognition'], coreReferences);
+  assert.ok(!coreFeatures.default.includes('workspace-intelligence-cognition'));
+  for (const assembly of ['product-full', 'agent-runtime']) {
+    assert.deepEqual(
+      coreFeatures[assembly].filter((reference) =>
+        reference.includes('workspace-intelligence-cognition')),
+      [],
+      `openbitfun-core ${assembly} must not assemble the internal cognition slice`,
+    );
+  }
+
+  const coreRule = coreClosedFeatureProfileRules.find(
+    (candidate) => candidate.manifestPath === coreManifestPath
+      && candidate.featureName === 'workspace-intelligence-cognition',
+  );
+  assert.equal(coreRule?.exact, true);
+  assert.deepEqual(coreRule.requiredFeatureRefs, coreReferences);
+
+  const servicesOwners = optionalDependencyFeatureOwnerRules.find(
+    (candidate) => candidate.crateName === 'services-core',
+  );
+  for (const depName of ['rusqlite', 'sha2']) {
+    const depOwner = servicesOwners.dependencies.find(
+      (dependency) => dependency.depName === depName,
+    );
+    assert.ok(
+      depOwner.ownerFeatures.includes('workspace-intelligence-cognition'),
+      `services-core ${depName} must stay owned by workspace-intelligence-cognition`,
+    );
+  }
+
+  // The core partition module must stay behind the cognition feature gate.
+  // A feature-free `scope` module is shared by both slices and is not gated.
+  const corePartitionRule = requiredContentRules.find(
+    (rule) => rule.path === 'src/crates/assembly/core/src/service/workspace_intelligence/mod.rs',
+  );
+  assert.ok(
+    corePartitionRule?.patterns.some((pattern) => pattern.regex.test(
+      '#[cfg(feature = "workspace-intelligence-cognition")]\npub(crate) mod partition;',
+    )),
+    'core workspace intelligence source rule must require the cognition partition gate',
+  );
+});
+
+test('workspace intelligence cognition cannot acquire Tokio capabilities', () => {
+  const cognitionMessages = (references) => findTokioDependencyFeatureViolations([{
+    name: 'openbitfun-services-core',
+    manifest_path: 'src/crates/services/services-core/Cargo.toml',
+    dependencies: [],
+    features: { 'workspace-intelligence-cognition': references },
+  }]).map((violation) => violation.message)
+    .filter((message) => message.includes(':workspace-intelligence-cognition '));
+
+  // The reviewed owner contract is SQLite plus content hashing only, so it
+  // holds no Tokio capability a future consumer could inherit.
+  assert.deepEqual(cognitionMessages(['dep:rusqlite', 'dep:sha2']), []);
+  const widened = cognitionMessages(['dep:rusqlite', 'dep:sha2', 'tokio/process']);
+  assert.ok(
+    widened.length > 0 && widened.every((message) => message.includes('Tokio')),
+    'workspace-intelligence-cognition must reject tokio/process widening',
+  );
 });
 
 test('Core feature-free Tokio capabilities stay limited to baseline path and state IO', () => {

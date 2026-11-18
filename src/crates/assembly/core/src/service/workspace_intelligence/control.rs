@@ -10,6 +10,11 @@
 //! control generation; there is no second control-generation truth, no cached
 //! copy, and no local file protocol.
 //!
+//! The host and scope value types themselves moved to the feature-free
+//! [`super::scope`] module, which the cognition partition slice shares. They are
+//! re-exported from here, so the control assembly, its CAS behaviour and the
+//! record-file naming contract are unchanged.
+//!
 //! What this module deliberately does not deliver:
 //!
 //! - no bootstrap claim, no claim, lease or incarnation of its own, and no
@@ -36,95 +41,11 @@ use crate::infrastructure::PathManager;
 use super::mode::is_idle as tier_is_idle;
 use super::{mode::*, policy::*, read_contract::*};
 
-/// Host and execution domain that own a control record.
-///
-/// The key is a pure pair of caller-supplied identifiers. It is never derived
-/// from a device identity, a connection id, a PID, a hostname probe, or the
-/// current machine, so two different hosts can never be merged by an ambient
-/// discovery step.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HostExecutionDomainKey {
-    host_id: String,
-    execution_domain: String,
-}
-
-impl HostExecutionDomainKey {
-    /// Builds the key, rejecting a blank host id or execution domain.
-    pub(crate) fn new(host_id: &str, execution_domain: &str) -> Option<Self> {
-        if host_id.trim().is_empty() || execution_domain.trim().is_empty() {
-            return None;
-        }
-        Some(Self {
-            host_id: host_id.to_owned(),
-            execution_domain: execution_domain.to_owned(),
-        })
-    }
-
-    /// Caller-supplied host identifier.
-    pub(crate) fn host_id(&self) -> &str {
-        &self.host_id
-    }
-
-    /// Caller-supplied execution domain inside that host.
-    pub(crate) fn execution_domain(&self) -> &str {
-        &self.execution_domain
-    }
-}
-
-/// Stable workspace scope of one control record.
-///
-/// The scope is the owning host plus the caller's stable workspace identifier.
-/// [`WorkspaceControlScope::as_str`] renders one injective, versioned encoding of
-/// that tuple: JSON tuple encoding escapes delimiters, Unicode and path
-/// separators, so two different tuples never share a string.
-///
-/// Scope derivation is not delivered by this slice. There is deliberately no
-/// path-to-scope helper: deriving a scope from a local workspace root, or from a
-/// remote workspace, is out of scope here and remote workspaces are unsupported
-/// by this slice. A remote POSIX path must never be split or reinterpreted with
-/// local path semantics.
-///
-/// A scope key is an opaque storage identity. It must never be reused to derive a
-/// grant key, a project id, or any other authority-bearing identifier.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorkspaceControlScope {
-    host: HostExecutionDomainKey,
-    stable_workspace_id: String,
-}
-
-impl WorkspaceControlScope {
-    /// Builds a scope from the owning host and a caller-supplied stable workspace
-    /// identifier, rejecting a blank identifier.
-    pub(crate) fn new(host: &HostExecutionDomainKey, stable_workspace_id: &str) -> Option<Self> {
-        if stable_workspace_id.trim().is_empty() {
-            return None;
-        }
-        Some(Self {
-            host: host.clone(),
-            stable_workspace_id: stable_workspace_id.to_owned(),
-        })
-    }
-
-    /// Injective version-prefixed storage key of this scope.
-    ///
-    /// The tuple is serialized as JSON, so the encoding cannot be confused by a
-    /// delimiter, a path separator or a Unicode payload that a plain join of the
-    /// fields would collide on.
-    pub(crate) fn as_str(&self) -> String {
-        serde_json::to_string(&(
-            "wi-scope-v1",
-            self.host.host_id(),
-            self.host.execution_domain(),
-            self.stable_workspace_id.as_str(),
-        ))
-        .expect("a JSON tuple of borrowed strings cannot fail to serialize")
-    }
-
-    /// True when `host` is the host this scope was built for.
-    pub(crate) fn host_matches(&self, host: &HostExecutionDomainKey) -> bool {
-        self.host == *host
-    }
-}
+// The host and scope value types live in the feature-free `scope` module so the
+// cognition partition slice shares exactly one scope identity and one encoding.
+// Re-exported here so every existing `control::HostExecutionDomainKey` and
+// `control::WorkspaceControlScope` path keeps resolving.
+pub(crate) use super::scope::{HostExecutionDomainKey, WorkspaceControlScope};
 
 /// Core assembly of one host-local workspace intelligence control handle.
 ///

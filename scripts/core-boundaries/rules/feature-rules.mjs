@@ -76,7 +76,7 @@ export const optionalDependencyFeatureOwnerRules = [
           'workspace-instructions',
         ],
       },
-      { depName: 'rusqlite', ownerFeatures: ['memory-store', 'permission', 'session-search', 'coordination-store'] },
+      { depName: 'rusqlite', ownerFeatures: ['memory-store', 'permission', 'session-search', 'coordination-store', 'workspace-intelligence-cognition'] },
       { depName: 'rustls', ownerFeatures: ['tls-provider'] },
       { depName: 'serde_yaml', ownerFeatures: ['markdown', 'workspace-instructions'] },
       { depName: 'similar', ownerFeatures: ['diff', 'local-storage'] },
@@ -92,6 +92,7 @@ export const optionalDependencyFeatureOwnerRules = [
           'routing-state',
           'resource-capacity',
           'workspace-identity',
+          'workspace-intelligence-cognition',
           'workspace-intelligence-store',
           'workspace-transfer',
         ],
@@ -1715,6 +1716,15 @@ export const coreClosedFeatureProfileRules = [
     reason:
       'services-core workspace-intelligence-store must own only scoped fact snapshots over generic atomic JSON IO and content hashing, without product policy, runtime, process, or network capabilities',
   },
+  // P1 cognition partition root: WP1.3 per-scope cognition partition state.
+  {
+    manifestPath: 'src/crates/services/services-core/Cargo.toml',
+    featureName: 'workspace-intelligence-cognition',
+    requiredFeatureRefs: ['dep:rusqlite', 'dep:sha2'],
+    exact: true,
+    reason:
+      'services-core workspace-intelligence-cognition must own only the per-scope cognition partition state over the existing bundled SQLite owner and content hashing, without a second control generation, product policy, claim, cursor consumption, runtime, process, or network capability',
+  },
   // P1 core control slice: WP1.1 core assembly + WP1.2a control-vs-control.
   {
     manifestPath: 'src/crates/assembly/core/Cargo.toml',
@@ -1723,6 +1733,14 @@ export const coreClosedFeatureProfileRules = [
     exact: true,
     reason:
       'openbitfun-core workspace-intelligence-control must select only the scoped control-record store owner, without product policy, runtime, claim, timer, or UI capability',
+  },
+  {
+    manifestPath: 'src/crates/assembly/core/Cargo.toml',
+    featureName: 'workspace-intelligence-cognition',
+    requiredFeatureRefs: ['openbitfun-services-core/workspace-intelligence-cognition'],
+    exact: true,
+    reason:
+      'openbitfun-core workspace-intelligence-cognition must select only the cognition partition store owner, without control generation, host claim, incarnation advancement, cursor consumption, policy, runtime, or UI capability',
   },
   {
     manifestPath: 'src/crates/assembly/core/Cargo.toml',
