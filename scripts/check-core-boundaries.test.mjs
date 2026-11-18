@@ -4627,6 +4627,39 @@ test('workspace intelligence cognition selects only the partition store owner', 
   );
 });
 
+test('workspace intelligence core commit selects only the governed fence owner', async () => {
+  const manifestPath = 'src/crates/assembly/core/Cargo.toml';
+  const manifest = await readFile(new URL(`../${manifestPath}`, import.meta.url), 'utf8');
+  const features = parseManifestFeatures(manifest);
+  const expectedReferences = ['openbitfun-services-core/workspace-intelligence-commit'];
+  assert.deepEqual(features['workspace-intelligence-commit'], expectedReferences);
+  for (const assembly of ['default', 'product-full', 'agent-runtime']) {
+    assert.deepEqual(
+      features[assembly].filter((reference) => reference.includes('workspace-intelligence-commit')),
+      [],
+      `${assembly} must not assemble the internal commit wrapper`,
+    );
+  }
+  for (const oldFeature of ['workspace-intelligence-control', 'workspace-intelligence-cognition']) {
+    assert.ok(!features['workspace-intelligence-commit'].includes(oldFeature));
+  }
+  const rule = coreClosedFeatureProfileRules.find(
+    (candidate) => candidate.manifestPath === manifestPath
+      && candidate.featureName === 'workspace-intelligence-commit',
+  );
+  assert.equal(rule?.exact, true);
+  assert.deepEqual(rule.requiredFeatureRefs, expectedReferences);
+
+  const modulePath = 'src/crates/assembly/core/src/service/workspace_intelligence/mod.rs';
+  const source = await readFile(new URL(`../${modulePath}`, import.meta.url), 'utf8');
+  const gate = /#\[cfg\(feature = "workspace-intelligence-commit"\)\]\s*pub\(crate\) mod commit;/;
+  assert.match(source, gate);
+  const sourceRule = requiredContentRules.find((candidate) => candidate.path === modulePath);
+  assert.ok(sourceRule?.patterns.some((pattern) => pattern.regex.test(
+    '#[cfg(feature = "workspace-intelligence-commit")]\npub(crate) mod commit;',
+  )));
+});
+
 test('workspace intelligence cognition cannot acquire Tokio capabilities', () => {
   const cognitionMessages = (references) => findTokioDependencyFeatureViolations([{
     name: 'openbitfun-services-core',

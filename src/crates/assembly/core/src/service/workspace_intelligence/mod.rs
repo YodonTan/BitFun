@@ -25,6 +25,11 @@
 //! `partition_state` shape, it is not selected by `default`, `product-full` or
 //! `agent-runtime`, and a future real narrow consumer must select
 //! `workspace-intelligence-cognition` explicitly in its own manifest.
+//!
+//! The gated `commit` module adds the internal governed owner-commit wrapper over
+//! the services fence. It recovers the cognition partition of an already-enabled
+//! scope only: no bootstrap/claim, no OFF-to-ON enabling path, and no model
+//! resolution. It is not selected by `default`, `product-full` or `agent-runtime`.
 
 #![allow(dead_code)] // P0 has no production consumer yet; remove once a later phase wires it in.
 
@@ -37,3 +42,5 @@ pub(crate) mod read_contract;
 pub(crate) mod control;
 #[cfg(feature = "workspace-intelligence-cognition")]
 pub(crate) mod partition;
+#[cfg(feature = "workspace-intelligence-commit")]
+pub(crate) mod commit;

@@ -147,6 +147,10 @@ export const requiredContentRules = [
         regex: /#\[cfg\(feature = "workspace-intelligence-cognition"\)\]\s*pub\(crate\) mod partition;/,
         message: 'missing workspace-intelligence-cognition core partition source gate',
       },
+      {
+        regex: /#\[cfg\(feature = "workspace-intelligence-commit"\)\]\s*pub\(crate\) mod commit;/,
+        message: 'missing workspace-intelligence-commit core wrapper source gate',
+      },
     ],
   },
   {

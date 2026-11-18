@@ -470,6 +470,7 @@ workspace-intelligence-control = ["openbitfun-services-core/workspace-intelligen
 # else; it is not selected by `default`, `product-full` or `agent-runtime`. A
 # future real narrow consumer selects it explicitly in its own manifest.
 workspace-intelligence-cognition = ["openbitfun-services-core/workspace-intelligence-cognition"]
+workspace-intelligence-commit = ["openbitfun-services-core/workspace-intelligence-commit"]
 workspace-runtime = [
     "openbitfun-services-core/workspace-persistence",
     "dep:serde_yaml",

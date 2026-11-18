@@ -22,10 +22,10 @@
 //! - no runtime, scheduler, provider, timer, or background task;
 //! - no production caller, no product-full assembly, and no UI, command,
 //!   registry row or capability;
-//! - control-vs-control CAS only. An owner commit fence for "close linearized
-//!   with a governance commit" is NOT implemented: a future version must
-//!   serialize the owner commit under the same control OS-guard or a reviewed
-//!   equivalent, designed after the cognition owner exists.
+//! - control-vs-control CAS only, unchanged in behaviour. The governed owner-commit
+//!   fence for "close linearized with a governance commit" now lives in
+//!   `super::commit` (feature `workspace-intelligence-commit`) over the services
+//!   fence; this is not WP1.2b completion.
 
 use std::path::PathBuf;
 

@@ -1753,6 +1753,13 @@ export const coreClosedFeatureProfileRules = [
   },
   {
     manifestPath: 'src/crates/assembly/core/Cargo.toml',
+    featureName: 'workspace-intelligence-commit',
+    requiredFeatureRefs: ['openbitfun-services-core/workspace-intelligence-commit'],
+    exact: true,
+    reason: 'openbitfun-core workspace-intelligence-commit must select only the governed commit fence owner, without product policy, model resolution, claim, timer, runtime, UI, or a second control record write path',
+  },
+  {
+    manifestPath: 'src/crates/assembly/core/Cargo.toml',
     featureName: 'dispatch-store',
     requiredFeatureRefs: [
       'dep:base64',
