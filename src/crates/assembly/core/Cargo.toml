@@ -460,6 +460,11 @@ local-storage = ["dep:openbitfun-agent-tools", "openbitfun-services-core/local-s
 process-runtime = ["openbitfun-services-core/process-runtime"]
 terminal = ["dep:terminal-core"]
 workspace-icons = ["workspace-runtime", "openbitfun-services-core/workspace-icons"]
+# Internal control-vs-control slice. It compiles the host-local control handle
+# over the authoritative workspace intelligence store and nothing else; it is not
+# selected by `default`, `product-full` or `agent-runtime`. A future real narrow
+# consumer selects it explicitly in its own manifest.
+workspace-intelligence-control = ["openbitfun-services-core/workspace-intelligence-store"]
 workspace-runtime = [
     "openbitfun-services-core/workspace-persistence",
     "dep:serde_yaml",

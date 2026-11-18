@@ -291,6 +291,17 @@ impl PathManager {
             .join("coordination.sqlite")
     }
 
+    /// Host-local authoritative control-record root for workspace intelligence.
+    ///
+    /// Separate from the memory database and memory workspace roots so the legacy
+    /// memory reset cannot reach it. This is a host-local config root, not a
+    /// workspace file root.
+    pub fn workspace_intelligence_control_dir(&self) -> PathBuf {
+        self.user_data_dir()
+            .join("workspace-intelligence")
+            .join("control")
+    }
+
     /// Process-level ownership locks for local Agent Runtime deployments.
     pub fn agent_runtime_ownership_dir(&self) -> PathBuf {
         self.user_data_dir().join("agent-runtime").join("ownership")
@@ -844,6 +855,41 @@ mod tests {
                 .user_data_dir()
                 .join("agent-runtime")
                 .join("ownership")
+        );
+    }
+
+    /// P1 core control slice: WP1.1 core assembly + WP1.2a control-vs-control.
+    ///
+    /// The workspace intelligence control root is host-local config storage that
+    /// is deliberately outside the memory database and the memory workspace root,
+    /// so the legacy memory reset cannot reach it. This test proves path
+    /// separation only: it does not run, and does not claim, a legacy reset.
+    #[test]
+    fn workspace_intelligence_control_root_is_separate_from_memory_storage() {
+        let user_root =
+            std::env::temp_dir().join("openbitfun-workspace-intelligence-control-path-test");
+        let path_manager = PathManager::with_user_root_for_tests(user_root);
+        let control_dir = path_manager.workspace_intelligence_control_dir();
+
+        assert_eq!(
+            control_dir,
+            path_manager
+                .user_data_dir()
+                .join("workspace-intelligence")
+                .join("control")
+        );
+        assert!(
+            !control_dir.starts_with(path_manager.memories_root_dir()),
+            "the control root must not live under the memory workspace root"
+        );
+        let memories_database_parent = path_manager
+            .memories_database_file()
+            .parent()
+            .expect("the memory database file must have a parent")
+            .to_path_buf();
+        assert!(
+            !control_dir.starts_with(&memories_database_parent),
+            "the memory database directory must not be an ancestor of the control root"
         );
     }
 

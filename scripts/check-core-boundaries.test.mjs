@@ -4468,6 +4468,32 @@ test('workspace intelligence store stays out of the empty default and product-fu
   );
 });
 
+// P1 core control slice: WP1.1 core assembly + WP1.2a control-vs-control.
+// The control slice stays internal to the crate: it selects only the store
+// owner and enters no empty default, product-full, or agent-runtime assembly.
+test('workspace intelligence control slice stays internal and selects only the store owner', async () => {
+  const coreManifestPath = 'src/crates/assembly/core/Cargo.toml';
+  const coreManifest = await readFile(new URL(`../${coreManifestPath}`, import.meta.url), 'utf8');
+  const features = parseManifestFeatures(coreManifest);
+  const expectedReferences = ['openbitfun-services-core/workspace-intelligence-store'];
+  assert.deepEqual(features['workspace-intelligence-control'], expectedReferences);
+  assert.ok(!features.default.includes('workspace-intelligence-control'));
+  assert.deepEqual(
+    features['product-full'].filter((reference) => reference.includes('workspace-intelligence-control')),
+    [],
+  );
+  assert.deepEqual(
+    features['agent-runtime'].filter((reference) => reference.includes('workspace-intelligence-control')),
+    [],
+  );
+  const rule = coreClosedFeatureProfileRules.find(
+    (candidate) => candidate.manifestPath === coreManifestPath
+      && candidate.featureName === 'workspace-intelligence-control',
+  );
+  assert.equal(rule?.exact, true);
+  assert.deepEqual(rule.requiredFeatureRefs, expectedReferences);
+});
+
 test('Core feature-free Tokio capabilities stay limited to baseline path and state IO', () => {
   const invalidPackage = {
     name: 'openbitfun-core',

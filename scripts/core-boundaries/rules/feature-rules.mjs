@@ -1715,6 +1715,15 @@ export const coreClosedFeatureProfileRules = [
     reason:
       'services-core workspace-intelligence-store must own only scoped fact snapshots over generic atomic JSON IO and content hashing, without product policy, runtime, process, or network capabilities',
   },
+  // P1 core control slice: WP1.1 core assembly + WP1.2a control-vs-control.
+  {
+    manifestPath: 'src/crates/assembly/core/Cargo.toml',
+    featureName: 'workspace-intelligence-control',
+    requiredFeatureRefs: ['openbitfun-services-core/workspace-intelligence-store'],
+    exact: true,
+    reason:
+      'openbitfun-core workspace-intelligence-control must select only the scoped control-record store owner, without product policy, runtime, claim, timer, or UI capability',
+  },
   {
     manifestPath: 'src/crates/assembly/core/Cargo.toml',
     featureName: 'dispatch-store',

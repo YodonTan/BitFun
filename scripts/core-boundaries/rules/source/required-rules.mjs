@@ -125,6 +125,18 @@ export const requiredContentRules = [
       },
     ],
   },
+  // P1 core control slice: WP1.1 core assembly + WP1.2a control-vs-control.
+  {
+    path: 'src/crates/assembly/core/src/service/workspace_intelligence/mod.rs',
+    reason:
+      'the workspace intelligence control slice must stay behind its explicit internal feature',
+    patterns: [
+      {
+        regex: /#\[cfg\(feature = "workspace-intelligence-control"\)\]\s*pub\(crate\) mod control;/,
+        message: 'missing workspace-intelligence-control source gate',
+      },
+    ],
+  },
   {
     path: 'src/crates/services/services-core/src/workspace_text.rs',
     reason:
