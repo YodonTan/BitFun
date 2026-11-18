@@ -92,6 +92,7 @@ export const optionalDependencyFeatureOwnerRules = [
           'routing-state',
           'resource-capacity',
           'workspace-identity',
+          'workspace-intelligence-store',
           'workspace-transfer',
         ],
       },
@@ -1705,6 +1706,14 @@ export const coreClosedFeatureProfileRules = [
     requiredFeatureRefs: ['dep:dunce', 'dep:sha2'],
     exact: true,
     reason: 'services-core workspace-identity must own only canonical workspace path identity support',
+  },
+  {
+    manifestPath: 'src/crates/services/services-core/Cargo.toml',
+    featureName: 'workspace-intelligence-store',
+    requiredFeatureRefs: ['json-io', 'dep:sha2'],
+    exact: true,
+    reason:
+      'services-core workspace-intelligence-store must own only scoped fact snapshots over generic atomic JSON IO and content hashing, without product policy, runtime, process, or network capabilities',
   },
   {
     manifestPath: 'src/crates/assembly/core/Cargo.toml',

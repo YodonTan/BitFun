@@ -177,6 +177,8 @@ const SERVICES_CORE_TOKIO_FEATURES = new Map([
   ['diff', ['rt', 'time']],
   ['filesystem', ['fs', 'rt', 'sync']],
   ['json-io', ['fs', 'rt', 'sync', 'time']],
+  // Scoped workspace-intelligence facts reuse the reviewed atomic JSON IO closure; no processes or network.
+  ['workspace-intelligence-store', ['fs', 'rt', 'sync', 'time']],
   ['routing-state', ['fs', 'rt', 'sync', 'time']],
   ['resource-capacity', ['fs', 'rt', 'sync', 'time']],
   ['local-storage', ['fs', 'rt', 'sync', 'time']],

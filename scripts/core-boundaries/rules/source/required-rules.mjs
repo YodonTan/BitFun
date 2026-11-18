@@ -119,6 +119,10 @@ export const requiredContentRules = [
         regex: /#\[cfg\(feature = "workspace-instructions"\)\]\s*pub mod workspace_instructions;/,
         message: 'missing workspace-instructions source gate',
       },
+      {
+        regex: /#\[cfg\(feature = "workspace-intelligence-store"\)\]\s*pub mod workspace_intelligence_store;/,
+        message: 'missing workspace-intelligence-store fact store source gate',
+      },
     ],
   },
   {

@@ -4245,6 +4245,7 @@ test('services-core capability profiles keep heavy owners out of the empty profi
     'system',
     'token_usage',
     'workspace_instructions',
+    'workspace_intelligence_store',
   ]) {
     assert.match(
       sourceContracts,
@@ -4308,6 +4309,7 @@ test('Services Core accepts only the reviewed feature-owned Tokio runtime graph'
       'json-io': ['dep:tokio', 'tokio/fs', 'tokio/rt', 'tokio/sync', 'tokio/time'],
       'routing-state': ['json-io'],
       'resource-capacity': ['json-io'],
+      'workspace-intelligence-store': ['json-io', 'dep:sha2'],
       'local-storage': [
         'dep:tokio',
         'tokio/fs',
@@ -4393,6 +4395,76 @@ test('Services Core Tokio owners cannot be hidden behind an unreviewed alias', (
   );
   assert.ok(
     messages.includes('openbitfun-services-core:sneaky-weak Tokio capabilities require an explicit owner contract'),
+  );
+});
+
+test('workspace intelligence store admits only the reviewed JSON IO Tokio closure', () => {
+  const servicesCorePackage = (storeReferences) => ({
+    name: 'openbitfun-services-core',
+    manifest_path: 'src/crates/services/services-core/Cargo.toml',
+    dependencies: [{ name: 'tokio', kind: null, optional: true, features: [] }],
+    features: {
+      'json-io': ['dep:tokio', 'tokio/fs', 'tokio/rt', 'tokio/sync', 'tokio/time'],
+      'workspace-transfer': ['dep:tokio', 'tokio/fs', 'tokio/io-util', 'tokio/rt', 'tokio/sync'],
+      'workspace-intelligence-store': storeReferences,
+    },
+  });
+  const storeMessages = (storeReferences) => findTokioDependencyFeatureViolations(
+    [servicesCorePackage(storeReferences)],
+  ).map((violation) => violation.message)
+    .filter((message) => message.includes(':workspace-intelligence-store '));
+
+  assert.deepEqual(storeMessages(['json-io', 'dep:sha2']), []);
+  for (const [reference, capability] of [
+    ['tokio/process', 'process'],
+    ['tokio/net', 'net'],
+    ['workspace-transfer', 'io-util'],
+  ]) {
+    assert.ok(
+      storeMessages(['json-io', 'dep:sha2', reference]).includes(
+        'openbitfun-services-core:workspace-intelligence-store has unexpected effective '
+        + `Tokio capabilities: ${capability}`,
+      ),
+      `workspace-intelligence-store must reject ${reference} widening`,
+    );
+  }
+});
+
+test('workspace intelligence store stays out of the empty default and product-full assembly', async () => {
+  const manifestPath = 'src/crates/services/services-core/Cargo.toml';
+  const manifest = await readFile(new URL(`../${manifestPath}`, import.meta.url), 'utf8');
+  const features = parseManifestFeatures(manifest);
+  const expectedReferences = ['json-io', 'dep:sha2'];
+
+  // The owner definition is exact: generic atomic JSON IO plus content hashing,
+  // with no product policy, runtime, process, or network capability.
+  assert.deepEqual(features['workspace-intelligence-store'], expectedReferences);
+  assert.ok(!features.default.includes('workspace-intelligence-store'));
+
+  const rule = coreClosedFeatureProfileRules.find(
+    (candidate) => candidate.manifestPath === manifestPath
+      && candidate.featureName === 'workspace-intelligence-store',
+  );
+  assert.equal(rule?.exact, true);
+  assert.deepEqual(rule.requiredFeatureRefs, expectedReferences);
+  assert.match(rule.reason, /product policy/);
+
+  const sha2Owner = optionalDependencyFeatureOwnerRules
+    .find((candidate) => candidate.crateName === 'services-core')
+    .dependencies.find((dependency) => dependency.depName === 'sha2');
+  assert.ok(sha2Owner.ownerFeatures.includes('workspace-intelligence-store'));
+
+  // P1 design boundary on the real manifests: the internal store is not part of
+  // the empty profile or of the shipped product assembly. A future narrow host
+  // consumer may select it in its own manifest without changing this contract.
+  const coreManifest = await readFile(
+    new URL('../src/crates/assembly/core/Cargo.toml', import.meta.url),
+    'utf8',
+  );
+  assert.deepEqual(
+    parseManifestFeatures(coreManifest)['product-full'].filter((reference) =>
+      reference.includes('workspace-intelligence-store')),
+    [],
   );
 });
 

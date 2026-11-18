@@ -173,6 +173,7 @@ workspace-runtime = [
     "tokio/sync",
 ]
 workspace-identity = ["dep:dunce", "dep:sha2"]
+workspace-intelligence-store = ["json-io", "dep:sha2"]
 runtime-ownership = ["dep:dunce", "dep:fs2", "dep:sha2"]
 permission = [
     "dep:async-trait",

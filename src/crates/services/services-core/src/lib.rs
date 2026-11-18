@@ -64,6 +64,8 @@ pub mod session_projection_format;
 pub mod storage_error;
 #[cfg(feature = "workspace-icons")]
 pub mod workspace_icon_assets;
+#[cfg(feature = "workspace-intelligence-store")]
+pub mod workspace_intelligence_store;
 #[cfg(feature = "workspace-persistence")]
 pub mod workspace_persistence;
 #[cfg(feature = "workspace-persistence")]
