@@ -56,6 +56,10 @@ pub(crate) struct PreparedSendInput {
 
 impl PreparedSendInput {
     /// Whether the two vectors still describe the same request message by message.
+    ///
+    /// The send path validates the pair it borrows before any copy exists, so
+    /// this check of an already owned input is only needed by tests.
+    #[cfg(test)]
     pub(crate) fn is_aligned(&self) -> bool {
         self.messages.len() == self.categories.len()
     }

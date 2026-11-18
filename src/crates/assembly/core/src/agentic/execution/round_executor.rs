@@ -1131,11 +1131,13 @@ impl RoundExecutor {
                 };
             // Record this attempt's real prepared input. The reference is built
             // from the existing attempt identity, so retries never share one.
-            super::request_context_snapshot::begin_attempt(
-                Arc::new(super::context_composition::PreparedSendInput {
-                    messages: ai_messages.clone(),
-                    categories: attempt_send_categories,
-                }),
+            // The send path only borrows the input: it is copied after the
+            // source budget and the summary admission decide that this attempt
+            // keeps a source or runs a summary job. A subagent attempt records
+            // nothing, so it can never evict the parent session's requests.
+            super::request_context_snapshot::begin_attempt_for_agent(
+                &ai_messages,
+                attempt_send_categories.as_slice(),
                 super::request_context_snapshot::request_ref(
                     super::request_context_snapshot::AttemptRequestIdentity {
                         workspace: context.workspace.as_ref(),
@@ -1153,6 +1155,7 @@ impl RoundExecutor {
                     self.snapshot_sink.clone(),
                     session_manager.clone(),
                 ),
+                is_subagent,
             );
             let request_started_at = Instant::now();
             debug!(
@@ -2742,8 +2745,14 @@ impl RoundExecutor {
         // Recorded context facts are separate from the cumulative token ledger:
         // they never add to token or billing accounting and never re-emit
         // `TokenUsageUpdated`.
-        self.activate_recorded_request_snapshot(context, &request, usage, session_manager)
-            .await;
+        self.activate_recorded_request_snapshot(
+            context,
+            &request,
+            usage,
+            is_subagent,
+            session_manager,
+        )
+        .await;
     }
 
     /// Persist the recorded request snapshot of a completed attempt.
@@ -2751,13 +2760,25 @@ impl RoundExecutor {
     /// A provider-reported normalized input total is authoritative; without one
     /// the snapshot is an explicit same-attempt estimate (summary ready) or an
     /// explicit unknown. A zero is never recorded as a reported total.
+    ///
+    /// A subagent attempt never registered a recorded request, so it activates
+    /// nothing, writes no session metadata and emits no snapshot event: the
+    /// registry and the parent session's persisted snapshot stay untouched.
     async fn activate_recorded_request_snapshot(
         &self,
         context: &RoundContext,
         request: &openbitfun_services_core::token_usage::types::ModelRequestUsageContext,
         usage: Option<&crate::util::types::ai::GeminiUsage>,
+        is_subagent: bool,
         session_manager: Option<Arc<SessionManager>>,
     ) {
+        if is_subagent {
+            debug!(
+                "Recorded request snapshot activation skipped for a subagent attempt: session_id={}, round_id={}, attempt_id={}",
+                context.session_id, request.round_id, request.attempt_id
+            );
+            return;
+        }
         let request_ref = super::request_context_snapshot::request_ref(
             super::request_context_snapshot::AttemptRequestIdentity {
                 workspace: context.workspace.as_ref(),

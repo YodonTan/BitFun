@@ -121,24 +121,41 @@ impl SnapshotActivation {
         }
     }
 
-    /// Persist through the session owner's CAS merge and publish the result.
+    /// Persist through the session owner's CAS merge when one exists and always
+    /// publish the in-memory snapshot.
     ///
-    /// Returns whether the snapshot was applied; an older attempt never
-    /// replaces a newer one and a skipped write publishes nothing.
+    /// Returns the persistence result: `false` means the snapshot is in-memory
+    /// only (no persistent session owner, a temporary session, persistence
+    /// disabled for the turn, a failed write, or an older attempt that must not
+    /// replace a newer one). Publication is independent from persistence: the
+    /// in-memory attempt truth is what the UI renders, so exactly one
+    /// `RequestContextSnapshotUpdated` describes it either way. No cumulative
+    /// usage or billing state is touched here.
     pub(crate) async fn persist_and_publish(&self, snapshot: UsageRequestSnapshot) -> bool {
-        let Some(session_manager) = self.session_manager.as_ref() else {
-            debug!(
-                "Recorded request snapshot has no persistent session owner: session_id={}, attempt_id={}",
-                snapshot.request.session_id, snapshot.request.attempt_id
-            );
-            return false;
+        let persisted = match self.session_manager.as_ref() {
+            Some(session_manager) => {
+                let applied = session_manager
+                    .persist_last_recorded_request_snapshot(
+                        &snapshot.request.session_id,
+                        snapshot.clone(),
+                    )
+                    .await;
+                if !applied {
+                    debug!(
+                        "Recorded request snapshot stays in-memory and unpersisted: the session did not apply it: session_id={}, attempt_id={}",
+                        snapshot.request.session_id, snapshot.request.attempt_id
+                    );
+                }
+                applied
+            }
+            None => {
+                debug!(
+                    "Recorded request snapshot stays in-memory and unpersisted: no persistent session owner: session_id={}, attempt_id={}",
+                    snapshot.request.session_id, snapshot.request.attempt_id
+                );
+                false
+            }
         };
-        let applied = session_manager
-            .persist_last_recorded_request_snapshot(&snapshot.request.session_id, snapshot.clone())
-            .await;
-        if !applied {
-            return false;
-        }
         self.sink
             .emit(AgenticEvent::RequestContextSnapshotUpdated {
                 session_id: snapshot.request.session_id.clone(),
@@ -146,7 +163,7 @@ impl SnapshotActivation {
                 snapshot,
             })
             .await;
-        true
+        persisted
     }
 }
 
@@ -386,6 +403,10 @@ enum AttemptAdmission {
 /// in at most [`MAX_CONCURRENT_SUMMARIES`] background tasks for the whole
 /// process: a task is spawned only when one of those permits is taken with
 /// `try_acquire_owned`, so retries can never queue unbounded work.
+///
+/// Test callers that already own the prepared input use this wrapper; the send
+/// path uses [`begin_attempt_for_agent`] so no copy happens before admission.
+#[cfg(test)]
 pub(crate) fn begin_attempt(
     prepared: Arc<PreparedSendInput>,
     request: UsageRequestRef,
@@ -393,15 +414,98 @@ pub(crate) fn begin_attempt(
     context_window: Option<u64>,
     activation: SnapshotActivation,
 ) {
-    if !prepared.is_aligned() {
+    let retained = Arc::clone(&prepared);
+    begin_attempt_with_source(
+        &prepared.messages,
+        &prepared.categories,
+        // The owned input answers the alignment question itself.
+        prepared.is_aligned(),
+        request,
+        tools,
+        context_window,
+        activation,
+        false,
+        move || retained,
+    );
+}
+
+/// Register the prepared input of one live attempt that the caller only
+/// borrows, so the send path never copies an input it will not keep.
+///
+/// The messages are copied at most once, after the size budget and the summary
+/// admission decided that this attempt retains a source or runs a summary job.
+/// A subagent attempt records nothing: it must not evict its parent session's
+/// retained requests.
+pub(crate) fn begin_attempt_for_agent(
+    messages: &[AIMessage],
+    categories: &[SendCategory],
+    request: UsageRequestRef,
+    tools: Option<Arc<Vec<ToolDefinition>>>,
+    context_window: Option<u64>,
+    activation: SnapshotActivation,
+    is_subagent: bool,
+) {
+    begin_attempt_with_source(
+        messages,
+        categories,
+        messages.len() == categories.len(),
+        request,
+        tools,
+        context_window,
+        activation,
+        is_subagent,
+        || {
+            Arc::new(PreparedSendInput {
+                messages: messages.to_vec(),
+                categories: categories.to_vec(),
+            })
+        },
+    );
+}
+
+/// Shared admission path of both entry points.
+///
+/// Order matters: the subagent gate, the alignment check, the byte budget and
+/// the summary permit all run before `prepare`, which is invoked at most once
+/// and only inside the registration critical section once the attempt is known
+/// to retain a source or to run a summary job. An attempt that retains nothing
+/// and summarizes nothing never copies the request.
+///
+/// `source_aligned` reports whether `categories[i]` still describes
+/// `messages[i]`; each entry point answers it from its own source type.
+fn begin_attempt_with_source<P>(
+    messages: &[AIMessage],
+    categories: &[SendCategory],
+    source_aligned: bool,
+    request: UsageRequestRef,
+    tools: Option<Arc<Vec<ToolDefinition>>>,
+    context_window: Option<u64>,
+    activation: SnapshotActivation,
+    is_subagent: bool,
+    prepare: P,
+) where
+    P: FnOnce() -> Arc<PreparedSendInput>,
+{
+    if is_subagent {
+        // A subagent request is a different unit of context and shares this
+        // process-global registry with its parent; recording it would evict
+        // the parent's retained requests and republish them under the parent
+        // session id.
+        debug!(
+            "Recorded request snapshot skipped for a subagent attempt: session_id={}, attempt_id={}",
+            request.session_id, request.attempt_id
+        );
+        return;
+    }
+    if !source_aligned {
         // Recording a misaligned source would attribute every later message to
         // the wrong category; degrade instead of guessing.
         warn!(
             "Recorded request snapshot skipped: session_id={}, attempt_id={}, messages={}, categories={}",
             request.session_id,
             request.attempt_id,
-            prepared.messages.len(),
-            prepared.categories.len()
+            messages.len(),
+            categories.len()
         );
         return;
     }
@@ -409,7 +513,7 @@ pub(crate) fn begin_attempt(
     let key = RequestKey::of(&request);
     // Messages and tool definitions are one retained unit: the byte bound covers
     // both, so an oversize request retains neither.
-    let source_bytes = retained_source_bytes(&prepared.messages)
+    let source_bytes = retained_source_bytes(messages)
         .saturating_add(retained_tool_definition_bytes(
             tools.as_deref().map(Vec::as_slice),
         ));
@@ -436,7 +540,11 @@ pub(crate) fn begin_attempt(
         }
     };
 
-    let spawn_summary = with_registry(|registry| {
+    // One critical section decides the summary state, registers the entry and
+    // only then materializes the caller's copy of the input. Nothing here
+    // awaits, and the copy is skipped entirely when this attempt keeps no source
+    // and runs no summary job.
+    let (prepared, spawn_summary) = with_registry(|registry| {
         let existing = registry
             .position(&key)
             .map(|index| registry.entries[index].summary.clone());
@@ -448,10 +556,11 @@ pub(crate) fn begin_attempt(
                 (SummarySlot::Pending, false)
             }
         };
+        let prepared = (retain_source || spawn).then(prepare);
         let entry = RetainedRequest {
             request: request.clone(),
             captured_at,
-            source: retain_source.then(|| Arc::clone(&prepared)),
+            source: if retain_source { prepared.clone() } else { None },
             tools: if retain_source { tools.clone() } else { None },
             source_bytes: if retain_source { source_bytes } else { 0 },
             summary,
@@ -481,7 +590,7 @@ pub(crate) fn begin_attempt(
             }
         }
         registry.enforce_limits();
-        spawn
+        (prepared, spawn)
     });
 
     let permit = match admission {
@@ -500,6 +609,16 @@ pub(crate) fn begin_attempt(
             );
             return;
         }
+    };
+
+    // A spawned summary job always took the prepared input above; an attempt
+    // that never prepared it owns no job and retains no source.
+    let Some(prepared) = prepared.filter(|_| spawn_summary) else {
+        debug!(
+            "Recorded request snapshot retained no source and runs no summary: session_id={}, attempt_id={}, source_bytes={}",
+            request.session_id, request.attempt_id, source_bytes
+        );
+        return;
     };
 
     tokio::spawn(async move {
@@ -585,6 +704,13 @@ async fn complete_summary(
 /// adapter normalized one, a same-attempt estimate when only the summary is
 /// ready, otherwise an explicit unknown. A reported total is never inferred and
 /// a zero is never recorded as a reported total.
+///
+/// Reading this attempt's summary, building the snapshot and storing it as the
+/// activated truth happen in one registry critical section. A summary job that
+/// completes concurrently therefore either merges into an already activated
+/// snapshot or is read here; a ready summary can never be dropped between the
+/// read and the store. Publication is the caller's job and happens after the
+/// lock, so no lock spans an await.
 pub(crate) fn activate_attempt(
     request: UsageRequestRef,
     usage_prompt_token_count: Option<u64>,
@@ -592,9 +718,10 @@ pub(crate) fn activate_attempt(
 ) -> UsageRequestSnapshot {
     let key = RequestKey::of(&request);
     let captured_at = now_ms();
-    let (summary, retained, retained_context_window) = with_registry(|registry| {
+    with_registry(|registry| {
         let Some(index) = registry.position(&key) else {
-            return (None, false, None);
+            // Nothing was captured for this attempt, so nothing is activated.
+            return unobserved_snapshot(request, captured_at, None, false);
         };
         let entry = &mut registry.entries[index];
         entry.request.started_at = request.started_at;
@@ -603,16 +730,45 @@ pub(crate) fn activate_attempt(
             SummarySlot::Ready(breakdown) => Some(breakdown.clone()),
             SummarySlot::Pending | SummarySlot::Running => None,
         };
-        (summary, true, entry.context_window)
-    });
+        let context_window = entry.context_window;
+        let mut snapshot = unobserved_snapshot(request, captured_at, context_window, true);
+        if let Some(prompt_token_count) = usage_prompt_token_count.filter(|count| *count > 0) {
+            // The only assignment of `ProviderReported` in this module. The value
+            // is the attempt's provider usage observation, already normalized by
+            // the adapter to the whole request input (including cached tokens).
+            // Compression data never reaches this branch, and a zero is not an
+            // observation.
+            snapshot.input_total = Some(prompt_token_count);
+            snapshot.cached_input_tokens = cached_input_tokens;
+            snapshot.usage_state = UsageRequestUsageState::ProviderReported;
+            snapshot.unavailable_reason = None;
+        }
+        if let Some(breakdown) = summary {
+            let estimated_total = breakdown_total(&breakdown);
+            record_summary_result(&mut snapshot, breakdown, estimated_total);
+        }
+        entry.activated = Some(snapshot.clone());
+        snapshot
+    })
+}
 
-    let mut snapshot = UsageRequestSnapshot {
+/// Snapshot of an attempt with no provider observation yet.
+///
+/// `retained` distinguishes a recorded attempt (summary still `Pending`) from a
+/// reference whose source was never captured (explicitly `Unavailable`).
+fn unobserved_snapshot(
+    request: UsageRequestRef,
+    captured_at: u64,
+    context_window: Option<u64>,
+    retained: bool,
+) -> UsageRequestSnapshot {
+    UsageRequestSnapshot {
         schema_version: REQUEST_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
         request,
         captured_at,
         input_source: UsageRequestInputSource::ModelRequest,
         input_total: None,
-        context_window: retained_context_window,
+        context_window,
         cached_input_tokens: None,
         usage_state: UsageRequestUsageState::Unknown,
         estimated_total: None,
@@ -628,32 +784,7 @@ pub(crate) fn activate_attempt(
         } else {
             Some(SNAPSHOT_NOT_CAPTURED_REASON.to_string())
         },
-    };
-
-    if let Some(prompt_token_count) = usage_prompt_token_count.filter(|count| *count > 0) {
-        // The only assignment of `ProviderReported` in this module. The value is
-        // the attempt's provider usage observation, already normalized by the
-        // adapter to the whole request input (including cached tokens).
-        // Compression data never reaches this branch, and a zero is not an
-        // observation.
-        snapshot.input_total = Some(prompt_token_count);
-        snapshot.cached_input_tokens = cached_input_tokens;
-        snapshot.usage_state = UsageRequestUsageState::ProviderReported;
-        snapshot.unavailable_reason = None;
     }
-
-    if let Some(breakdown) = summary {
-        let estimated_total = breakdown_total(&breakdown);
-        record_summary_result(&mut snapshot, breakdown, estimated_total);
-    }
-
-    let stored = snapshot.clone();
-    with_registry(|registry| {
-        if let Some(index) = registry.position(&key) {
-            registry.entries[index].activated = Some(stored);
-        }
-    });
-    snapshot
 }
 
 /// Merge a completed same-attempt summary into one snapshot.
@@ -927,6 +1058,7 @@ fn push_preview_text(content: &mut String, text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::agentic::core::Message as DomainMessage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_request(attempt_id: &str, attempt_index: u32, started_at: i64) -> UsageRequestRef {
         UsageRequestRef {
@@ -1024,6 +1156,18 @@ mod tests {
         })
     }
 
+    /// Bytes this attempt keeps in the registry, for its own entry only.
+    fn retained_bytes(request: &UsageRequestRef) -> usize {
+        let key = RequestKey::of(request);
+        with_registry(|registry| {
+            registry
+                .entries
+                .iter()
+                .find(|entry| entry.same_identity(&key))
+                .map_or(0, |entry| entry.retained_bytes())
+        })
+    }
+
     fn summary_ready(request: &UsageRequestRef) -> bool {
         let key = RequestKey::of(request);
         with_registry(|registry| {
@@ -1043,6 +1187,31 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("the background summary did not finish");
+    }
+
+    /// Hold every global summary permit so no attempt can be admitted a job.
+    async fn drain_summary_permits() -> Vec<OwnedSemaphorePermit> {
+        let semaphore = Arc::clone(summary_semaphore());
+        let mut held = Vec::new();
+        for _ in 0..600 {
+            if held.len() == MAX_CONCURRENT_SUMMARIES {
+                break;
+            }
+            match semaphore.clone().try_acquire_owned() {
+                Ok(permit) => held.push(permit),
+                Err(_) => {
+                    // A task of an earlier test may still be releasing its permit.
+                    held.clear();
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }
+        }
+        assert_eq!(
+            held.len(),
+            MAX_CONCURRENT_SUMMARIES,
+            "the summary permits must be drained for this test"
+        );
+        held
     }
 
     #[tokio::test]
@@ -1728,26 +1897,7 @@ mod tests {
         clear_registry();
         // Drain the global permit pool, then start an attempt: it must not queue
         // a task that would hold its source for an unbounded time.
-        let semaphore = Arc::clone(summary_semaphore());
-        let mut held = Vec::new();
-        for _ in 0..600 {
-            if held.len() == MAX_CONCURRENT_SUMMARIES {
-                break;
-            }
-            match semaphore.clone().try_acquire_owned() {
-                Ok(permit) => held.push(permit),
-                Err(_) => {
-                    // A task of an earlier test may still be releasing its permit.
-                    held.clear();
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            }
-        }
-        assert_eq!(
-            held.len(),
-            MAX_CONCURRENT_SUMMARIES,
-            "the summary permits must be drained for this test"
-        );
+        let held = drain_summary_permits().await;
 
         let burst = session_request("session-burst", "round-1:attempt:1", 1, 10);
         begin_attempt(
@@ -1790,6 +1940,323 @@ mod tests {
         assert_eq!(ready.summary_state, UsageSummaryState::Ready);
         assert_eq!(ready.usage_state, UsageRequestUsageState::Estimated);
         assert!(ready.estimated_total.is_some());
+        clear_registry();
+    }
+
+    #[tokio::test]
+    async fn send_path_copies_the_input_only_when_it_is_kept_or_summarized() {
+        let _guard = test_guard();
+        clear_registry();
+        // No summary permit is free, so only source retention can justify a copy.
+        let held = drain_summary_permits().await;
+        let copies = Arc::new(AtomicUsize::new(0));
+
+        // An oversize request is neither retained nor summarized, so the send
+        // path never materializes a copy of it.
+        let oversize = session_request("session-copy", "round-1:attempt:1", 1, 10);
+        let large_messages = vec![AIMessage::system("x".repeat(MAX_RETAINED_SOURCE_BYTES + 1))];
+        let large_categories = vec![SendCategory::SystemPrompt];
+        let never = Arc::clone(&copies);
+        begin_attempt_with_source(
+            &large_messages,
+            &large_categories,
+            true,
+            oversize.clone(),
+            None,
+            None,
+            activation(),
+            false,
+            move || {
+                never.fetch_add(1, Ordering::SeqCst);
+                Arc::new(PreparedSendInput::default())
+            },
+        );
+        assert_eq!(
+            copies.load(Ordering::SeqCst),
+            0,
+            "an input that is neither retained nor summarized is never copied"
+        );
+        assert_eq!(retained_bytes(&oversize), 0);
+        assert!(matches!(summary_slot(&oversize), Some(SummarySlot::Pending)));
+        assert!(!request_context_summary_is_live(&oversize));
+
+        // A request within the budget copies its input exactly once, even when
+        // no summary job is admitted.
+        let retained = session_request("session-copy", "round-1:attempt:2", 2, 20);
+        let small_messages = vec![AIMessage::system("system body".into())];
+        let small_categories = vec![SendCategory::SystemPrompt];
+        begin_attempt_with_source(
+            &small_messages,
+            &small_categories,
+            true,
+            retained.clone(),
+            None,
+            None,
+            activation(),
+            false,
+            || {
+                copies.fetch_add(1, Ordering::SeqCst);
+                Arc::new(PreparedSendInput {
+                    messages: small_messages.clone(),
+                    categories: small_categories.clone(),
+                })
+            },
+        );
+        assert_eq!(copies.load(Ordering::SeqCst), 1);
+        assert!(matches!(summary_slot(&retained), Some(SummarySlot::Pending)));
+        match materialize_request_context_preview(&retained, UsageContextCategory::SystemPrompt) {
+            RequestContextPreview::Available { content, .. } => assert_eq!(content, "system body"),
+            other => panic!("expected the retained source, got {other:?}"),
+        }
+
+        // An oversize request whose summary job is admitted is copied for that
+        // job only, and still retains nothing.
+        drop(held);
+        let summarized = session_request("session-copy", "round-1:attempt:3", 3, 30);
+        let summarized_messages =
+            vec![AIMessage::system("y".repeat(MAX_RETAINED_SOURCE_BYTES + 1))];
+        let summarized_categories = vec![SendCategory::SystemPrompt];
+        begin_attempt_with_source(
+            &summarized_messages,
+            &summarized_categories,
+            true,
+            summarized.clone(),
+            None,
+            None,
+            activation(),
+            false,
+            || {
+                copies.fetch_add(1, Ordering::SeqCst);
+                Arc::new(PreparedSendInput {
+                    messages: summarized_messages.clone(),
+                    categories: summarized_categories.clone(),
+                })
+            },
+        );
+        assert_eq!(
+            copies.load(Ordering::SeqCst),
+            2,
+            "only an admitted summary job copies an input that is not retained"
+        );
+        assert_eq!(retained_bytes(&summarized), 0);
+        wait_for_summary(&summarized).await;
+        clear_registry();
+    }
+
+    #[tokio::test]
+    async fn subagent_attempts_never_register_a_recorded_request() {
+        let _guard = test_guard();
+        clear_registry();
+        let request = session_request("session-parent", "round-1:attempt:1", 1, 10);
+        let messages = vec![AIMessage::system("subagent system prompt".into())];
+        let categories = vec![SendCategory::SystemPrompt];
+        let copies = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&copies);
+        let owned = prepared(messages.clone(), categories.clone());
+        begin_attempt_with_source(
+            &messages,
+            &categories,
+            true,
+            request.clone(),
+            None,
+            None,
+            activation(),
+            true,
+            move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                owned
+            },
+        );
+        assert_eq!(
+            copies.load(Ordering::SeqCst),
+            0,
+            "a subagent attempt never copies its input"
+        );
+        assert!(
+            with_registry(|registry| registry.entries.is_empty()),
+            "a subagent attempt registers no entry"
+        );
+        assert!(!request_context_summary_is_live(&request));
+        assert_eq!(
+            materialize_request_context_preview(&request, UsageContextCategory::SystemPrompt),
+            RequestContextPreview::Unavailable {
+                reason: PREVIEW_RESTART_REASON.to_string()
+            }
+        );
+
+        // The borrowed send-path entry point behaves identically.
+        begin_attempt_for_agent(
+            &messages,
+            &categories,
+            request.clone(),
+            None,
+            None,
+            activation(),
+            true,
+        );
+        assert!(with_registry(|registry| registry.entries.is_empty()));
+        assert!(!request_context_summary_is_live(&request));
+
+        // The parent attempt still records normally.
+        begin_attempt_for_agent(
+            &messages,
+            &categories,
+            request.clone(),
+            None,
+            None,
+            activation(),
+            false,
+        );
+        assert_eq!(with_registry(|registry| registry.entries.len()), 1);
+        assert!(request_context_summary_is_live(&request));
+        clear_registry();
+    }
+
+    /// A summary that becomes ready while an attempt is being activated must
+    /// never be dropped: whichever task reaches the registry first, the stored
+    /// activation is the merged snapshot of this attempt.
+    ///
+    /// Both tasks are parked on the registry lock before it is released, so a
+    /// summary completion is handed the table right after the activation read
+    /// it; a read-build-store split across two locks loses the ready summary
+    /// under this handoff.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn late_summary_and_activation_keep_the_ready_summary() {
+        let _guard = test_guard();
+        clear_registry();
+        // No background job competes with the explicit completions below.
+        let held = drain_summary_permits().await;
+        let breakdown = UsageContextBreakdown {
+            system_prompt: 11,
+            conversation: 22,
+            ..Default::default()
+        };
+        let estimated_total = breakdown_total(&breakdown);
+        const ROUNDS: usize = 40;
+        for iteration in 0..ROUNDS {
+            clear_registry();
+            let request = session_request("session-race", "round-1:attempt:1", 1, 10);
+            begin_attempt(
+                conversation_input("hello"),
+                request.clone(),
+                None,
+                Some(64_000),
+                activation(),
+            );
+            // The job owning this attempt has not published yet.
+            with_registry(|registry| {
+                let key = RequestKey::of(&request);
+                let index = registry.position(&key).expect("registered");
+                registry.entries[index].summary = SummarySlot::Running;
+            });
+
+            // Park both tasks on the registry table, then release it.
+            let parked = Arc::new(AtomicUsize::new(0));
+            let guard = registry().lock().unwrap_or_else(|error| error.into_inner());
+            let completion = tokio::spawn({
+                let parked = Arc::clone(&parked);
+                let completion_request = request.clone();
+                let completion_breakdown = breakdown.clone();
+                async move {
+                    parked.fetch_add(1, Ordering::SeqCst);
+                    complete_summary(completion_request, completion_breakdown, activation()).await;
+                }
+            });
+            let activation_task = tokio::spawn({
+                let parked = Arc::clone(&parked);
+                let activation_request = request.clone();
+                async move {
+                    parked.fetch_add(1, Ordering::SeqCst);
+                    activate_attempt(activation_request, Some(1_200), Some(64))
+                }
+            });
+            // Both tasks report before they reach the locked table, so neither
+            // can run to completion before the other is admitted.
+            for _ in 0..5_000 {
+                if parked.load(Ordering::SeqCst) == 2 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(
+                parked.load(Ordering::SeqCst),
+                2,
+                "both race tasks must reach the registry"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            drop(guard);
+
+            completion.await.expect("summary task");
+            let returned = activation_task.await.expect("activation task");
+            assert_eq!(returned.input_total, Some(1_200));
+
+            let stored = activated_snapshot(&request).expect("activation recorded");
+            assert_eq!(
+                stored.summary_state,
+                UsageSummaryState::Ready,
+                "iteration {iteration}"
+            );
+            assert_eq!(
+                stored.estimated_total,
+                Some(estimated_total),
+                "iteration {iteration}"
+            );
+            assert_eq!(stored.input_total, Some(1_200), "iteration {iteration}");
+            assert_eq!(stored.cached_input_tokens, Some(64), "iteration {iteration}");
+            let categories = stored.categories.expect("categories");
+            assert_eq!(categories.system_prompt, breakdown.system_prompt);
+            assert_eq!(categories.conversation, breakdown.conversation);
+        }
+        drop(held);
+        clear_registry();
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_published_even_when_it_is_not_persisted() {
+        let _guard = test_guard();
+        clear_registry();
+        // No summary job runs, so the activation's event is the only one.
+        let held = drain_summary_permits().await;
+        let event_queue = Arc::new(EventQueue::new(
+            openbitfun_agent_runtime::event_queue::EventQueueConfig::default(),
+        ));
+        let activation =
+            SnapshotActivation::new(SnapshotEventSink::new(Arc::clone(&event_queue)), None);
+        let request = session_request("session-temporary", "round-1:attempt:1", 1, 10);
+        begin_attempt(
+            conversation_input("hello"),
+            request.clone(),
+            None,
+            Some(1_000),
+            activation.clone(),
+        );
+        let snapshot = activate_attempt(request, Some(320), None);
+        assert_eq!(snapshot.summary_state, UsageSummaryState::Pending);
+
+        let persisted = activation.persist_and_publish(snapshot.clone()).await;
+        assert!(
+            !persisted,
+            "a snapshot without a persistent session owner reports no persistence"
+        );
+        let batch = event_queue.dequeue_batch(8).await;
+        assert_eq!(batch.len(), 1, "the snapshot is published exactly once");
+        match &batch[0].event {
+            AgenticEvent::RequestContextSnapshotUpdated {
+                session_id,
+                turn_id,
+                snapshot: published,
+            } => {
+                assert_eq!(session_id, &snapshot.request.session_id);
+                assert_eq!(turn_id, &snapshot.request.turn_id);
+                assert_eq!(published, &snapshot);
+            }
+            other => panic!("expected a recorded snapshot event, got {other:?}"),
+        }
+        assert!(
+            event_queue.is_empty().await,
+            "publication never duplicates the event"
+        );
+        drop(held);
         clear_registry();
     }
 
