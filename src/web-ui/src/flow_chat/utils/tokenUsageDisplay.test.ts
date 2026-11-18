@@ -5,6 +5,7 @@ import {
   buildContextUsageTooltip,
   buildModelSelectorTooltipDetails,
   buildModelRoundCompletionMeta,
+  DEFAULT_MAX_CONTEXT_TOKENS,
   deriveContextUsageFromTurns,
   formatCompactTokenCount,
   getCompressionTriggerTokens,
@@ -80,11 +81,14 @@ describe('tokenUsageDisplay', () => {
         size: 128000,
         timestamp: 10,
       },
+      // ACP ranks above the legacy ledger even when the legacy value is
+      // compression-derived, because ACP reports its own live context size.
       currentTokenUsage: {
         inputTokens: 1200,
         outputTokens: 300,
         totalTokens: 1500,
         timestamp: 10,
+        source: 'context_compression',
       },
     });
 
@@ -453,15 +457,24 @@ describe('recorded request context snapshot display', () => {
     /*
      * `currentTokenUsage`/`currentContextUsage` may be written by the
      * compression path (`source: 'context_compression'`). That value describes a
-     * rebuilt prompt, not the request the host recorded, so it may only appear
-     * on the legacy display path — never as the snapshot's provider total.
+     * rebuilt prompt, not the request the host recorded, so it is never the
+     * snapshot's provider total — and the legacy fallback refuses it too,
+     * reporting an explicit unknown state instead of a compacted prompt total.
      */
     const compressed = {
       inputTokens: 9000, outputTokens: 100, totalTokens: 9100, timestamp: 5,
       turnId: 'turn-1', source: 'context_compression' as const,
     };
     expect(getSessionContextUsageDisplay(makeSession({ currentTokenUsage: compressed }))).toEqual({
-      current: 9000, max: 4000, source: 'agent_prompt',
+      current: 0, max: 4000, source: 'agent_prompt', snapshotState: 'unknown',
+    });
+
+    // Without a Session context window the refusal keeps the default ceiling
+    // instead of presenting a bare zero-max reading.
+    expect(getSessionContextUsageDisplay(makeSession({
+      currentTokenUsage: compressed, maxContextTokens: undefined,
+    }))).toEqual({
+      current: 0, max: DEFAULT_MAX_CONTEXT_TOKENS, source: 'agent_prompt', snapshotState: 'unknown',
     });
 
     expect(getSessionContextUsageDisplay(makeSession({
@@ -483,5 +496,18 @@ describe('recorded request context snapshot display', () => {
     }));
     expect(estimated.current).toBe(1000);
     expect(estimated.snapshotState).toBe('estimated');
+  });
+
+  it('keeps a legacy model_request reading on the legacy fallback path', () => {
+    // The refusal above is scoped to compression-derived data; a runtime
+    // recorded model request keeps displaying its provider-reported input.
+    expect(getSessionContextUsageDisplay(makeSession({
+      currentTokenUsage: {
+        inputTokens: 1200, outputTokens: 300, totalTokens: 1500, timestamp: 10,
+        turnId: 'turn-1', source: 'model_request',
+      },
+    }))).toEqual({
+      current: 1200, max: 4000, source: 'agent_prompt',
+    });
   });
 });

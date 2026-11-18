@@ -64,7 +64,10 @@ export interface ChatInputWorkspaceStripProps {
     loadSnapshot?: () => Promise<RequestContextSnapshotReadResult>;
     /** The rendered host does not advertise the recorded-snapshot mode. */
     snapshotUnsupported?: boolean;
-    /** Label for a non-reported total, or undefined when U is provider-reported. */
+    /**
+     * Label for a non-reported total, or undefined when U is provider-reported.
+     * `'unknown'` also covers a fallback with no trustworthy recorded total.
+     */
     snapshotState?: UsageRequestUsageState;
     compactDisabled?: boolean;
     onCompact?: () => void;

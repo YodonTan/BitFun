@@ -21,6 +21,8 @@ export interface ContextUsageDisplay {
   /**
    * How the total was obtained when it came from a recorded request snapshot.
    * Undefined means the value is a legacy reading with no recorded snapshot.
+   * `'unknown'` also covers a legacy fallback that had no trustworthy recorded
+   * request total to present.
    */
   snapshotState?: UsageRequestUsageState;
 }
@@ -231,8 +233,24 @@ export function getSessionContextUsageDisplay(session?: Session): ContextUsageDi
     };
   }
 
+  const legacyUsage = session.currentTokenUsage;
+  // Only a recorded model request may present a legacy number. An undefined
+  // source is a legacy turn-derived provider reading; every other defined
+  // source (for example `context_compression`, which describes the rebuilt
+  // prompt written after a compaction) is not a recorded request total. The
+  // check is an allowlist so a future non-provider source cannot silently leak
+  // a value that was never reported by the provider for a recorded request.
+  if (legacyUsage?.source !== undefined && legacyUsage.source !== 'model_request') {
+    return {
+      current: 0,
+      max: session.maxContextTokens || DEFAULT_MAX_CONTEXT_TOKENS,
+      source: 'agent_prompt',
+      snapshotState: 'unknown',
+    };
+  }
+
   return {
-    current: session.currentTokenUsage?.inputTokens || 0,
+    current: legacyUsage?.inputTokens || 0,
     max: session.maxContextTokens || DEFAULT_MAX_CONTEXT_TOKENS,
     source: 'agent_prompt',
   };
