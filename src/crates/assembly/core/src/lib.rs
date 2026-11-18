@@ -69,6 +69,8 @@ pub mod service; // Workspace, Config, FileSystem, Terminal, Git
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod service_agent_runtime;
 pub mod util; // General types, errors, helper functions
+#[cfg(all(test, feature = "agent-runtime"))]
+mod workspace_intelligence_off_baseline_tests;
 
 #[cfg(feature = "remote-connect")]
 pub use openbitfun_services_integrations::remote_connect::{

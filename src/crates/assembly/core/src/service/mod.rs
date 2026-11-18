@@ -53,6 +53,7 @@ pub mod token_usage; // Token usage tracking
 pub mod web_search; // Provider-neutral WebSearch runtime and local credentials
 #[cfg(feature = "workspace-runtime")]
 pub mod workspace; // Workspace management // Diff calculation and merge service
+pub(crate) mod workspace_intelligence; // Workspace intelligence tier derivation (P0, private)
 #[cfg(feature = "workspace-runtime")]
 pub mod workspace_runtime; // Workspace runtime layout / migration / initialization
 #[cfg(all(feature = "agent-runtime", feature = "git"))]
