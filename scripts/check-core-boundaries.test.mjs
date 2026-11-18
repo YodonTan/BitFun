@@ -4311,6 +4311,8 @@ test('Services Core accepts only the reviewed feature-owned Tokio runtime graph'
       'routing-state': ['json-io'],
       'resource-capacity': ['json-io'],
       'workspace-intelligence-store': ['json-io', 'dep:sha2'],
+      'workspace-intelligence-cognition': ['dep:rusqlite', 'dep:sha2'],
+      'workspace-intelligence-commit': ['workspace-intelligence-store', 'workspace-intelligence-cognition'],
       'local-storage': [
         'dep:tokio',
         'tokio/fs',
@@ -4397,6 +4399,61 @@ test('Services Core Tokio owners cannot be hidden behind an unreviewed alias', (
   assert.ok(
     messages.includes('openbitfun-services-core:sneaky-weak Tokio capabilities require an explicit owner contract'),
   );
+});
+
+test('workspace intelligence commit pins only two owners and rejects direct Tokio widening', async () => {
+  const manifestPath = 'src/crates/services/services-core/Cargo.toml';
+  const manifest = await readFile(new URL(`../${manifestPath}`, import.meta.url), 'utf8');
+  const features = parseManifestFeatures(manifest);
+  const references = ['workspace-intelligence-store', 'workspace-intelligence-cognition'];
+  const rule = coreClosedFeatureProfileRules.find((candidate) =>
+    candidate.manifestPath === manifestPath && candidate.featureName === 'workspace-intelligence-commit');
+  assert.equal(rule?.exact, true);
+  assert.deepEqual(rule.requiredFeatureRefs, references);
+  assert.deepEqual(rule.allowedTransitiveFeatureRefs, ['json-io']);
+  assert.deepEqual(features['workspace-intelligence-commit'], references);
+  assert.deepEqual(features.default, []);
+  assert.match(rule.reason, /only the two store owners/);
+  const { unexpectedDependencyOwnerFeatures } = await import(
+    './core-boundaries/manifest-feature-helpers.mjs'
+  );
+  const tokioOwner = optionalDependencyFeatureOwnerRules
+    .find((candidate) => candidate.crateName === 'services-core')
+    .dependencies.find((dependency) => dependency.depName === 'tokio');
+  // Exercise the actual owner checker too: redundant direct capabilities must
+  // be rejected even when they do not change the effective Tokio union.
+  for (const forbidden of ['dep:tokio', 'tokio/rt']) {
+    const widened = [...references, forbidden];
+    const unexpected = widened.filter((reference) => !rule.requiredFeatureRefs.includes(reference));
+    assert.deepEqual(unexpected, [forbidden]);
+    assert.deepEqual(unexpectedDependencyOwnerFeatures(new Map([
+      ['workspace-intelligence-commit', { refs: widened, line: 1 }],
+    ]), tokioOwner).map(([featureName]) => featureName), ['workspace-intelligence-commit']);
+  }
+  const sourceRule = requiredContentRules.find((candidate) =>
+    candidate.path === 'src/crates/services/services-core/src/lib.rs');
+  assert.ok(sourceRule.patterns.some((pattern) => pattern.regex.test(
+    '#[cfg(feature = "workspace-intelligence-commit")]\npub mod workspace_intelligence_commit;',
+  )));
+});
+
+test('workspace intelligence commit inherits exactly the effective JSON IO Tokio contract', () => {
+  const messages = (refs) => findTokioDependencyFeatureViolations([{
+    name: 'openbitfun-services-core',
+    manifest_path: 'src/crates/services/services-core/Cargo.toml',
+    dependencies: [{ name: 'tokio', kind: null, optional: true, features: [] }],
+    features: {
+      'json-io': ['dep:tokio', 'tokio/fs', 'tokio/rt', 'tokio/sync', 'tokio/time'],
+      'workspace-intelligence-store': ['json-io', 'dep:sha2'],
+      'workspace-intelligence-cognition': ['dep:rusqlite', 'dep:sha2'],
+      'workspace-intelligence-commit': refs,
+    },
+  }]).map((violation) => violation.message)
+    .filter((message) => message.includes(':workspace-intelligence-commit '));
+  const refs = ['workspace-intelligence-store', 'workspace-intelligence-cognition'];
+  assert.deepEqual(messages(refs), []);
+  assert.match(messages([...refs, 'tokio/process']).join('\n'), /unexpected effective Tokio capabilities: process/);
+  assert.match(messages(['workspace-intelligence-cognition']).join('\n'), /missing effective Tokio capabilities: fs, rt, sync, time/);
 });
 
 test('workspace intelligence store admits only the reviewed JSON IO Tokio closure', () => {

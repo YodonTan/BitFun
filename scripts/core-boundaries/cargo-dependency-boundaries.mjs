@@ -179,6 +179,8 @@ const SERVICES_CORE_TOKIO_FEATURES = new Map([
   ['json-io', ['fs', 'rt', 'sync', 'time']],
   // Scoped workspace-intelligence facts reuse the reviewed atomic JSON IO closure; no processes or network.
   ['workspace-intelligence-store', ['fs', 'rt', 'sync', 'time']],
+  // Governed commits inherit exactly the json-io closure through the control store.
+  ['workspace-intelligence-commit', ['fs', 'rt', 'sync', 'time']],
   ['routing-state', ['fs', 'rt', 'sync', 'time']],
   ['resource-capacity', ['fs', 'rt', 'sync', 'time']],
   ['local-storage', ['fs', 'rt', 'sync', 'time']],

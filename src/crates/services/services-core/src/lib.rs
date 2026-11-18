@@ -68,6 +68,8 @@ pub mod workspace_icon_assets;
 pub mod workspace_intelligence_cognition;
 #[cfg(feature = "workspace-intelligence-store")]
 pub mod workspace_intelligence_store;
+#[cfg(feature = "workspace-intelligence-commit")]
+pub mod workspace_intelligence_commit;
 #[cfg(feature = "workspace-persistence")]
 pub mod workspace_persistence;
 #[cfg(feature = "workspace-persistence")]

@@ -127,6 +127,10 @@ export const requiredContentRules = [
         regex: /#\[cfg\(feature = "workspace-intelligence-cognition"\)\]\s*pub mod workspace_intelligence_cognition;/,
         message: 'missing workspace-intelligence-cognition partition store source gate',
       },
+      {
+        regex: /#\[cfg\(feature = "workspace-intelligence-commit"\)\]\s*pub mod workspace_intelligence_commit;/,
+        message: 'missing workspace-intelligence-commit governed owner source gate',
+      },
     ],
   },
   // P1 core slice: WP1.1 core assembly, WP1.2a control-vs-control, WP1.3 cognition.

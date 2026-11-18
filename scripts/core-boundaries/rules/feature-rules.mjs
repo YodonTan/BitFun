@@ -1716,6 +1716,15 @@ export const coreClosedFeatureProfileRules = [
     reason:
       'services-core workspace-intelligence-store must own only scoped fact snapshots over generic atomic JSON IO and content hashing, without product policy, runtime, process, or network capabilities',
   },
+  {
+    manifestPath: 'src/crates/services/services-core/Cargo.toml',
+    featureName: 'workspace-intelligence-commit',
+    requiredFeatureRefs: ['workspace-intelligence-store', 'workspace-intelligence-cognition'],
+    allowedTransitiveFeatureRefs: ['json-io'],
+    exact: true,
+    reason:
+      'services-core workspace-intelligence-commit composes only the two store owners, with no product policy, runtime, process, network, UI, claim, cursor, or token capability',
+  },
   // P1 cognition partition root: WP1.3 per-scope cognition partition state.
   {
     manifestPath: 'src/crates/services/services-core/Cargo.toml',

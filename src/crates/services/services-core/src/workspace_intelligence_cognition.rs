@@ -5,7 +5,7 @@
 //! are shape-only: this module never interprets, advances, assigns or checks
 //! governance meaning for either value. Incarnation advancement (WP1.4) and
 //! cursor/gap consumption (WP1.5) are owned elsewhere and are out of scope
-//! here. This is an internal seam with no production consumer yet.
+//! here. The governed commit gate is the narrow runtime caller of this seam.
 //!
 //! # Layout and scope opacity
 //!
@@ -73,9 +73,9 @@
 //! # Blocking boundary
 //!
 //! This module is synchronous on purpose: no `tokio`, no async signature and no
-//! runtime handle. A future runtime caller must cross a blocking boundary (for
-//! example `spawn_blocking`) before calling it. No runtime caller exists in this
-//! slice.
+//! runtime handle. The commit gate calls `initialize` through `spawn_blocking`
+//! while holding the control guard. The API stays synchronous and gains no
+//! cursor/token write path.
 
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OpenFlags, Transaction, TransactionBehavior};

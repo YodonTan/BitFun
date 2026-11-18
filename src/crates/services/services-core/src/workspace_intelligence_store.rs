@@ -351,6 +351,30 @@ impl WorkspaceIntelligenceStore {
         Ok(self.root.join(format!("{digest:x}.json")))
     }
 
+    #[cfg(feature = "workspace-intelligence-commit")]
+    pub(crate) fn control_root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Hands one writer guard and its fresh observation to the governed owner commit.
+    /// This adds no second write path into the control record.
+    #[cfg(feature = "workspace-intelligence-commit")]
+    pub(crate) async fn lock_and_read_authority(
+        &self,
+        scope: &str,
+    ) -> Result<
+        (crate::json_store::JsonFileCrossProcessLock, Option<WorkspaceIntelligenceControlRecord>),
+        WorkspaceIntelligenceStoreError,
+    > {
+        let path = self.record_path(scope)?;
+        let guard = JsonFileStore.acquire_cross_process_lock(&path).await?;
+        let record = match self.read_document(&path).await? {
+            Some(document) => Some(self.decode(&path, document)?),
+            None => None,
+        };
+        Ok((guard, record))
+    }
+
     fn newest_accepted_schema_version(&self) -> Option<u32> {
         self.accepted_schema_versions.iter().copied().max()
     }
