@@ -471,6 +471,9 @@ workspace-intelligence-control = ["openbitfun-services-core/workspace-intelligen
 # future real narrow consumer selects it explicitly in its own manifest.
 workspace-intelligence-cognition = ["openbitfun-services-core/workspace-intelligence-cognition"]
 workspace-intelligence-commit = ["openbitfun-services-core/workspace-intelligence-commit"]
+# Internal already-enabled owner lifecycle; selects only the services claim owner.
+# Not selected by `default`, `product-full` or `agent-runtime`.
+workspace-intelligence-claim = ["openbitfun-services-core/workspace-intelligence-claim"]
 workspace-runtime = [
     "openbitfun-services-core/workspace-persistence",
     "dep:serde_yaml",

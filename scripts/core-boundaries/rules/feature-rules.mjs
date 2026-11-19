@@ -1775,6 +1775,13 @@ export const coreClosedFeatureProfileRules = [
   },
   {
     manifestPath: 'src/crates/assembly/core/Cargo.toml',
+    featureName: 'workspace-intelligence-claim',
+    requiredFeatureRefs: ['openbitfun-services-core/workspace-intelligence-claim'],
+    exact: true,
+    reason: 'openbitfun-core workspace-intelligence-claim selects only the services claim owner, without product policy, model resolution, timer, runtime, UI, a second control write path, or core control/cognition/commit features',
+  },
+  {
+    manifestPath: 'src/crates/assembly/core/Cargo.toml',
     featureName: 'dispatch-store',
     requiredFeatureRefs: [
       'dep:base64',

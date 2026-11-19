@@ -155,6 +155,10 @@ export const requiredContentRules = [
         regex: /#\[cfg\(feature = "workspace-intelligence-commit"\)\]\s*pub\(crate\) mod commit;/,
         message: 'missing workspace-intelligence-commit core wrapper source gate',
       },
+      {
+        regex: /#\[cfg\(feature = "workspace-intelligence-claim"\)\]\s*pub\(crate\) mod claim;/,
+        message: 'missing workspace-intelligence-claim core wrapper source gate',
+      },
     ],
   },
   {

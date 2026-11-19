@@ -311,6 +311,17 @@ impl PathManager {
             .join("cognition")
     }
 
+    /// Single stable host-local lease root for workspace intelligence owner tenure.
+    ///
+    /// Sibling of the control and cognition roots and deliberately outside the memory
+    /// database and memory workspace roots, so the legacy memory reset cannot reach it.
+    /// A pure path derivation: it creates no directory and takes no lock.
+    pub fn workspace_intelligence_lease_dir(&self) -> PathBuf {
+        self.user_data_dir()
+            .join("workspace-intelligence")
+            .join("lease")
+    }
+
     /// Process-level ownership locks for local Agent Runtime deployments.
     pub fn agent_runtime_ownership_dir(&self) -> PathBuf {
         self.user_data_dir().join("agent-runtime").join("ownership")
@@ -946,6 +957,34 @@ mod tests {
             !cognition_dir.starts_with(&memories_database_parent),
             "the memory database directory must not be an ancestor of the cognition root"
         );
+    }
+
+    #[test]
+    fn workspace_intelligence_lease_root_is_separate_from_memory_storage() {
+        let fixture = tempfile::tempdir().expect("temp dir");
+        let paths = PathManager::with_user_root_for_tests(fixture.path().join("user"));
+        let lease_dir = paths.workspace_intelligence_lease_dir();
+        assert_eq!(
+            lease_dir,
+            paths.user_data_dir().join("workspace-intelligence").join("lease")
+        );
+        for sibling in [
+            paths.workspace_intelligence_control_dir(),
+            paths.workspace_intelligence_cognition_dir(),
+        ] {
+            assert_eq!(lease_dir.parent(), sibling.parent());
+            assert_ne!(lease_dir, sibling);
+        }
+        assert!(!lease_dir.starts_with(paths.memories_root_dir()));
+        let memories_database_parent = paths
+            .memories_database_file()
+            .parent()
+            .expect("the memory database file must have a parent")
+            .to_path_buf();
+        assert!(!lease_dir.starts_with(memories_database_parent));
+        assert_ne!(lease_dir, paths.agent_runtime_ownership_dir());
+        assert!(!lease_dir.exists());
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 0);
     }
 
     #[test]

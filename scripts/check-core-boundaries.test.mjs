@@ -4662,6 +4662,33 @@ test('workspace intelligence core commit selects only the governed fence owner',
   )));
 });
 
+test('workspace intelligence core claim selects only the services claim owner', async () => {
+  const manifestPath = 'src/crates/assembly/core/Cargo.toml';
+  const manifest = await readFile(new URL(`../${manifestPath}`, import.meta.url), 'utf8');
+  const features = parseManifestFeatures(manifest);
+  const expectedReferences = ['openbitfun-services-core/workspace-intelligence-claim'];
+  assert.deepEqual(features['workspace-intelligence-claim'], expectedReferences);
+  for (const assembly of ['default', 'product-full', 'agent-runtime']) {
+    assert.ok(!features[assembly].includes('workspace-intelligence-claim'));
+  }
+  for (const slice of ['control', 'cognition', 'commit']) {
+    assert.ok(!features['workspace-intelligence-claim'].includes(`workspace-intelligence-${slice}`));
+  }
+  const rule = coreClosedFeatureProfileRules.find(
+    (candidate) => candidate.manifestPath === manifestPath
+      && candidate.featureName === 'workspace-intelligence-claim',
+  );
+  assert.equal(rule?.exact, true);
+  assert.deepEqual(rule.requiredFeatureRefs, expectedReferences);
+  const modulePath = 'src/crates/assembly/core/src/service/workspace_intelligence/mod.rs';
+  const source = await readFile(new URL(`../${modulePath}`, import.meta.url), 'utf8');
+  assert.match(source, /#\[cfg\(feature = "workspace-intelligence-claim"\)\]\s*pub\(crate\) mod claim;/);
+  const sourceRule = requiredContentRules.find((candidate) => candidate.path === modulePath);
+  assert.ok(sourceRule?.patterns.some((pattern) => pattern.regex.test(
+    '#[cfg(feature = "workspace-intelligence-claim")]\npub(crate) mod claim;',
+  )));
+});
+
 test('workspace intelligence cognition cannot acquire Tokio capabilities', () => {
   const cognitionMessages = (references) => findTokioDependencyFeatureViolations([{
     name: 'openbitfun-services-core',

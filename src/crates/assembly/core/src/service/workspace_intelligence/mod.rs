@@ -14,14 +14,13 @@
 //! compare-and-swap. The feature-gated `partition` module adds the internal
 //! cognition partition handle over the authoritative per-scope partition store.
 //!
-//! This slice is internal: it has no production caller, no bootstrap and no
-//! claim, no legacy confirmation gate, and no UI, command, registry or
-//! capability. A real enable later must pass the P2.4/P3 gate; nothing here
-//! turns workspace intelligence on, and no product feature selects
-//! `workspace-intelligence-control`.
+//! These slices are internal and have no production caller, app bootstrap,
+//! legacy confirmation gate, UI, command, registry or capability. A real enable
+//! later must pass the P2.4/P3 gate; nothing here turns workspace intelligence
+//! on, and no product feature selects `workspace-intelligence-control`.
 //!
-//! The cognition partition slice is internal in the same way: no claim, no cursor
-//! consumption and no policy. It persists only the partition root and the
+//! The `partition` slice itself adds no claim, cursor consumption or policy.
+//! It persists only the partition root and the
 //! `partition_state` shape, it is not selected by `default`, `product-full` or
 //! `agent-runtime`, and a future real narrow consumer must select
 //! `workspace-intelligence-cognition` explicitly in its own manifest.
@@ -30,6 +29,14 @@
 //! the services fence. It recovers the cognition partition of an already-enabled
 //! scope only: no bootstrap/claim, no OFF-to-ON enabling path, and no model
 //! resolution. It is not selected by `default`, `product-full` or `agent-runtime`.
+//!
+//! The gated `claim` module wraps the services owner-claim lifecycle for an
+//! already-enabled scope: one OS lease per scope, a transactional incarnation
+//! marker, and read-only tenure verification. It is NOT a WP1.4 exit and NOT a
+//! P1 exit. There is still no app bootstrap, first enable, `allow_off`, host
+//! identity source, execution-binding change detection, Shared-profile gate,
+//! pending cursor, revision/epoch, model run, background task or registry.
+//! It is not selected by `default`, `product-full` or `agent-runtime`.
 
 #![allow(dead_code)] // P0 has no production consumer yet; remove once a later phase wires it in.
 
@@ -44,3 +51,5 @@ pub(crate) mod control;
 pub(crate) mod partition;
 #[cfg(feature = "workspace-intelligence-commit")]
 pub(crate) mod commit;
+#[cfg(feature = "workspace-intelligence-claim")]
+pub(crate) mod claim;
