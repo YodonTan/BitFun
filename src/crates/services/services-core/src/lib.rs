@@ -74,6 +74,8 @@ pub mod workspace_intelligence_store;
 pub mod workspace_intelligence_claim;
 #[cfg(feature = "workspace-intelligence-commit")]
 pub mod workspace_intelligence_commit;
+#[cfg(feature = "workspace-intelligence-host-anchor")]
+pub mod workspace_intelligence_host_anchor;
 #[cfg(feature = "workspace-persistence")]
 pub mod workspace_persistence;
 #[cfg(feature = "workspace-persistence")]

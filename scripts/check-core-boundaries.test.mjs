@@ -4315,6 +4315,7 @@ test('Services Core accepts only the reviewed feature-owned Tokio runtime graph'
       'workspace-intelligence-commit': ['workspace-intelligence-store', 'workspace-intelligence-cognition'],
       'exclusive-file-lease': ['dep:fs2'],
       'workspace-intelligence-claim': ['workspace-intelligence-commit', 'exclusive-file-lease', 'dep:uuid'],
+      'workspace-intelligence-host-anchor': ['json-io', 'dep:uuid', 'dep:libc'],
       'local-storage': [
         'dep:tokio',
         'tokio/fs',
@@ -5548,3 +5549,87 @@ test('Responses WebSocket adapter uses framing over the existing Reqwest upgrade
   assert.match(messages(['exclusive-file-lease', 'dep:uuid']).join('\n'), /missing effective Tokio capabilities: fs, rt, sync, time/);
   assert.match(messages(refs, ['dep:fs2', 'tokio/rt']).join('\n'), /exclusive-file-lease Tokio capabilities require an explicit owner contract/);
  });
+
+test('workspace intelligence host anchor is an exact write-once feature over uuid and json-io', async () => {
+  const manifestPath = 'src/crates/services/services-core/Cargo.toml';
+  const manifest = await readFile(new URL('../' + manifestPath, import.meta.url), 'utf8');
+  const features = parseManifestFeatures(manifest);
+  const refs = ['json-io', 'dep:uuid', 'dep:libc'];
+
+  // The owner definition is exact: generic atomic JSON IO plus opaque v4 uuid
+  // generation and the atomic no-follow, non-blocking Unix open, with no hashing
+  // dependency, policy, runtime, process, network, or UI capability.
+  assert.deepEqual(features['workspace-intelligence-host-anchor'], refs);
+  assert.deepEqual(features.default, []);
+  assert.ok(!features.default.includes('workspace-intelligence-host-anchor'));
+
+  const rule = coreClosedFeatureProfileRules.find((candidate) =>
+    candidate.manifestPath === manifestPath
+      && candidate.featureName === 'workspace-intelligence-host-anchor');
+  assert.equal(rule?.exact, true);
+  assert.deepEqual(rule.requiredFeatureRefs, refs);
+  // json-io composes no further local feature, so no transitive local feature
+  // needs a separate allowance.
+  assert.equal(rule.allowedTransitiveFeatureRefs, undefined);
+  assert.ok(!rule.requiredFeatureRefs.includes('dep:sha2'));
+  assert.match(rule.reason, /write-once opaque storage-namespace anchor/);
+
+  const owners = optionalDependencyFeatureOwnerRules
+    .find((candidate) => candidate.crateName === 'services-core').dependencies;
+  assert.ok(owners.find((dependency) => dependency.depName === 'uuid').ownerFeatures
+    .includes('workspace-intelligence-host-anchor'));
+  // The Unix no-follow, non-blocking open is the only reason this feature owns
+  // `libc`; the owner rule must stay exact for it too.
+  assert.ok(owners.find((dependency) => dependency.depName === 'libc').ownerFeatures
+    .includes('workspace-intelligence-host-anchor'));
+  assert.ok(!owners.find((dependency) => dependency.depName === 'sha2').ownerFeatures
+    .includes('workspace-intelligence-host-anchor'));
+
+  const sourceRule = requiredContentRules.find((candidate) =>
+    candidate.path === 'src/crates/services/services-core/src/lib.rs');
+  const gate = sourceRule.patterns.find((pattern) =>
+    pattern.message === 'missing workspace-intelligence-host-anchor storage namespace source gate');
+  assert.ok(gate, 'the lib.rs source contract must require the host anchor gate');
+  assert.match(
+    '#[cfg(feature = "workspace-intelligence-host-anchor")]\npub mod workspace_intelligence_host_anchor;',
+    gate.regex,
+  );
+  const source = await readFile(
+    new URL('../src/crates/services/services-core/src/lib.rs', import.meta.url),
+    'utf8',
+  );
+  assert.match(source, gate.regex);
+  assert.ok(!gate.regex.test(
+    '#[cfg(feature = "workspace-intelligence-claim")]\npub mod workspace_intelligence_claim;',
+  ));
+});
+
+test('workspace intelligence host anchor inherits only JSON IO Tokio and no process or network', () => {
+  const messages = (refs) => findTokioDependencyFeatureViolations([{
+    name: 'openbitfun-services-core',
+    manifest_path: 'src/crates/services/services-core/Cargo.toml',
+    dependencies: [{ name: 'tokio', kind: null, optional: true, features: [] }],
+    features: {
+      'json-io': ['dep:tokio', 'tokio/fs', 'tokio/rt', 'tokio/sync', 'tokio/time'],
+      'workspace-intelligence-host-anchor': refs,
+    },
+  }]).map((violation) => violation.message)
+    .filter((message) => message.includes(':workspace-intelligence-host-anchor '));
+
+  const refs = ['json-io', 'dep:uuid', 'dep:libc'];
+  // The reviewed Tokio capability row must exist with exactly the json-io
+  // closure, so the reviewed refs stay clean and widening names the capability.
+  assert.deepEqual(messages(refs), []);
+  assert.match(
+    messages([...refs, 'tokio/process']).join('\n'),
+    /unexpected effective Tokio capabilities: process/,
+  );
+  assert.match(
+    messages([...refs, 'tokio/net']).join('\n'),
+    /unexpected effective Tokio capabilities: net/,
+  );
+  assert.match(
+    messages(['dep:uuid']).join('\n'),
+    /missing effective Tokio capabilities: fs, rt, sync, time/,
+  );
+});

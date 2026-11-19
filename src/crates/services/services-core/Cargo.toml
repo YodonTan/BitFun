@@ -178,6 +178,8 @@ workspace-intelligence-cognition = ["dep:rusqlite", "dep:sha2"]
 workspace-intelligence-commit = ["workspace-intelligence-store", "workspace-intelligence-cognition"]
 exclusive-file-lease = ["dep:fs2"]
 workspace-intelligence-claim = ["workspace-intelligence-commit", "exclusive-file-lease", "dep:uuid"]
+# The anchor read is an atomic no-follow, non-blocking open on Unix: a security property of the read, not runtime/process/network capability.
+workspace-intelligence-host-anchor = ["json-io", "dep:uuid", "dep:libc"]
 runtime-ownership = ["dep:dunce", "dep:fs2", "dep:sha2"]
 permission = [
     "dep:async-trait",

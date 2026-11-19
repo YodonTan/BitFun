@@ -135,6 +135,10 @@ export const requiredContentRules = [
         regex: /#\[cfg\(feature = "workspace-intelligence-claim"\)\]\s*pub mod workspace_intelligence_claim;/,
         message: 'missing workspace-intelligence-claim lifecycle source gate',
       },
+      {
+        regex: /#\[cfg\(feature = "workspace-intelligence-host-anchor"\)\]\s*pub mod workspace_intelligence_host_anchor;/,
+        message: 'missing workspace-intelligence-host-anchor storage namespace source gate',
+      },
     ],
   },
   // P1 core slice: WP1.1 core assembly, WP1.2a control-vs-control, WP1.3 cognition.

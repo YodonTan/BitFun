@@ -182,6 +182,8 @@ const SERVICES_CORE_TOKIO_FEATURES = new Map([
   // Governed commits inherit exactly the json-io closure through the control store.
   ['workspace-intelligence-commit', ['fs', 'rt', 'sync', 'time']],
   ['workspace-intelligence-claim', ['fs', 'rt', 'sync', 'time']],
+  // The host anchor inherits the json-io closure and carries no network or process capability.
+  ['workspace-intelligence-host-anchor', ['fs', 'rt', 'sync', 'time']],
   ['routing-state', ['fs', 'rt', 'sync', 'time']],
   ['resource-capacity', ['fs', 'rt', 'sync', 'time']],
   ['local-storage', ['fs', 'rt', 'sync', 'time']],

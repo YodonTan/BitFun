@@ -46,7 +46,7 @@ export const optionalDependencyFeatureOwnerRules = [
     dependencies: [
       { depName: 'image', ownerFeatures: ['pet-packages', 'workspace-icons'] },
       { depName: 'zip', ownerFeatures: ['pet-packages'] },
-      { depName: 'uuid', ownerFeatures: ['pet-packages', 'resource-capacity', 'workspace-icons', 'workspace-intelligence-claim'] },
+      { depName: 'uuid', ownerFeatures: ['pet-packages', 'resource-capacity', 'workspace-icons', 'workspace-intelligence-claim', 'workspace-intelligence-host-anchor'] },
       { depName: 'aes-gcm', ownerFeatures: ['credential-vault'] },
       { depName: 'anyhow', ownerFeatures: ['credential-vault', 'dispatch-workspace', 'workspace-runtime', 'workspace-transfer', 'session-recovery'] },
       { depName: 'async-trait', ownerFeatures: ['permission', 'workspace-runtime'] },
@@ -64,7 +64,7 @@ export const optionalDependencyFeatureOwnerRules = [
       { depName: 'git2', ownerFeatures: ['session-git'] },
       { depName: 'globset', ownerFeatures: ['workspace-instructions'] },
       { depName: 'ignore', ownerFeatures: ['filesystem'] },
-      { depName: 'libc', ownerFeatures: ['credential-vault', 'local-storage', 'process-runtime'] },
+      { depName: 'libc', ownerFeatures: ['credential-vault', 'local-storage', 'process-runtime', 'workspace-intelligence-host-anchor'] },
       { depName: 'rand', ownerFeatures: ['credential-vault'] },
       {
         depName: 'regex',
@@ -1739,6 +1739,14 @@ export const coreClosedFeatureProfileRules = [
     allowedTransitiveFeatureRefs: ['workspace-intelligence-store', 'workspace-intelligence-cognition', 'json-io'],
     exact: true,
     reason: 'services-core workspace-intelligence-claim adds only lease tenure and transactional incarnation evidence for already-enabled scopes',
+  },
+  {
+    manifestPath: 'src/crates/services/services-core/Cargo.toml',
+    featureName: 'workspace-intelligence-host-anchor',
+    requiredFeatureRefs: ['json-io', 'dep:uuid', 'dep:libc'],
+    exact: true,
+    reason:
+      'services-core workspace-intelligence-host-anchor owns only a write-once opaque storage-namespace anchor; its Unix read is an atomic no-follow, non-blocking open, which is a security property of the read itself, and it still carries no policy, runtime, process, network, or UI capability',
   },
   // P1 cognition partition root: WP1.3 per-scope cognition partition state.
   {
