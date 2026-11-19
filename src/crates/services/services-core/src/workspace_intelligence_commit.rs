@@ -65,6 +65,14 @@ use crate::workspace_intelligence_store::{
     WorkspaceIntelligenceStoreError,
 };
 use std::path::{Path, PathBuf};
+#[cfg(feature = "workspace-intelligence-claim")]
+use crate::workspace_intelligence_claim::ClaimLeaseBinding;
+#[cfg(feature = "workspace-intelligence-claim")]
+use crate::workspace_intelligence_cognition::{scope_digest, IncarnationAdvance};
+#[cfg(all(test, feature = "workspace-intelligence-claim"))]
+use std::sync::Arc;
+#[cfg(all(test, feature = "workspace-intelligence-claim"))]
+use crate::exclusive_file_lease::ExclusiveFileLease;
 
 /// A closed owner-commit gate; construction performs no IO.
 #[derive(Debug, Clone)]
@@ -73,11 +81,13 @@ pub struct WorkspaceIntelligenceCommitGate {
     control_root: PathBuf,
     cognition_root: PathBuf,
     #[cfg(test)]
-    after_precheck: Option<TestPause>,
+    pub(crate) after_precheck: Option<TestPause>,
     #[cfg(test)]
-    after_fresh: Option<TestPause>,
+    pub(crate) after_fresh: Option<TestPause>,
     #[cfg(test)]
-    inside_owner: Option<TestPause>,
+    pub(crate) inside_owner: Option<TestPause>,
+    #[cfg(all(test, feature = "workspace-intelligence-claim"))]
+    pub(crate) inside_verification: Option<TestPause>,
 }
 
 /// Request-scoped observation, minted only by `observe`, never persisted or cached.
@@ -175,6 +185,8 @@ impl WorkspaceIntelligenceCommitGate {
             after_fresh: None,
             #[cfg(test)]
             inside_owner: None,
+            #[cfg(all(test, feature = "workspace-intelligence-claim"))]
+            inside_verification: None,
         }
     }
 
@@ -193,41 +205,43 @@ impl WorkspaceIntelligenceCommitGate {
         }))
     }
 
+    fn binding_refusal(&self, snapshot: &GovernedCommitSnapshot) -> Option<GovernedCommitRefusal> {
+        if snapshot.control_root.as_os_str() != self.control_root.as_os_str()
+            || snapshot.cognition_root.as_os_str() != self.cognition_root.as_os_str()
+        { Some(GovernedCommitRefusal::ForeignSnapshot) } else { None }
+    }
+
+    fn projection_refusal(
+        record: Option<WorkspaceIntelligenceControlRecord>, snapshot: &GovernedCommitSnapshot,
+    ) -> Result<GovernedCommitAuthority, GovernedCommitRefusal> {
+        let record = record.ok_or(GovernedCommitRefusal::NotObserved)?;
+        let projection = GovernedCommitAuthority::project(record);
+        if projection != *snapshot.authority() { return Err(GovernedCommitRefusal::AuthorityChanged); }
+        if projection.enabled != Some(true) { return Err(GovernedCommitRefusal::NotEnabled); }
+        Ok(projection)
+    }
+
     pub async fn commit(
         &self, snapshot: &GovernedCommitSnapshot, intent: GovernedCommitIntent,
     ) -> Result<GovernedCommitOutcome, WorkspaceIntelligenceCommitError> {
-        if snapshot.control_root.as_os_str() != self.control_root.as_os_str()
-            || snapshot.cognition_root.as_os_str() != self.cognition_root.as_os_str()
-        {
-            return Ok(GovernedCommitOutcome::Refused(GovernedCommitRefusal::ForeignSnapshot));
+        if let Some(refusal) = self.binding_refusal(snapshot) {
+            return Ok(GovernedCommitOutcome::Refused(refusal));
         }
         match intent { GovernedCommitIntent::RecoverEnabledCognitionPartition => {} }
 
         // Reject only: never license an owner commit from this lock-free read.
-        let Some(record) = self.control.read(&snapshot.scope).await? else {
-            return Ok(GovernedCommitOutcome::Refused(GovernedCommitRefusal::NotObserved));
+        let _projection = match Self::projection_refusal(self.control.read(&snapshot.scope).await?, snapshot) {
+            Ok(projection) => projection,
+            Err(refusal) => return Ok(GovernedCommitOutcome::Refused(refusal)),
         };
-        let projection = GovernedCommitAuthority::project(record);
-        if projection != *snapshot.authority() {
-            return Ok(GovernedCommitOutcome::Refused(GovernedCommitRefusal::AuthorityChanged));
-        }
-        if projection.enabled != Some(true) {
-            return Ok(GovernedCommitOutcome::Refused(GovernedCommitRefusal::NotEnabled));
-        }
         #[cfg(test)]
         if let Some(pause) = &self.after_precheck { Self::wait_async(pause).await; }
 
         let (guard, fresh) = self.control.lock_and_read_authority(&snapshot.scope).await?;
-        let Some(record) = fresh else {
-            return Ok(GovernedCommitOutcome::Refused(GovernedCommitRefusal::NotObserved));
+        let projection = match Self::projection_refusal(fresh, snapshot) {
+            Ok(projection) => projection,
+            Err(refusal) => return Ok(GovernedCommitOutcome::Refused(refusal)),
         };
-        let projection = GovernedCommitAuthority::project(record);
-        if projection != *snapshot.authority() {
-            return Ok(GovernedCommitOutcome::Refused(GovernedCommitRefusal::AuthorityChanged));
-        }
-        if projection.enabled != Some(true) {
-            return Ok(GovernedCommitOutcome::Refused(GovernedCommitRefusal::NotEnabled));
-        }
         // Production has no extra cancellation point here. Only tests insert one
         // to inspect destruction of the local guard before the owner hand-off.
         #[cfg(test)]
@@ -251,7 +265,7 @@ impl WorkspaceIntelligenceCommitGate {
 }
 
 #[cfg(test)]
-type TestPause = (
+pub(crate) type TestPause = (
     tokio::sync::mpsc::UnboundedSender<()>,
     std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
 );
@@ -329,10 +343,18 @@ mod tests {
             other => panic!("expected committed: {other:?}"),
         }
     }
-    fn pause() -> (TestPause, tokio::sync::mpsc::UnboundedReceiver<()>, std::sync::mpsc::Sender<()>) {
+    struct ReleasePause(std::sync::mpsc::Sender<()>);
+    impl ReleasePause {
+        fn send(&self, value: ()) -> Result<(), std::sync::mpsc::SendError<()>> { self.0.send(value) }
+    }
+    impl Drop for ReleasePause {
+        fn drop(&mut self) { let _ = self.0.send(()); }
+    }
+
+    fn pause() -> (TestPause, tokio::sync::mpsc::UnboundedReceiver<()>, ReleasePause) {
         let (entered, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (release, wait) = std::sync::mpsc::channel();
-        ((entered, std::sync::Arc::new(std::sync::Mutex::new(wait))), receiver, release)
+        ((entered, std::sync::Arc::new(std::sync::Mutex::new(wait))), receiver, ReleasePause(release))
     }
     async fn entered(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<()>) {
         tokio::time::timeout(DEADLINE, receiver.recv()).await.unwrap().unwrap();
@@ -853,6 +875,149 @@ mod tests {
         send_sync_value(gate.commit(&snapshot, GovernedCommitIntent::RecoverEnabledCognitionPartition));
     }
 
+    #[cfg(feature = "workspace-intelligence-claim")]
+    fn lease(gate: &WorkspaceIntelligenceCommitGate, scope: &str) -> ClaimLeaseBinding {
+        let path = path(&gate.control_root().join("leases"), scope, "lock");
+        ClaimLeaseBinding::bind(Arc::new(ExclusiveFileLease::try_acquire(&path).unwrap()),
+            gate.control_root.clone(), gate.cognition_root.clone(), scope.into(), path)
+    }
+    #[cfg(feature = "workspace-intelligence-claim")]
+    fn claim_refused(outcome: GovernedFenceOutcome, expected: GovernedClaimRefusal) {
+        assert!(matches!(outcome, GovernedFenceOutcome::Refused(reason) if reason == expected), "{outcome:?}");
+    }
+    #[cfg(feature = "workspace-intelligence-claim")]
+    #[tokio::test]
+    async fn commit_governed_advances_only_an_enabled_scope_and_reports_typed_refusals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = gate(tmp.path());
+        seed(&gate, SCOPE, true).await;
+        let snapshot = gate.observe(SCOPE).await.unwrap().unwrap();
+        let held = lease(&gate, SCOPE);
+        let other = lease(&gate, "other");
+        claim_refused(gate.commit_governed(&snapshot, GovernedFenceOperation::AdvanceIncarnation, &other).await.unwrap(), GovernedClaimRefusal::ForeignBinding);
+        let foreign = self::gate(&tmp.path().join("foreign"));
+        claim_refused(foreign.commit_governed(&snapshot, GovernedFenceOperation::AdvanceIncarnation, &held).await.unwrap(), GovernedClaimRefusal::ForeignSnapshot);
+        close(&gate, SCOPE).await;
+        claim_refused(gate.commit_governed(&snapshot, GovernedFenceOperation::AdvanceIncarnation, &held).await.unwrap(), GovernedClaimRefusal::AuthorityChanged);
+        let disabled = gate.observe(SCOPE).await.unwrap().unwrap();
+        claim_refused(gate.commit_governed(&disabled, GovernedFenceOperation::AdvanceIncarnation, &held).await.unwrap(), GovernedClaimRefusal::NotEnabled);
+        std::fs::remove_file(path(gate.control_root(), SCOPE, "json")).unwrap();
+        claim_refused(gate.commit_governed(&snapshot, GovernedFenceOperation::AdvanceIncarnation, &held).await.unwrap(), GovernedClaimRefusal::NotObserved);
+        assert!(!gate.cognition_root().exists());
+    }
+    #[cfg(feature = "workspace-intelligence-claim")]
+    #[tokio::test]
+    async fn commit_governed_holds_guard_and_lease_through_commit_and_after_caller_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gate = gate(tmp.path());
+        seed(&gate, SCOPE, true).await;
+        let snapshot = gate.observe(SCOPE).await.unwrap().unwrap();
+        let held = lease(&gate, SCOPE);
+        let lease_path = held.lease_path().to_path_buf();
+        let (hook, mut receiver, release) = pause();
+        gate.inside_owner = Some(hook);
+        let cloned = gate.clone();
+        let task = tokio::spawn(async move { cloned.commit_governed(&snapshot, GovernedFenceOperation::AdvanceIncarnation, &held).await });
+        entered(&mut receiver).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let probe = std::fs::OpenOptions::new().read(true).write(true).open(&lease_path).unwrap();
+        let error = fs2::FileExt::try_lock_exclusive(&probe).unwrap_err();
+        assert_eq!(error.raw_os_error(), fs2::lock_contended_error().raw_os_error());
+        drop(probe);
+        release.send(()).unwrap();
+        tokio::time::timeout(DEADLINE, close(&gate, SCOPE)).await.unwrap();
+        let state = WorkspaceIntelligenceCognitionStore::new(gate.cognition_root.clone()).read(SCOPE).unwrap().unwrap();
+        assert!(state.incarnation_token.is_some());
+        let probe = std::fs::OpenOptions::new().read(true).write(true).open(&lease_path).unwrap();
+        // The close completion proves the closure dropped the control guard;
+        // both owned locks are destroyed before that blocking closure returns.
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&probe) {
+                Ok(()) => break,
+                Err(error) => { assert_eq!(error.raw_os_error(), fs2::lock_contended_error().raw_os_error()); assert!(Instant::now() < deadline); tokio::task::yield_now().await; }
+            }
+        }
+    }
+    #[cfg(feature = "workspace-intelligence-claim")]
+    #[tokio::test]
+    async fn commit_governed_verify_is_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = gate(tmp.path());
+        seed(&gate, SCOPE, true).await;
+        let snapshot = gate.observe(SCOPE).await.unwrap().unwrap();
+        let held = lease(&gate, SCOPE);
+        let outcome = gate.commit_governed(&snapshot, GovernedFenceOperation::AdvanceIncarnation, &held).await.unwrap();
+        let GovernedFenceOutcome::Advanced(advance) = outcome else { panic!("{outcome:?}") };
+        let db = path(gate.cognition_root(), SCOPE, "sqlite");
+        let bytes = std::fs::read(&db).unwrap();
+        let outcome = gate.commit_governed(&snapshot, GovernedFenceOperation::VerifyIncarnation { expected: advance.token.clone(), origin: advance.token }, &held).await.unwrap();
+        let GovernedFenceOutcome::Verified { control_generation } = outcome else { panic!("{outcome:?}") };
+        assert_eq!(control_generation, 1);
+        assert_eq!(std::fs::read(&db).unwrap(), bytes);
+    }
+
+
+    /// The former bare-Arc gate accepted any matching file name, even when the
+    /// lease was acquired for another root pairing. The sealed tuple closes that
+    /// hole; caller-selected lease-root location alone is not gate authority.
+    #[cfg(feature = "workspace-intelligence-claim")]
+    #[tokio::test]
+    async fn foreign_root_pairing_with_the_same_file_name_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = gate(tmp.path());
+        seed(&gate, SCOPE, true).await;
+        let snapshot = gate.observe(SCOPE).await.unwrap().unwrap();
+        let before = control_bytes(&gate);
+        for field in 0..3 {
+            let scope = if field == 2 { "another-scope" } else { SCOPE };
+            let lease_path = path(&tmp.path().join(format!("foreign-leases-{field}")), scope, "lock");
+            let lease = Arc::new(ExclusiveFileLease::try_acquire(&lease_path).unwrap());
+            let control_root = if field == 0 { tmp.path().join("foreign-control") } else { gate.control_root.clone() };
+            let cognition_root = if field == 1 { tmp.path().join("foreign-cognition") } else { gate.cognition_root.clone() };
+            if field != 2 { assert_eq!(lease_path.file_name(), path(&tmp.path().join("leases"), SCOPE, "lock").file_name()); }
+            let binding = ClaimLeaseBinding::bind(lease, control_root, cognition_root, scope.into(), lease_path);
+            claim_refused(gate.commit_governed(&snapshot, GovernedFenceOperation::AdvanceIncarnation, &binding).await.unwrap(), GovernedClaimRefusal::ForeignBinding);
+            assert_eq!(control_bytes(&gate), before);
+            assert!(!gate.cognition_root().exists());
+        }
+    }
+
+    #[cfg(feature = "workspace-intelligence-claim")]
+    #[tokio::test]
+    async fn binding_declaring_another_path_than_the_held_lease_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = gate(tmp.path());
+        seed(&gate, SCOPE, true).await;
+        let snapshot = gate.observe(SCOPE).await.unwrap().unwrap();
+        let actual = path(&tmp.path().join("actual"), SCOPE, "lock");
+        let declared = path(&tmp.path().join("declared"), SCOPE, "lock");
+        let binding = ClaimLeaseBinding::bind(Arc::new(ExclusiveFileLease::try_acquire(&actual).unwrap()),
+            gate.control_root.clone(), gate.cognition_root.clone(), SCOPE.into(), declared);
+        claim_refused(gate.commit_governed(&snapshot, GovernedFenceOperation::AdvanceIncarnation, &binding).await.unwrap(), GovernedClaimRefusal::ForeignBinding);
+        assert!(!gate.cognition_root().exists());
+    }
+
+    #[cfg(feature = "workspace-intelligence-claim")]
+    #[tokio::test]
+    async fn same_full_pairing_is_reusable_across_handles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = gate(tmp.path());
+        seed(&gate, SCOPE, true).await;
+        let snapshot = gate.observe(SCOPE).await.unwrap().unwrap();
+        let binding = lease(&gate, SCOPE);
+        let second = ClaimLeaseBinding::bind(binding.lease(), binding.control_root().to_path_buf(),
+            binding.cognition_root().to_path_buf(), binding.scope().into(), binding.lease_path().to_path_buf());
+        let other_handle = WorkspaceIntelligenceCommitGate::new(gate.control.clone(), gate.cognition_root.clone());
+        let first = gate.commit_governed(&snapshot, GovernedFenceOperation::AdvanceIncarnation, &binding).await.unwrap();
+        let GovernedFenceOutcome::Advanced(first) = first else { panic!("{first:?}") };
+        let next = other_handle.commit_governed(&snapshot, GovernedFenceOperation::AdvanceIncarnation, &second).await.unwrap();
+        let GovernedFenceOutcome::Advanced(next) = next else { panic!("{next:?}") };
+        assert_eq!(next.previous_token.as_deref(), Some(first.token.as_str()));
+        assert_ne!(next.token, first.token);
+    }
+
     const CHILD_DIR: &str = "OPENBITFUN_WI_COMMIT_CHILD_DIR";
     const CHILD_ROLE: &str = "OPENBITFUN_WI_COMMIT_CHILD_ROLE";
 
@@ -962,5 +1127,124 @@ mod tests {
             "closed 2"
         };
         JsonFileStore.write_text_atomic_strict(&root.join(format!("{role}.outcome")), outcome).await.unwrap();
+    }
+}
+
+#[cfg(feature = "workspace-intelligence-claim")]
+#[derive(Debug)]
+pub(crate) enum GovernedFenceOperation {
+    AdvanceIncarnation,
+    VerifyIncarnation { expected: String, origin: String },
+}
+
+#[cfg(feature = "workspace-intelligence-claim")]
+#[derive(Debug)]
+pub(crate) enum GovernedFenceOutcome {
+    Advanced(IncarnationAdvance),
+    Verified { control_generation: u64 },
+    Refused(GovernedClaimRefusal),
+}
+
+#[cfg(feature = "workspace-intelligence-claim")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernedClaimRefusal {
+    ForeignSnapshot, ForeignBinding, NotObserved, NotEnabled, AuthorityChanged, StaleIncarnation,
+}
+
+#[cfg(feature = "workspace-intelligence-claim")]
+impl GovernedClaimRefusal {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::ForeignSnapshot => "foreign_snapshot",
+            Self::ForeignBinding => "foreign_binding",
+            Self::NotObserved => "not_observed",
+            Self::NotEnabled => "not_enabled",
+            Self::AuthorityChanged => "authority_changed",
+            Self::StaleIncarnation => "stale_incarnation",
+        }
+    }
+}
+
+#[cfg(feature = "workspace-intelligence-claim")]
+impl From<GovernedCommitRefusal> for GovernedClaimRefusal {
+    fn from(refusal: GovernedCommitRefusal) -> Self {
+        match refusal {
+            GovernedCommitRefusal::ForeignSnapshot => Self::ForeignSnapshot,
+            GovernedCommitRefusal::NotObserved => Self::NotObserved,
+            GovernedCommitRefusal::AuthorityChanged => Self::AuthorityChanged,
+            GovernedCommitRefusal::NotEnabled => Self::NotEnabled,
+        }
+    }
+}
+
+#[cfg(feature = "workspace-intelligence-claim")]
+impl WorkspaceIntelligenceCommitGate {
+    /// Guard acquisition and the fresh read are awaits. From the final fresh
+    /// read returning to hand-off there is no await. The blocking closure owns
+    /// both the guard and its own lease Arc. Advancement is covered through
+    /// COMMIT/rollback; verification is read-only and always rolls back on drop.
+    /// The binding is immutable, with private fields and no interior mutability,
+    /// so checks before the control lock cannot be invalidated before hand-off.
+    /// Caller cancellation after hand-off loses only the result, not either lock.
+    pub(crate) async fn commit_governed(
+        &self, snapshot: &GovernedCommitSnapshot, op: GovernedFenceOperation,
+        hold: &ClaimLeaseBinding,
+    ) -> Result<GovernedFenceOutcome, WorkspaceIntelligenceCommitError> {
+        use GovernedFenceOutcome::Refused;
+        if let Some(refusal) = self.binding_refusal(snapshot) { return Ok(Refused(refusal.into())); }
+        if hold.control_root().as_os_str() != self.control_root.as_os_str() {
+            return Ok(Refused(GovernedClaimRefusal::ForeignBinding));
+        }
+        if hold.cognition_root().as_os_str() != self.cognition_root.as_os_str() {
+            return Ok(Refused(GovernedClaimRefusal::ForeignBinding));
+        }
+        if hold.scope() != snapshot.scope {
+            return Ok(Refused(GovernedClaimRefusal::ForeignBinding));
+        }
+        let name = format!("{}.lock", scope_digest(&snapshot.scope)?);
+        if hold.lease_path().file_name() != Some(std::ffi::OsStr::new(&name)) {
+            return Ok(Refused(GovernedClaimRefusal::ForeignBinding));
+        }
+        if hold.lease().lock_path().as_os_str() != hold.lease_path().as_os_str() {
+            return Ok(Refused(GovernedClaimRefusal::ForeignBinding));
+        }
+        if let Err(refusal) = Self::projection_refusal(self.control.read(&snapshot.scope).await?, snapshot) {
+            return Ok(Refused(refusal.into()));
+        }
+        #[cfg(test)]
+        if let Some(pause) = &self.after_precheck { Self::wait_async(pause).await; }
+        let (guard, fresh) = self.control.lock_and_read_authority(&snapshot.scope).await?;
+        let projection = match Self::projection_refusal(fresh, snapshot) {
+            Ok(projection) => projection,
+            Err(refusal) => return Ok(Refused(refusal.into())),
+        };
+        #[cfg(test)]
+        if let Some(pause) = &self.after_fresh { Self::wait_async(pause).await; }
+        let scope = snapshot.scope.clone();
+        let store = WorkspaceIntelligenceCognitionStore::new(self.cognition_root.clone());
+        #[cfg(test)]
+        let store = { let mut store = store; store.verify_pause = self.inside_verification.clone(); store };
+        let control_generation = projection.control_generation;
+        #[cfg(test)]
+        let pause = self.inside_owner.clone();
+        let lease = hold.lease();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let _lease = lease;
+            #[cfg(test)]
+            if let Some(pause) = pause { Self::wait_blocking(&pause); }
+            match op {
+                GovernedFenceOperation::AdvanceIncarnation => store.advance_incarnation(&scope)
+                    .map(GovernedFenceOutcome::Advanced),
+                GovernedFenceOperation::VerifyIncarnation { expected, origin } =>
+                    store.verify_incarnation(&scope, &expected, &origin)
+                        .map(|_| GovernedFenceOutcome::Verified { control_generation }),
+            }
+        }).await.map_err(WorkspaceIntelligenceCommitError::OwnerTask)?;
+        match outcome {
+            Err(WorkspaceIntelligenceCognitionError::StaleIncarnation { .. }) => Ok(Refused(GovernedClaimRefusal::StaleIncarnation)),
+            Err(error) => Err(error.into()),
+            Ok(outcome) => Ok(outcome),
+        }
     }
 }

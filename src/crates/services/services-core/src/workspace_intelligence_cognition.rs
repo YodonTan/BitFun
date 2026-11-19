@@ -1,11 +1,11 @@
 //! Durable cognition partition store for Workspace Intelligence P1.
 //!
 //! This module owns one SQLite database per **opaque scope**. Each database
-//! holds a single `partition_state` row whose `cursor` and `incarnation_token`
-//! are shape-only: this module never interprets, advances, assigns or checks
-//! governance meaning for either value. Incarnation advancement (WP1.4) and
-//! cursor/gap consumption (WP1.5) are owned elsewhere and are out of scope
-//! here. The governed commit gate is the narrow runtime caller of this seam.
+//! holds a single `partition_state` row. The plain cognition / bootstrap contract,
+//! without `workspace-intelligence-claim`, initializes and reads partitions with
+//! shape-only `cursor` and `incarnation_token` values; it does not advance or
+//! interpret either value. Cursor/gap consumption (WP1.5) remains out of scope.
+//! The governed commit gate is the narrow runtime caller of this seam.
 //!
 //! # Layout and scope opacity
 //!
@@ -30,11 +30,35 @@
 //! it is not proof of an accepted close, reset or delete, and it says nothing
 //! about a file another process is about to publish.
 //!
-//! [`WorkspaceIntelligenceCognitionStore::initialize`] is the only writer. It
-//! creates the schema only for a database that is version `0` and holds no user
-//! objects, and it never adopts, repairs, resets or deletes a database it did
-//! not create. An initialized database is returned as
+//! [`WorkspaceIntelligenceCognitionStore::initialize`] is the only writer in the
+//! plain cognition / bootstrap contract, without `workspace-intelligence-claim`.
+//! It creates the schema only for a database that is version `0` and holds no
+//! user objects, and it never adopts, repairs, resets or deletes a database it
+//! did not create. An initialized database is returned as
 //! [`CognitionInitialization::Existing`] without writing any user field.
+//! `initialize` remains a public low-level primitive, not an authorization path.
+//!
+//! Only under `workspace-intelligence-claim`, two `pub(crate)` operations extend
+//! this seam. `advance_incarnation` is the claim-gated surface's only real
+//! mutation: one IMMEDIATE transaction creates or validates the v1 partition,
+//! generates the tenure marker inside that transaction and writes
+//! `incarnation_token`. `verify_incarnation` is read-only, never creates a root,
+//! database, table or row, and refuses on any disagreement between the stored,
+//! live-claim and request markers. Both use the same v1 shape and `user_version`
+//! contract; `cursor` and extra columns/tables remain unchanged. This is not an
+//! enabling path, a WP1.4 exit or a P1 exit.
+//!
+//! An empty v0 database (no user objects) is a valid starting point that
+//! `advance_incarnation` initializes as v1. A v0 database carrying user objects
+//! returns `UnrecognizedDatabase` on advancement and is never adopted, repaired
+//! or reset. `verify_incarnation` returns `UninitializedDatabase` for any v0
+//! database without writing.
+//!
+//! The stored incarnation value is an opaque tenure marker, returned verbatim,
+//! never trimmed or parsed; it is not a secret, authorization or grant. Token
+//! generation promises only `new != immediate previous`. Historical ABA
+//! resistance rests on UUID v4 collision resistance, with residual collision
+//! risk.
 //!
 //! # Schema v1
 //!
@@ -74,8 +98,10 @@
 //!
 //! This module is synchronous on purpose: no `tokio`, no async signature and no
 //! runtime handle. The commit gate calls `initialize` through `spawn_blocking`
-//! while holding the control guard. The API stays synchronous and gains no
-//! cursor/token write path.
+//! while holding the control guard. The plain cognition / bootstrap API gains no
+//! cursor/token write path. The claim-gated operations also run synchronously
+//! through the governed fence's blocking hand-off, under its control guard and
+//! held lease; only `advance_incarnation` writes the tenure marker.
 
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OpenFlags, Transaction, TransactionBehavior};
@@ -239,6 +265,10 @@ pub enum WorkspaceIntelligenceCognitionError {
     #[error("Cognition partition record {path} is not a readable SQLite database: {detail}")]
     CorruptDatabase { path: PathBuf, detail: String },
 
+    #[cfg(feature = "workspace-intelligence-claim")]
+    #[error("Cognition partition record {path} has a stale incarnation")]
+    StaleIncarnation { path: PathBuf },
+
     #[error("Cognition partition record storage failed: {0}")]
     Storage(#[from] rusqlite::Error),
 
@@ -259,6 +289,8 @@ impl WorkspaceIntelligenceCognitionError {
             Self::MissingPartitionRow { .. } => "missing_partition_row",
             Self::PartitionScopeMismatch { .. } => "partition_scope_mismatch",
             Self::CorruptDatabase { .. } => "corrupt_database",
+            #[cfg(feature = "workspace-intelligence-claim")]
+            Self::StaleIncarnation { .. } => "stale_incarnation",
             Self::Storage(_) => "sqlite_storage",
             Self::Io(_) => "io",
         }
@@ -330,6 +362,125 @@ impl CognitionInitialization {
     }
 }
 
+/// Result of advancement called only by the governed fence under a live lease;
+/// this is not a general-purpose writer or a constructible public token result.
+#[cfg(feature = "workspace-intelligence-claim")]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct IncarnationAdvance {
+    /// Stored token before this advance, verbatim, including arbitrary legacy text.
+    pub(crate) previous_token: Option<String>,
+    /// Newly generated tenure marker, not an authorization or secret.
+    pub(crate) token: String,
+}
+
+#[cfg(feature = "workspace-intelligence-claim")]
+impl std::fmt::Debug for IncarnationAdvance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IncarnationAdvance")
+            .field("previous_token", &self.previous_token.as_ref().map(|_| "<redacted>"))
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(feature = "workspace-intelligence-claim")]
+impl WorkspaceIntelligenceCognitionStore {
+    /// Advance only incarnation_token in one IMMEDIATE transaction through COMMIT.
+    /// Precondition: called only by the governed fence under a live lease, never
+    /// as a general-purpose writer.
+    pub(crate) fn advance_incarnation(
+        &self, scope: &str,
+    ) -> Result<IncarnationAdvance, WorkspaceIntelligenceCognitionError> {
+        let key = scope_digest(scope)?;
+        let path = self.record_path(&key);
+        let mut connection = match self.open_existing_record(&path, WRITE_FLAGS)? {
+            Some(connection) => connection,
+            None => self.create_and_open_record(&path)?,
+        };
+        connection.busy_timeout(BUSY_TIMEOUT).map_err(|e| sqlite_error(&path, e))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| sqlite_error(&path, e))?;
+        match schema_version(&transaction, &path)? {
+            1 => { observe_v1_partition(&transaction, &path, &key)?; }
+            0 => {
+                if user_object_count(&transaction, &path)? > 0 {
+                    return Err(WorkspaceIntelligenceCognitionError::UnrecognizedDatabase { path });
+                }
+                self.create_v1_partition(&transaction, &path, &key)?;
+            }
+            observed => return Err(WorkspaceIntelligenceCognitionError::UnsupportedSchemaVersion { path, observed }),
+        }
+        let previous_token = read_incarnation(&transaction, &path)?;
+        let mut token = uuid::Uuid::new_v4().to_string();
+        while previous_token.as_deref() == Some(token.as_str()) {
+            token = uuid::Uuid::new_v4().to_string();
+        }
+        transaction.execute(
+            "UPDATE partition_state SET incarnation_token = ?1 WHERE state_id = 1",
+            params![token],
+        ).map_err(|e| sqlite_error(&path, e))?;
+        transaction.commit().map_err(|e| sqlite_error(&path, e))?;
+        Ok(IncarnationAdvance { previous_token, token })
+    }
+
+    /// Verification with no data writes in ONE IMMEDIATE transaction, acquiring
+    /// SQLite's reserved writer lock (not a read-only connection). Compare stored/live
+    /// first, request/live second, exactly (no trim, parsing or case folding),
+    /// then validate shape. Never create any root, record, table or row.
+    /// The transaction is dropped and rolled back on return, never committed.
+    ///
+    /// A store call that returns has already ended its transaction: an
+    /// after-return comparison cannot be in-transaction. Passing both expected
+    /// markers into this typed operation is the callback-free way to keep the
+    /// provenance comparison in the same IMMEDIATE transaction as the
+    /// authoritative stored/live comparison. This strengthens the draft
+    /// single-marker contract rather than weakening it.
+    pub(crate) fn verify_incarnation(
+        &self, scope: &str, live_token: &str, request_token: &str,
+    ) -> Result<CognitionInitialization, WorkspaceIntelligenceCognitionError> {
+        let key = scope_digest(scope)?;
+        let path = self.record_path(&key);
+        let Some(mut connection) = self.open_existing_record(&path, WRITE_FLAGS)? else {
+            return Err(WorkspaceIntelligenceCognitionError::StaleIncarnation { path });
+        };
+        connection.busy_timeout(BUSY_TIMEOUT).map_err(|e| sqlite_error(&path, e))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| sqlite_error(&path, e))?;
+        match schema_version(&transaction, &path)? {
+            1 => {}
+            0 => return Err(WorkspaceIntelligenceCognitionError::UninitializedDatabase { path }),
+            observed => return Err(WorkspaceIntelligenceCognitionError::UnsupportedSchemaVersion { path, observed }),
+        }
+        #[cfg(test)]
+        if let Some(pause) = &self.verify_pause {
+            pause.0.send(()).unwrap();
+            let _ = pause.1.lock().unwrap().recv();
+        }
+        let stored = read_incarnation(&transaction, &path)?;
+        if stored.as_deref() != Some(live_token) {
+            return Err(WorkspaceIntelligenceCognitionError::StaleIncarnation { path });
+        }
+        if request_token != live_token {
+            return Err(WorkspaceIntelligenceCognitionError::StaleIncarnation { path });
+        }
+        let state = observe_v1_partition(&transaction, &path, &key)?;
+        drop(transaction);
+        Ok(CognitionInitialization::Existing(state))
+    }
+}
+
+#[cfg(feature = "workspace-intelligence-claim")]
+fn read_incarnation(connection: &Connection, path: &Path) -> Result<Option<String>, WorkspaceIntelligenceCognitionError> {
+    // The same strict nullable-text rule used by the shape-only reader.
+    let mut statement = connection.prepare(
+        "SELECT incarnation_token FROM partition_state WHERE state_id = 1"
+    ).map_err(|e| sqlite_error(path, e))?;
+    let mut rows = statement.query([]).map_err(|e| sqlite_error(path, e))?;
+    let row = rows.next().map_err(|e| sqlite_error(path, e))?
+        .ok_or_else(|| WorkspaceIntelligenceCognitionError::MissingPartitionRow { path: path.to_path_buf() })?;
+    read_optional_text(row, 0, path, PartitionShapeFault::IncarnationTokenNotText)
+}
+
 /// Durable cognition partition store over a host-injected, host-local root.
 ///
 /// Each opaque scope maps to one SQLite database directly inside `root`.
@@ -338,6 +489,8 @@ pub struct WorkspaceIntelligenceCognitionStore {
     root: PathBuf,
     #[cfg(test)]
     inject_initialize_failure: bool,
+    #[cfg(all(test, feature = "workspace-intelligence-claim"))]
+    pub(crate) verify_pause: Option<crate::workspace_intelligence_commit::TestPause>,
 }
 
 impl WorkspaceIntelligenceCognitionStore {
@@ -358,6 +511,8 @@ impl WorkspaceIntelligenceCognitionStore {
         Self {
             root,
             inject_initialize_failure: false,
+            #[cfg(feature = "workspace-intelligence-claim")]
+            verify_pause: None,
         }
     }
 
@@ -370,6 +525,8 @@ impl WorkspaceIntelligenceCognitionStore {
         Self {
             root,
             inject_initialize_failure: true,
+            #[cfg(feature = "workspace-intelligence-claim")]
+            verify_pause: None,
         }
     }
 
@@ -599,7 +756,7 @@ const CREATE_FLAGS: OpenFlags = OpenFlags::SQLITE_OPEN_READ_WRITE
 /// Hashes the opaque scope into the only untrusted record-path component.
 ///
 /// A blank scope is rejected before any filesystem or SQLite work.
-fn scope_digest(scope: &str) -> Result<String, WorkspaceIntelligenceCognitionError> {
+pub(crate) fn scope_digest(scope: &str) -> Result<String, WorkspaceIntelligenceCognitionError> {
     if scope.trim().is_empty() {
         return Err(WorkspaceIntelligenceCognitionError::EmptyScope);
     }
@@ -697,7 +854,8 @@ fn table_columns(
 ///
 /// The validation order is fixed: table presence, required columns, row
 /// cardinality, then the row itself. Extra columns and extra tables are allowed
-/// and ignored.
+/// and ignored. Claim verification compares markers first, failing closed on
+/// disagreement; this full shape check runs only after those comparisons succeed.
 fn observe_v1_partition(
     connection: &Connection,
     path: &Path,
@@ -1956,5 +2114,181 @@ mod tests {
             1,
             "no record file or journal is created next to the directory"
         );
+    }
+
+    #[cfg(feature = "workspace-intelligence-claim")]
+    mod claim {
+        use super::*;
+
+        #[test]
+        fn advance_incarnation_creates_v1_then_writes_token_in_one_transaction() {
+            let temp = TempDir::new().unwrap();
+            let store = WorkspaceIntelligenceCognitionStore::new(store_root(&temp));
+            let advance = store.advance_incarnation(SCOPE).unwrap();
+            assert_eq!(advance.previous_token, None);
+            assert!(!advance.token.is_empty());
+            let state = store.read(SCOPE).unwrap().unwrap();
+            assert_eq!(state.cursor, None);
+            assert_eq!(state.incarnation_token, Some(advance.token));
+            let db = raw_read_connection(&record_path_for(&store, SCOPE));
+            assert_eq!(user_version_of(&db), 1);
+            assert_eq!(partition_row_count(&db), 1);
+        }
+
+        #[test]
+        fn advance_incarnation_preserves_cursor_extra_columns_and_legacy_token() {
+            let temp = TempDir::new().unwrap();
+            let store = WorkspaceIntelligenceCognitionStore::new(store_root(&temp));
+            store.initialize(SCOPE).unwrap();
+            let path = record_path_for(&store, SCOPE);
+            raw_write_connection(&path).execute_batch(
+                "ALTER TABLE partition_state ADD COLUMN note TEXT;
+                 UPDATE partition_state SET cursor='c7', incarnation_token=' legacy token ', note='keep';
+                 CREATE TABLE extra (value TEXT); INSERT INTO extra VALUES ('sentinel');"
+            ).unwrap();
+            let advance = store.advance_incarnation(SCOPE).unwrap();
+            assert_eq!(advance.previous_token.as_deref(), Some(" legacy token "));
+            assert_ne!(advance.token, " legacy token ");
+            assert_eq!(store.read(SCOPE).unwrap().unwrap().cursor.as_deref(), Some("c7"));
+            let db = raw_read_connection(&path);
+            assert_eq!(user_version_of(&db), 1);
+            assert_eq!(db.query_row("SELECT note FROM partition_state", [], |r| r.get::<_, String>(0)).unwrap(), "keep");
+            assert_eq!(db.query_row("SELECT value FROM extra", [], |r| r.get::<_, String>(0)).unwrap(), "sentinel");
+        }
+
+        #[test]
+        fn advance_incarnation_failure_inside_the_transaction_leaves_no_partial_row() {
+            let temp = TempDir::new().unwrap();
+            let mut store = WorkspaceIntelligenceCognitionStore::with_injected_initialize_failure(store_root(&temp));
+            let path = record_path_for(&store, SCOPE);
+            assert!(matches!(store.advance_incarnation(SCOPE), Err(WorkspaceIntelligenceCognitionError::Io(_))));
+            assert!(path.is_file(), "rollback preserves the empty v0 file");
+            {
+                let db = raw_read_connection(&path);
+                assert_eq!(user_version_of(&db), 0);
+                assert_eq!(user_object_count(&db, &path).unwrap(), 0);
+                assert_eq!(db.query_row("SELECT count(*) FROM sqlite_master WHERE name='partition_state'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+            }
+            let bytes = file_bytes(&path);
+            assert!(matches!(store.verify_incarnation(SCOPE, "live", "live"), Err(WorkspaceIntelligenceCognitionError::UninitializedDatabase { .. })));
+            assert_eq!(file_bytes(&path), bytes);
+            store.inject_initialize_failure = false;
+            let advance = store.advance_incarnation(SCOPE).unwrap();
+            assert_eq!(advance.previous_token, None);
+            assert!(!advance.token.is_empty());
+            assert_eq!(format!("{advance:?}"), "IncarnationAdvance { previous_token: None, token: \"<redacted>\" }");
+            let state = store.read(SCOPE).unwrap().unwrap();
+            assert_eq!(state.incarnation_token.as_deref(), Some(advance.token.as_str()));
+            assert_eq!(state.cursor, None);
+            let db = raw_read_connection(&path);
+            assert_eq!(user_version_of(&db), 1);
+            assert_eq!(partition_row_count(&db), 1);
+        }
+
+        #[test]
+        fn advance_incarnation_failure_after_v1_creation_preserves_previous_token_cursor_and_unknown_columns() {
+            let temp = TempDir::new().unwrap();
+            let store = WorkspaceIntelligenceCognitionStore::new(store_root(&temp));
+            store.initialize(SCOPE).unwrap();
+            let path = record_path_for(&store, SCOPE);
+            raw_write_connection(&path).execute_batch(
+                "ALTER TABLE partition_state ADD COLUMN note TEXT;
+                 UPDATE partition_state SET cursor='c7', incarnation_token=' opaque token ', note='keep';
+                 CREATE TABLE extra (value TEXT); INSERT INTO extra VALUES ('sentinel');
+                 CREATE TRIGGER reject_incarnation BEFORE UPDATE ON partition_state
+                 BEGIN SELECT RAISE(ABORT, 'fixture rejects token update'); END;"
+            ).unwrap();
+            let bytes = file_bytes(&path);
+            let error = store.advance_incarnation(SCOPE).unwrap_err();
+            assert!(matches!(error, WorkspaceIntelligenceCognitionError::Storage(ref source)
+                if source.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation)));
+            assert_eq!(file_bytes(&path), bytes);
+            let state = store.read(SCOPE).unwrap().unwrap();
+            assert_eq!(state.cursor.as_deref(), Some("c7"));
+            assert_eq!(state.incarnation_token.as_deref(), Some(" opaque token "));
+            let db = raw_read_connection(&path);
+            assert_eq!(user_version_of(&db), 1);
+            assert_eq!(partition_row_count(&db), 1);
+            assert_eq!(db.query_row("SELECT note FROM partition_state", [], |r| r.get::<_, String>(0)).unwrap(), "keep");
+            assert_eq!(db.query_row("SELECT value FROM extra", [], |r| r.get::<_, String>(0)).unwrap(), "sentinel");
+        }
+
+        #[test]
+        fn verify_incarnation_on_empty_v0_is_uninitialized_without_writes() {
+            let temp = TempDir::new().unwrap();
+            let root = store_root(&temp);
+            fs::create_dir_all(&root).unwrap();
+            let store = WorkspaceIntelligenceCognitionStore::new(root);
+            let path = record_path_for(&store, SCOPE);
+            raw_write_connection(&path).execute_batch("PRAGMA user_version=0").unwrap();
+            let bytes = file_bytes(&path);
+            assert!(matches!(store.verify_incarnation(SCOPE, "live", "live"), Err(WorkspaceIntelligenceCognitionError::UninitializedDatabase { .. })));
+            assert_eq!(file_bytes(&path), bytes);
+            assert_eq!(user_version_of(&raw_read_connection(&path)), 0);
+        }
+
+        #[test]
+        fn advance_incarnation_never_reuses_the_immediately_previous_token() {
+            let temp = TempDir::new().unwrap();
+            let store = WorkspaceIntelligenceCognitionStore::new(store_root(&temp));
+            let mut previous = None;
+            for _ in 0..32 {
+                let advance = store.advance_incarnation(SCOPE).unwrap();
+                assert_eq!(advance.previous_token, previous);
+                assert_ne!(advance.previous_token.as_deref(), Some(advance.token.as_str()));
+                previous = Some(advance.token);
+            }
+        }
+
+        #[test]
+        fn verify_incarnation_rejects_stale_and_absent_without_writes() {
+            let temp = TempDir::new().unwrap();
+            let store = WorkspaceIntelligenceCognitionStore::new(store_root(&temp));
+            assert_eq!(store.verify_incarnation(SCOPE, "live", "live").unwrap_err().code(), "stale_incarnation");
+            assert!(!store_root(&temp).exists());
+            store.initialize(SCOPE).unwrap();
+            let path = record_path_for(&store, SCOPE);
+            let bytes = file_bytes(&path);
+            assert_eq!(store.verify_incarnation(SCOPE, "live", "live").unwrap_err().code(), "stale_incarnation");
+            assert_eq!(file_bytes(&path), bytes);
+            store.advance_incarnation(SCOPE).unwrap();
+            let bytes = file_bytes(&path);
+            assert_eq!(store.verify_incarnation(SCOPE, "wrong", "wrong").unwrap_err().code(), "stale_incarnation");
+            assert_eq!(file_bytes(&path), bytes);
+        }
+
+        #[test]
+        fn verify_incarnation_checks_both_tokens_in_one_transaction() {
+            let temp = TempDir::new().unwrap();
+            let store = WorkspaceIntelligenceCognitionStore::new(store_root(&temp));
+            let advance = store.advance_incarnation(SCOPE).unwrap();
+            let path = record_path_for(&store, SCOPE);
+            let bytes = file_bytes(&path);
+            for (live, request) in [
+                (advance.token.as_str(), "wrong"), ("wrong", "wrong"),
+                ("wrong", advance.token.as_str()),
+            ] {
+                assert_eq!(store.verify_incarnation(SCOPE, live, request).unwrap_err().code(), "stale_incarnation");
+                assert_eq!(file_bytes(&path), bytes);
+            }
+            assert!(matches!(store.verify_incarnation(SCOPE, &advance.token, &advance.token).unwrap(), CognitionInitialization::Existing(_)));
+            assert_eq!(file_bytes(&path), bytes);
+        }
+
+        #[test]
+        fn unknown_schema_and_corrupt_partitions_are_never_reset() {
+            let temp = TempDir::new().unwrap();
+            let store = WorkspaceIntelligenceCognitionStore::new(store_root(&temp));
+            store.initialize(SCOPE).unwrap();
+            let path = record_path_for(&store, SCOPE);
+            raw_write_connection(&path).execute_batch("PRAGMA user_version=2").unwrap();
+            for (code, corrupt) in [("unsupported_schema_version", false), ("corrupt_database", true)] {
+                if corrupt { fs::write(&path, b"not a SQLite database").unwrap(); }
+                let bytes = file_bytes(&path);
+                assert_eq!(store.advance_incarnation(SCOPE).unwrap_err().code(), code);
+                assert_eq!(store.verify_incarnation(SCOPE, "live", "live").unwrap_err().code(), code);
+                assert_eq!(file_bytes(&path), bytes);
+            }
+        }
     }
 }

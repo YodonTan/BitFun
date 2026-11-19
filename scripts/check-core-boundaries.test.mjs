@@ -4313,6 +4313,8 @@ test('Services Core accepts only the reviewed feature-owned Tokio runtime graph'
       'workspace-intelligence-store': ['json-io', 'dep:sha2'],
       'workspace-intelligence-cognition': ['dep:rusqlite', 'dep:sha2'],
       'workspace-intelligence-commit': ['workspace-intelligence-store', 'workspace-intelligence-cognition'],
+      'exclusive-file-lease': ['dep:fs2'],
+      'workspace-intelligence-claim': ['workspace-intelligence-commit', 'exclusive-file-lease', 'dep:uuid'],
       'local-storage': [
         'dep:tokio',
         'tokio/fs',
@@ -5474,3 +5476,48 @@ test('Responses WebSocket adapter uses framing over the existing Reqwest upgrade
     assert.ok(findThirdPartyCapabilityFeatureViolations([mutated]).length > 0);
   }
 });
+
+ test('workspace intelligence claim and synchronous lease have exact closed owners and source gates', async () => {
+  const manifestPath = 'src/crates/services/services-core/Cargo.toml';
+  const features = parseManifestFeatures(await readFile(new URL('../' + manifestPath, import.meta.url), 'utf8'));
+  for (const [featureName, refs] of [
+    ['exclusive-file-lease', ['dep:fs2']],
+    ['workspace-intelligence-claim', ['workspace-intelligence-commit', 'exclusive-file-lease', 'dep:uuid']],
+  ]) {
+    assert.deepEqual(features[featureName], refs);
+    const rule = coreClosedFeatureProfileRules.find(r => r.manifestPath === manifestPath && r.featureName === featureName);
+    assert.equal(rule.exact, true);
+    assert.deepEqual(rule.requiredFeatureRefs, refs);
+    if (featureName === 'workspace-intelligence-claim') assert.deepEqual(rule.allowedTransitiveFeatureRefs,
+      ['workspace-intelligence-store', 'workspace-intelligence-cognition', 'json-io']);
+  }
+  const owners = optionalDependencyFeatureOwnerRules.find(r => r.crateName === 'services-core').dependencies;
+  assert.ok(owners.find(d => d.depName === 'uuid').ownerFeatures.includes('workspace-intelligence-claim'));
+  assert.ok(owners.find(d => d.depName === 'fs2').ownerFeatures.includes('exclusive-file-lease'));
+  const rule = requiredContentRules.find(r => r.path === 'src/crates/services/services-core/src/lib.rs');
+  const source = await readFile(new URL('../' + rule.path, import.meta.url), 'utf8');
+  const lock = rule.patterns.find(p => p.message === 'missing shared file lock owner source gate');
+  assert.ok(lock.regex.test(source));
+  assert.ok(!lock.regex.test('#[cfg(any(feature = "local-storage", feature = "runtime-ownership", feature = "resource-capacity"))] mod file_lock;'));
+  assert.ok(rule.patterns.some(p => p.regex.test('#[cfg(feature = "workspace-intelligence-claim")] pub mod workspace_intelligence_claim;')));
+  assert.deepEqual(features.default, []);
+ });
+
+ test('workspace intelligence claim inherits only JSON IO Tokio and standalone lease needs none', () => {
+  const messages = (claimRefs, leaseRefs = ['dep:fs2']) => findTokioDependencyFeatureViolations([{
+    name: 'openbitfun-services-core', manifest_path: 'src/crates/services/services-core/Cargo.toml',
+    dependencies: [{ name: 'tokio', kind: null, optional: true, features: [] }],
+    features: {
+      'json-io': ['dep:tokio', 'tokio/fs', 'tokio/rt', 'tokio/sync', 'tokio/time'],
+      'workspace-intelligence-store': ['json-io', 'dep:sha2'],
+      'workspace-intelligence-cognition': ['dep:rusqlite', 'dep:sha2'],
+      'workspace-intelligence-commit': ['workspace-intelligence-store', 'workspace-intelligence-cognition'],
+      'workspace-intelligence-claim': claimRefs, 'exclusive-file-lease': leaseRefs,
+    },
+  }]).map(v => v.message).filter(m => /:workspace-intelligence-claim |:exclusive-file-lease /.test(m));
+  const refs = ['workspace-intelligence-commit', 'exclusive-file-lease', 'dep:uuid'];
+  assert.deepEqual(messages(refs), []);
+  assert.match(messages([...refs, 'tokio/process']).join('\n'), /unexpected effective Tokio capabilities: process/);
+  assert.match(messages(['exclusive-file-lease', 'dep:uuid']).join('\n'), /missing effective Tokio capabilities: fs, rt, sync, time/);
+  assert.match(messages(refs, ['dep:fs2', 'tokio/rt']).join('\n'), /exclusive-file-lease Tokio capabilities require an explicit owner contract/);
+ });

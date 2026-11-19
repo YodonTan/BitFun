@@ -18,13 +18,15 @@ pub mod dispatch_workspace;
 #[cfg(any(
     feature = "local-storage",
     feature = "runtime-ownership",
-    feature = "resource-capacity"
+    feature = "resource-capacity",
+    feature = "exclusive-file-lease"
 ))]
 pub mod exclusive_file_lease;
 #[cfg(any(
     feature = "local-storage",
     feature = "runtime-ownership",
-    feature = "resource-capacity"
+    feature = "resource-capacity",
+    feature = "exclusive-file-lease"
 ))]
 mod file_lock;
 #[cfg(any(feature = "filesystem", feature = "workspace-transfer"))]
@@ -68,6 +70,8 @@ pub mod workspace_icon_assets;
 pub mod workspace_intelligence_cognition;
 #[cfg(feature = "workspace-intelligence-store")]
 pub mod workspace_intelligence_store;
+#[cfg(feature = "workspace-intelligence-claim")]
+pub mod workspace_intelligence_claim;
 #[cfg(feature = "workspace-intelligence-commit")]
 pub mod workspace_intelligence_commit;
 #[cfg(feature = "workspace-persistence")]

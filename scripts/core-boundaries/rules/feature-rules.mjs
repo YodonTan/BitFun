@@ -46,7 +46,7 @@ export const optionalDependencyFeatureOwnerRules = [
     dependencies: [
       { depName: 'image', ownerFeatures: ['pet-packages', 'workspace-icons'] },
       { depName: 'zip', ownerFeatures: ['pet-packages'] },
-      { depName: 'uuid', ownerFeatures: ['pet-packages', 'resource-capacity', 'workspace-icons'] },
+      { depName: 'uuid', ownerFeatures: ['pet-packages', 'resource-capacity', 'workspace-icons', 'workspace-intelligence-claim'] },
       { depName: 'aes-gcm', ownerFeatures: ['credential-vault'] },
       { depName: 'anyhow', ownerFeatures: ['credential-vault', 'dispatch-workspace', 'workspace-runtime', 'workspace-transfer', 'session-recovery'] },
       { depName: 'async-trait', ownerFeatures: ['permission', 'workspace-runtime'] },
@@ -60,7 +60,7 @@ export const optionalDependencyFeatureOwnerRules = [
       { depName: 'chrono', ownerFeatures: ['filesystem', 'local-storage', 'workspace-persistence'] },
       { depName: 'chrono-tz', ownerFeatures: ['token-usage-statistics'] },
       { depName: 'dunce', ownerFeatures: ['pet-packages', 'runtime-ownership', 'workspace-identity', 'workspace-runtime'] },
-      { depName: 'fs2', ownerFeatures: ['pet-packages', 'credential-vault', 'json-io', 'local-storage', 'runtime-ownership'] },
+      { depName: 'fs2', ownerFeatures: ['pet-packages', 'credential-vault', 'json-io', 'local-storage', 'runtime-ownership', 'exclusive-file-lease'] },
       { depName: 'git2', ownerFeatures: ['session-git'] },
       { depName: 'globset', ownerFeatures: ['workspace-instructions'] },
       { depName: 'ignore', ownerFeatures: ['filesystem'] },
@@ -1724,6 +1724,21 @@ export const coreClosedFeatureProfileRules = [
     exact: true,
     reason:
       'services-core workspace-intelligence-commit composes only the two store owners, with no product policy, runtime, process, network, UI, claim, cursor, or token capability',
+  },
+  {
+    manifestPath: 'src/crates/services/services-core/Cargo.toml',
+    featureName: 'exclusive-file-lease',
+    requiredFeatureRefs: ['dep:fs2'],
+    exact: true,
+    reason: 'services-core exclusive-file-lease owns only the synchronous OS tenure primitive',
+  },
+  {
+    manifestPath: 'src/crates/services/services-core/Cargo.toml',
+    featureName: 'workspace-intelligence-claim',
+    requiredFeatureRefs: ['workspace-intelligence-commit', 'exclusive-file-lease', 'dep:uuid'],
+    allowedTransitiveFeatureRefs: ['workspace-intelligence-store', 'workspace-intelligence-cognition', 'json-io'],
+    exact: true,
+    reason: 'services-core workspace-intelligence-claim adds only lease tenure and transactional incarnation evidence for already-enabled scopes',
   },
   // P1 cognition partition root: WP1.3 per-scope cognition partition state.
   {

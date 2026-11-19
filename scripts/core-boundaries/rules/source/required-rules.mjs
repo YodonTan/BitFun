@@ -60,7 +60,7 @@ export const requiredContentRules = [
         message: 'missing local diff capability source gate',
       },
       {
-        regex: /#\[cfg\(any\(\s*feature = "local-storage",\s*feature = "runtime-ownership",\s*feature = "resource-capacity",?\s*\)\)\]\s*mod file_lock;/,
+        regex: /#\[cfg\(any\(\s*feature = "local-storage",\s*feature = "runtime-ownership",\s*feature = "resource-capacity",\s*feature = "exclusive-file-lease",?\s*\)\)\]\s*mod file_lock;/,
         message: 'missing shared file lock owner source gate',
       },
       {
@@ -130,6 +130,10 @@ export const requiredContentRules = [
       {
         regex: /#\[cfg\(feature = "workspace-intelligence-commit"\)\]\s*pub mod workspace_intelligence_commit;/,
         message: 'missing workspace-intelligence-commit governed owner source gate',
+      },
+      {
+        regex: /#\[cfg\(feature = "workspace-intelligence-claim"\)\]\s*pub mod workspace_intelligence_claim;/,
+        message: 'missing workspace-intelligence-claim lifecycle source gate',
       },
     ],
   },

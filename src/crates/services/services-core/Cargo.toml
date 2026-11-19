@@ -176,6 +176,8 @@ workspace-identity = ["dep:dunce", "dep:sha2"]
 workspace-intelligence-store = ["json-io", "dep:sha2"]
 workspace-intelligence-cognition = ["dep:rusqlite", "dep:sha2"]
 workspace-intelligence-commit = ["workspace-intelligence-store", "workspace-intelligence-cognition"]
+exclusive-file-lease = ["dep:fs2"]
+workspace-intelligence-claim = ["workspace-intelligence-commit", "exclusive-file-lease", "dep:uuid"]
 runtime-ownership = ["dep:dunce", "dep:fs2", "dep:sha2"]
 permission = [
     "dep:async-trait",
