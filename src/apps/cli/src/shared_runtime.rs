@@ -25,6 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch, Notify};
 
+use crate::workspace_intelligence::{self, CliHostPlacement, CliHostSkip};
+
 const RELEASE_CHANNEL: &str = "stable";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
@@ -1138,6 +1140,9 @@ pub(crate) async fn run_service(workspace: PathBuf, expected_identity: String) -
             "Shared Runtime identity does not match its workspace"
         ));
     }
+    // The shared runtime owns its workspace and has not drained, so it is a
+    // typed refusal rather than a second owner of the same workspace.
+    workspace_intelligence::install_for(CliHostPlacement::Skip(CliHostSkip::SharedRuntime)).await?;
     let runtime = crate::initialize_core_services_for_deployment(
         &workspace,
         crate::runtime::approval::CliApprovalPolicy::Ask,

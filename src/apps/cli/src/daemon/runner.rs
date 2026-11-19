@@ -11,7 +11,7 @@ use anyhow::{anyhow, Result};
 
 use openbitfun_core::service::remote_connect::DeviceIdentity;
 
-use crate::{runtime, BootstrapProfile};
+use crate::{runtime, workspace_intelligence, BootstrapProfile};
 
 use super::pid;
 
@@ -30,6 +30,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // The daemon is not bound to the caller's cwd; peer commands carry their
     // own workspace paths. Home is a stable root for the runtime context.
     let workspace_root = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    // A daemon is headless even though it initializes the interactive profile's
+    // services, so it names no interactive surface and admits no host.
+    workspace_intelligence::install_for(workspace_intelligence::CliHostPlacement::Skip(
+        workspace_intelligence::CliHostSkip::Daemon,
+    ))
+    .await?;
     let runtime = crate::initialize_core_services(
         &workspace_root,
         runtime::approval::CliApprovalPolicy::Ask,

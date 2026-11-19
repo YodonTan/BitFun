@@ -39,10 +39,12 @@ mod server_host;
 mod shared_runtime;
 mod terminal_attention;
 mod ui;
+mod workspace_intelligence;
 
 use anyhow::{anyhow, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use openbitfun_core::service::remote_connect::DeviceIdentity;
+use openbitfun_core::service::workspace_intelligence::WorkspaceIntelligenceHostSurface;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -981,6 +983,11 @@ async fn initialize_core_services_for_deployment(
             deployment,
         )
         .map_err(|error| anyhow!(error.startup_message(deployment, entrypoint)))?;
+    // An entry point that can admit the host records the deployment of the owner it
+    // just built. The ACP and app-server entry points build their own owner and
+    // refuse the host, so they record nothing. The value is read back from the owner
+    // so the host admits on exactly what was acquired.
+    workspace_intelligence::record_deployment(runtime_ownership.deployment());
     let runtime_ownership = std::sync::Arc::new(runtime_ownership);
 
     let config_service = openbitfun_core::service::config::get_global_config_service()
@@ -1111,14 +1118,20 @@ async fn run_interactive(
     let runtime = if shared {
         None
     } else {
-        Some(
-            initialize_core_services(
-                &workspace_path,
-                runtime::approval::CliApprovalPolicy::Ask,
-                BootstrapProfile::Interactive,
-            )
-            .await?,
+        let runtime = initialize_core_services(
+            &workspace_path,
+            runtime::approval::CliApprovalPolicy::Ask,
+            BootstrapProfile::Interactive,
         )
+        .await?;
+        // Only this embedded TUI is the CLI's interactive surface: a shared
+        // controller owns no workspace here, and the shared service refuses its
+        // own surface where it runs.
+        workspace_intelligence::install_for(workspace_intelligence::CliHostPlacement::Install(
+            WorkspaceIntelligenceHostSurface::CliInteractive,
+        ))
+        .await?;
+        Some(runtime)
     };
     let agent = if let Some(runtime) = &runtime {
         Arc::new(agent::runtime_client::CliAgentRuntimeClient::new(runtime))
@@ -1577,10 +1590,22 @@ async fn run_cli() -> Result<()> {
         }
 
         Some(Commands::Usage { session_id }) => {
+            // The usage report initializes core services for a read-only summary;
+            // it owns no workspace.
+            workspace_intelligence::install_for(workspace_intelligence::CliHostPlacement::Skip(
+                workspace_intelligence::CliHostSkip::Management,
+            ))
+            .await?;
             management::print_usage_report(session_id.as_deref()).await?;
         }
 
         Some(Commands::Doctor) => {
+            // A one-shot diagnosis assembles the same core runtime to report on it
+            // but owns no workspace, so it refuses the host.
+            workspace_intelligence::install_for(workspace_intelligence::CliHostPlacement::Skip(
+                workspace_intelligence::CliHostSkip::Management,
+            ))
+            .await?;
             let workspace = std::env::current_dir()?;
             let (_, services) =
                 openbitfun_core::product_runtime::build_local_runtime_services(&workspace, 16)?;
@@ -1599,6 +1624,12 @@ async fn run_cli() -> Result<()> {
         }
 
         Some(Commands::Health) => {
+            // A one-shot report assembles the same core runtime to describe it but
+            // owns no workspace, so it refuses the host.
+            workspace_intelligence::install_for(workspace_intelligence::CliHostPlacement::Skip(
+                workspace_intelligence::CliHostSkip::Management,
+            ))
+            .await?;
             root_handlers::handle_health_command()?;
         }
 
@@ -1623,6 +1654,11 @@ async fn run_cli() -> Result<()> {
         }
 
         Some(Commands::Server) => {
+            // stdout belongs to the app-server protocol on this surface.
+            workspace_intelligence::install_for(workspace_intelligence::CliHostPlacement::Skip(
+                workspace_intelligence::CliHostSkip::StdioServer,
+            ))
+            .await?;
             server_host::serve().await?;
         }
 
@@ -1800,6 +1836,10 @@ fn main() {
             runtime.block_on(async {
                 let _native_cleanup = openbitfun_computer_use::host_runtime::StopOnExit;
                 let result = run_cli().await;
+                // Every `run_cli` return path, including an early error, reaches
+                // the bounded drain before the plugin host is shut down and before
+                // the process leaves.
+                workspace_intelligence::drain().await;
                 match openbitfun_core::plugin_host::shutdown_configured_plugin_host().await {
                     Ok(Some(report)) => tracing::info!(
                         generation = report.generation,

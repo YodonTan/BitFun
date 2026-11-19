@@ -1,11 +1,11 @@
-//! Workspace intelligence tier derivation (P0) and internal control assembly
-//! (P1 core control slice: WP1.1 core assembly + WP1.2a control-vs-control).
+//! Workspace intelligence tier derivation, internal control assembly and the
+//! app-facing host facade.
 //!
-//! Phase 0 holds the pure, side-effect-free parts of the workspace intelligence
-//! control contract: `mode` derives the tier from control facts, and
+//! The pure, side-effect-free parts of the workspace intelligence control
+//! contract live here: `mode` derives the tier from control facts, and
 //! `read_contract` projects a persisted control record without writing,
 //! repairing, or reorganizing it. No storage, IO, background work, or model
-//! resolution lives here.
+//! resolution lives in them.
 //!
 //! The feature-free `scope` module holds the host and workspace scope value types
 //! and their single injective storage encoding. The `policy` module adds the pure,
@@ -14,15 +14,19 @@
 //! compare-and-swap. The feature-gated `partition` module adds the internal
 //! cognition partition handle over the authoritative per-scope partition store.
 //!
-//! The P0/P1 control and cognition slices are internal and have no production
-//! caller, no app entry point of their own, no legacy confirmation gate, UI,
-//! command, registry or capability. The gated `host` facade re-exported at the end
-//! of this module is the only app-facing entry point, and no in-tree composition
-//! root calls it yet. A real enable
-//! later must pass the P2.4/P3 gate; nothing here turns workspace intelligence
-//! on, and no product feature selects `workspace-intelligence-control`.
+//! The control and cognition modules are internal and have no production caller
+//! outside the host facade, plus no entry point of their own, no legacy
+//! confirmation gate, UI, command, registry or capability. The gated `host`
+//! facade re-exported at the end of this module is the only app-facing entry
+//! point, and the composition roots that call `bootstrap` are the app surfaces
+//! that select this feature deliberately: in this tree the CLI interactive and
+//! execution modes are such callers. A surface that does not select it answers
+//! `NotCompiled` instead of silently reporting success. A real enable later must
+//! pass a separately reviewed enable gate outside this tree; nothing here turns
+//! workspace intelligence on, and no product feature selects
+//! `workspace-intelligence-control`.
 //!
-//! The `partition` slice itself adds no claim, cursor consumption or policy.
+//! The `partition` module itself adds no claim, cursor consumption or policy.
 //! It persists only the partition root and the
 //! `partition_state` shape, it is not selected by `default`, `product-full` or
 //! `agent-runtime`, and a future real narrow consumer must select
@@ -35,11 +39,12 @@
 //!
 //! The gated `claim` module wraps the services owner-claim lifecycle for an
 //! already-enabled scope: one OS lease per scope, a transactional incarnation
-//! marker, and read-only tenure verification. It is NOT a WP1.4 exit and NOT a
-//! P1 exit. There is still no app bootstrap, first enable, `allow_off`, host
-//! identity source, execution-binding change detection, Shared-profile gate,
-//! pending cursor, revision/epoch, model run, background task or registry.
-//! It is not selected by `default`, `product-full` or `agent-runtime`.
+//! marker, and read-only tenure verification. The module itself adds no first
+//! enable, no `allow_off`, no device or account identity source, no pending
+//! cursor, no revision/epoch, no model run, no background worker and no registry;
+//! the delivery-profile admission and the execution-binding change detection
+//! that drive it live in the `host` facade. It is not selected by `default`,
+//! `product-full` or `agent-runtime`.
 //!
 //! The unconditional `host` module is the workspace intelligence host handle:
 //! bootstrap over one owner-decoded persisted catalog, per-scope lease tenure, a
@@ -52,25 +57,28 @@
 //! (read-only persisted registry snapshot), the `host_binding` module (execution
 //! binding resolution) and the `host_standby` module (bounded fallback wake-up)
 //! are gated on `workspace-intelligence-host` together with the rest of the host
-//! slice.
+//! feature.
 //!
-//! This is neither a WP1.4 nor a P1 exit: it adds no first enable, no
-//! `allow_off`, no pending cursor, no content mutation, no model run, no Tauri
-//! command, no Product Operation Registry row and no UI. `bootstrap` returns a
-//! handle nobody promotes yet; a real enable later must pass the P2.4/P3 gate.
-//! Nothing here is selected by `default`, `product-full` or `agent-runtime`.
+//! This tree still adds no first enable, no `allow_off`, no pending cursor, no
+//! content mutation, no model run, no Tauri command, no Product Operation
+//! Registry row and no UI, so a real first enable still has to pass the enable
+//! gate this tree does not provide. Nothing here is selected by `default`,
+//! `product-full` or `agent-runtime`.
 //!
-//! The `test-support`-gated `host_fixture` module is a test-only writer that
-//! publishes one real enabled scope through those same owners, for a test that
-//! needs that persisted shape and cannot obtain it from a production entry point.
-//! Outside `#[cfg(test)]` fixtures it is the only mint site of a host anchor in
-//! this crate, and no production caller names it.
+//! The `test-support`-gated `host_fixture` module is a test-only writer, compiled
+//! only when `test-support` and `workspace-intelligence-host` are selected
+//! together and reached only from a `[dev-dependencies]` edge: it publishes one
+//! real enabled scope through those same owners, for a test that needs that
+//! persisted shape and cannot obtain it from a production entry point. Outside
+//! `#[cfg(test)]` fixtures it is the only mint site of a host anchor in this
+//! crate, and no production caller names it.
 
 // Crate-internal modules: reachable inside the crate. Only the facade re-exported at
 // the end of this module and the `test-support`-gated `host_fixture` below are public
 // API; `host` itself stays crate-private.
-// Nothing in this tree has a production consumer yet. The allowances are per module
-// so each one disappears with the change that gives that module its caller.
+// Each allowance is per module: it covers the internal modules that only the
+// app-facing facade consumes, and disappears with the change that gives that module
+// its own caller.
 #[allow(dead_code)]
 pub(crate) mod scope;
 #[allow(dead_code)]
@@ -81,13 +89,13 @@ pub(crate) mod policy;
 pub(crate) mod read_contract;
 // Unconditional: a feature-off build must be able to answer `NotCompiled`.
 pub(crate) mod host;
-#[allow(dead_code)] // Internal to the host slice; consumed only by `host`.
+#[allow(dead_code)] // Internal to the host feature; consumed only by `host`.
 #[cfg(feature = "workspace-intelligence-host")]
 pub(crate) mod catalog_readonly;
-#[allow(dead_code)] // Internal to the host slice; consumed only by `host`.
+#[allow(dead_code)] // Internal to the host feature; consumed only by `host`.
 #[cfg(feature = "workspace-intelligence-host")]
 pub(crate) mod host_binding;
-#[allow(dead_code)] // Internal to the host slice; consumed only by `host`.
+#[allow(dead_code)] // Internal to the host feature; consumed only by `host`.
 #[cfg(feature = "workspace-intelligence-host")]
 pub(crate) mod host_standby;
 #[allow(dead_code)]

@@ -1922,6 +1922,7 @@ const CLI_REVIEWED_CORE_FEATURES = [
   'plugin-runtime',
   'opencode-plugin-host',
   'dispatch-store',
+  'workspace-intelligence-host',
 ];
 
 const APP_SERVER_REVIEWED_CORE_FEATURES = [

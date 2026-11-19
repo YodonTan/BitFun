@@ -55,6 +55,7 @@ openbitfun-core = { path = "../../crates/assembly/core", features = [
     "tools-image-generation",
     "tools-office-documents",
     "tools-agent-control",
+    "workspace-intelligence-host",
 ] }
 openbitfun-events = { path = "../../crates/contracts/events" }
 openbitfun-core-types = { path = "../../crates/contracts/core-types" }

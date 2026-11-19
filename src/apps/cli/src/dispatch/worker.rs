@@ -15,7 +15,7 @@ use openbitfun_runtime_ports::{
     AgentSubmissionSource, DialogSubmissionPolicy, SessionExecutionTarget,
 };
 
-use crate::{shutdown_mcp_servers, BootstrapProfile};
+use crate::{shutdown_mcp_servers, workspace_intelligence, BootstrapProfile};
 
 use super::permissions::{self, REJECT_AND_REPORT_REASON};
 use super::protocol::{DispatchApprovalPolicy, DispatchEvent, DispatchJobState, DispatchTurnKind};
@@ -143,6 +143,12 @@ async fn run_inner(store: &DispatchStore, job_id: &str) -> Result<()> {
         )?;
     }
 
+    // A dispatched job outlives any host tenure the worker could hold, so the
+    // target refuses the workspace intelligence host for its own surface.
+    workspace_intelligence::install_for(workspace_intelligence::CliHostPlacement::Skip(
+        workspace_intelligence::CliHostSkip::DetachedDispatch,
+    ))
+    .await?;
     let runtime = crate::initialize_core_services(
         workspace,
         permissions::cli_policy(effective_policy),

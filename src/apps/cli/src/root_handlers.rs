@@ -12,6 +12,7 @@ use crate::{
         emit_preflight_json_error, ExecApprovalMode, ExecMode, ExecOutputFormat, ExecSessionOptions,
     },
     ui::string_utils::truncate_str,
+    workspace_intelligence::{self, CliHostPlacement, CliHostSkip},
     ConfigAction, DispatchAction, ExternalAccessArg, ExternalCapabilityArg, ExternalConfigAction,
     ExternalPolicyModeArg, ExternalPolicyScopeArg, SessionAction,
 };
@@ -25,6 +26,7 @@ use openbitfun_core::external_sources::{
     ExternalSourceOperationErrorCode, EXTERNAL_CAPABILITY_COMMAND, EXTERNAL_CAPABILITY_MCP,
     EXTERNAL_CAPABILITY_SUBAGENT, EXTERNAL_CAPABILITY_TOOL,
 };
+use openbitfun_core::service::workspace_intelligence::WorkspaceIntelligenceHostSurface;
 
 /// Sized for submit/continue requests carrying inline image attachments
 /// (16 MiB of data URLs) plus headroom for the rest of the payload.
@@ -213,6 +215,17 @@ pub(crate) async fn handle_exec_command(config: CliConfig, args: ExecCommandArgs
             return exec_preflight_error(args.output_format, error);
         }
     };
+    // A batch execution owns the workspace for this invocation until the
+    // process leaves, and it is the CLI's execution surface. A placement that
+    // cannot resolve this invocation's own root is a preflight failure, so it is
+    // reported through the same envelope as every other one.
+    if let Err(error) = workspace_intelligence::install_for(CliHostPlacement::Install(
+        WorkspaceIntelligenceHostSurface::CliExecution,
+    ))
+    .await
+    {
+        return exec_preflight_error(args.output_format, error);
+    }
 
     let mut exec_mode = ExecMode::new(
         config,
@@ -278,9 +291,25 @@ pub(crate) async fn handle_session_action(
         _ => crate::runtime::approval::CliApprovalPolicy::Reject,
     };
     let bootstrap_profile = action.bootstrap_profile();
+    // The action decides the surface: resume and continue keep running the
+    // interactive TUI on the runtime created here, and every other action prints a
+    // report and exits, so it owns no workspace.
+    let host_placement = match action {
+        SessionAction::Resume { .. } | SessionAction::Continue => {
+            CliHostPlacement::Install(WorkspaceIntelligenceHostSurface::CliInteractive)
+        }
+        SessionAction::List
+        | SessionAction::Show { .. }
+        | SessionAction::Delete { .. }
+        | SessionAction::Fork { .. } => CliHostPlacement::Skip(CliHostSkip::Management),
+    };
+    // The placement follows the runtime it admits a host beside: an admission reads
+    // the deployment that runtime ownership was built with, so the runtime comes
+    // first. A skip resolves nothing and reads nothing either way.
     let runtime =
         crate::initialize_core_services(&workspace_path, approval_policy, bootstrap_profile)
             .await?;
+    workspace_intelligence::install_for(host_placement).await?;
 
     match action {
         SessionAction::List => {
@@ -912,6 +941,8 @@ pub(crate) fn handle_health_command() -> Result<()> {
 
 pub(crate) async fn serve_acp_stdio() -> Result<()> {
     crate::setup_workspace();
+    // ACP owns its own session lifetime; this host stays out of it.
+    workspace_intelligence::install_for(CliHostPlacement::Skip(CliHostSkip::Acp)).await?;
     let workspace_root = std::env::current_dir().context("Failed to resolve ACP workspace")?;
 
     crate::agent::agentic_system::select_agentic_system_profile(

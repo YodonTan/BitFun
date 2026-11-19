@@ -1487,6 +1487,9 @@ export function findProductEntrypointCoreFeatureViolations(
       'ssh-remote',
       // Outbound controller for `openbitfun dispatch outbound`.
       'dispatch-store',
+      // The CLI composition root assembles the app-facing workspace
+      // intelligence host facade, so it selects the host owner directly.
+      'workspace-intelligence-host',
     ]],
     ['openbitfun-acp', [...new Set([...acpClientCoreFeatures, ...acpServerCoreFeatures])]],
     ['openbitfun-app-server', [
@@ -1556,6 +1559,14 @@ export function findProductEntrypointCoreFeatureViolations(
       'opencode-plugin-host',
       'remote-connect',
       'dispatch-store',
+      // `workspace-intelligence-host` is the only reviewable way to reach these
+      // four internal owners: it activates them itself, and the CLI selects no
+      // other feature that names them.
+      'workspace-intelligence-control',
+      'workspace-intelligence-cognition',
+      'workspace-intelligence-commit',
+      'workspace-intelligence-claim',
+      'workspace-intelligence-host',
     ]],
     ['openbitfun-acp', acpActiveCoreFeatures],
     ['openbitfun-sdk-host-app', coreCompatibilityActiveFeatures],
