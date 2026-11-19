@@ -207,6 +207,90 @@ impl GovernedClaim {
         }
     }
 
+    /// One lease attempt whose admission also requires the caller's expected
+    /// execution binding, after the same read-only observation `claim` performs.
+    ///
+    /// The comparison is a caller-belief gate over the WHOLE raw persisted
+    /// `policy` value, never over selected sub-keys: this layer does not model a
+    /// policy schema, so unknown keys, unknown nesting and JSON number identity
+    /// participate in equality exactly as stored.
+    ///
+    /// The expectation is exact equality of `Option<&Value>` against the stored
+    /// `Option<Value>`, and `None` is a real expectation, not a wildcard: it
+    /// states "no policy is stored", so a record that carries any policy refuses
+    /// instead of being admitted, and a record with no stored policy is admitted.
+    /// That is deliberately the same rule as `Some(value)`, which must equal the
+    /// stored value exactly; there is no caller state that means "any binding".
+    ///
+    /// The mismatch answer is the existing `AuthorityChanged` refusal, reusing
+    /// the vocabulary the lock-internal comparison already reports. Because the
+    /// expected value is only compared here, the lock-internal fresh-versus-
+    /// observed `AuthorityChanged` re-check inside `commit_governed` remains the
+    /// thing that additionally rejects a change that lands after `observe`,
+    /// including a same-generation policy edit made by another writer. This
+    /// function therefore adds no new lock, no second transaction and no new
+    /// write.
+    ///
+    /// Refusal timing differs by refusal source. The pre-lease refusals
+    /// (`NotObserved`, `NotEnabled`, and the `AuthorityChanged` from this
+    /// caller-belief comparison) return before the lease is taken and before any
+    /// store or cognition write, so they leave no lease file and no cognition
+    /// root. A refusal reported later by `commit_governed` — the same-generation
+    /// re-check, or `NotEnabled` after a concurrent close — happens after this
+    /// call already holds the lease and leaves a payload-free `.lock` file
+    /// behind. That file is never unlinked, by design: another process may be
+    /// flocking that inode, so deleting it would break mutual exclusion.
+    ///
+    /// This is the entry point production hosts are required to use, because a
+    /// host knows which persisted binding it believes the scope is enabled
+    /// under. That requirement is a repository convention here, not a
+    /// structurally enforced property: `claim` stays public and would still admit
+    /// an enabled scope without expressing a binding, and this primitive cannot
+    /// detect a caller that uses it. `claim` remains for fixtures.
+    pub async fn claim_expecting(
+        control: WorkspaceIntelligenceStore, cognition_root: PathBuf,
+        lease_root: PathBuf, scope: &str, expected_policy: Option<&serde_json::Value>,
+    ) -> Result<ClaimAttempt, WorkspaceIntelligenceClaimError> {
+        let gate = WorkspaceIntelligenceCommitGate::new(control, cognition_root);
+        #[cfg(test)]
+        let gate = tests::install_claim_pauses(gate);
+        let digest = scope_digest(scope).map_err(WorkspaceIntelligenceCommitError::Cognition)?;
+        let lease_path = lease_root.join(format!("{digest}.lock"));
+        let Some(snapshot) = gate.observe(scope).await? else {
+            return Ok(ClaimAttempt::Refused(GovernedClaimRefusal::NotObserved));
+        };
+        if snapshot.authority().enabled() != Some(true) {
+            return Ok(ClaimAttempt::Refused(GovernedClaimRefusal::NotEnabled));
+        }
+        if snapshot.authority().policy() != expected_policy {
+            return Ok(ClaimAttempt::Refused(GovernedClaimRefusal::AuthorityChanged));
+        }
+        let path = lease_path.clone();
+        let lease = match tokio::task::spawn_blocking(move || ExclusiveFileLease::try_acquire(&path))
+            .await.map_err(WorkspaceIntelligenceCommitError::OwnerTask)? {
+            Ok(lease) => Arc::new(lease),
+            Err(ExclusiveFileLeaseError::InUse) => return Ok(ClaimAttempt::Standby),
+            Err(error) => return Err(error.into()),
+        };
+        let binding = ClaimLeaseBinding::bind(lease, gate.control_root().to_path_buf(),
+            gate.cognition_root().to_path_buf(), scope.to_owned(), lease_path.clone());
+        match gate.commit_governed(&snapshot, GovernedFenceOperation::AdvanceIncarnation, &binding).await? {
+            GovernedFenceOutcome::Advanced(advance) => {
+                let ticket = OriginTicket {
+                    scope: scope.to_owned(), control_root: gate.control_root().to_path_buf(),
+                    cognition_root: gate.cognition_root().to_path_buf(),
+                    lease_path: lease_path.clone(), token: advance.token.clone(),
+                };
+                Ok(ClaimAttempt::Claimed(Self { gate, binding,
+                    scope: scope.to_owned(), token: advance.token, ticket }))
+            }
+            GovernedFenceOutcome::Refused(refusal) => Ok(ClaimAttempt::Refused(refusal)),
+            GovernedFenceOutcome::Verified { .. } => Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
+                operation: "advance_incarnation",
+            }),
+        }
+    }
+
     pub fn scope(&self) -> &str { &self.scope }
     /// Opaque origin ticket; no token accessor.
     pub fn ticket(&self) -> &OriginTicket { &self.ticket }
@@ -227,6 +311,55 @@ impl GovernedClaim {
         let Some(snapshot) = self.gate.observe(&self.scope).await? else {
             return Ok(ClaimVerification::Refused(GovernedClaimRefusal::NotObserved));
         };
+        match self.gate.commit_governed(&snapshot, GovernedFenceOperation::VerifyIncarnation {
+            expected: self.token.clone(), origin: origin.token.clone(),
+        }, &self.binding).await? {
+            GovernedFenceOutcome::Verified { control_generation } => Ok(ClaimVerification::Verified { control_generation }),
+            GovernedFenceOutcome::Refused(refusal) => Ok(ClaimVerification::Refused(refusal)),
+            GovernedFenceOutcome::Advanced(_) => Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
+                operation: "verify_incarnation",
+            }),
+        }
+    }
+
+    /// Read-only verification that also re-checks the caller's expected
+    /// execution binding on every call.
+    ///
+    /// The `origin`-versus-live-claim binding checks are identical to `verify`,
+    /// so a foreign ticket is still refused before any IO. The added gate is the
+    /// caller's belief over the WHOLE raw persisted `policy`, compared against a
+    /// fresh observation; a mismatch refuses with the existing
+    /// `AuthorityChanged` refusal and touches nothing.
+    ///
+    /// As in `claim_expecting`, the expectation is exact `Option<Value>`
+    /// equality and `None` is not a wildcard: it means "no policy is stored", so
+    /// a scope that now carries a policy refuses instead of being verified. The
+    /// refusal returns before the typed store operation runs, so it leaves the
+    /// cognition partition untouched.
+    ///
+    /// This remains rollback-only: the SQLite transaction opened by the typed
+    /// store operation always rolls back, no new tenure token is minted, and the
+    /// double-marker check is unchanged. Lock-internal fresh-versus-observed
+    /// comparison still covers a change that lands after this observation.
+    pub async fn verify_expecting(
+        &self, origin: &OriginTicket, expected_policy: Option<&serde_json::Value>,
+    ) -> Result<ClaimVerification, WorkspaceIntelligenceClaimError> {
+        if origin.scope != self.scope
+            || origin.control_root.as_os_str() != self.gate.control_root().as_os_str()
+            || origin.cognition_root.as_os_str() != self.gate.cognition_root().as_os_str()
+            || origin.control_root.as_os_str() != self.binding.control_root().as_os_str()
+            || origin.cognition_root.as_os_str() != self.binding.cognition_root().as_os_str()
+            || origin.scope != self.binding.scope()
+            || origin.lease_path.as_os_str() != self.binding.lease_path().as_os_str()
+        {
+            return Ok(ClaimVerification::Refused(GovernedClaimRefusal::ForeignBinding));
+        }
+        let Some(snapshot) = self.gate.observe(&self.scope).await? else {
+            return Ok(ClaimVerification::Refused(GovernedClaimRefusal::NotObserved));
+        };
+        if snapshot.authority().policy() != expected_policy {
+            return Ok(ClaimVerification::Refused(GovernedClaimRefusal::AuthorityChanged));
+        }
         match self.gate.commit_governed(&snapshot, GovernedFenceOperation::VerifyIncarnation {
             expected: self.token.clone(), origin: origin.token.clone(),
         }, &self.binding).await? {
@@ -269,6 +402,67 @@ mod tests {
     }
     fn refused(outcome: ClaimVerification, reason: GovernedClaimRefusal) {
         assert!(matches!(outcome, ClaimVerification::Refused(actual) if actual == reason), "{outcome:?}");
+    }
+    fn refused_claim(outcome: ClaimAttempt, reason: GovernedClaimRefusal) {
+        assert!(matches!(outcome, ClaimAttempt::Refused(actual) if actual == reason), "{outcome:?}");
+    }
+    const HOST_ID: &str = "wi-host-v1:0123456789abcdef0123456789abcdef";
+    const OTHER_HOST_ID: &str = "wi-host-v1:ffffffffffffffffffffffffffffffff";
+    fn bound_policy(host_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "execution_binding": {"schema_version": 1, "host_id": host_id},
+            "domains": {"memory": {"enabled": true}},
+        })
+    }
+    async fn seed_policy(base: &Path, scope: &str, policy: serde_json::Value) {
+        control(base).update(scope, ControlGenerationExpectation::Absent, WorkspaceIntelligenceControlPatch {
+            enabled: ControlFieldUpdate::Set(true),
+            policy: ControlFieldUpdate::Set(policy),
+            ..Default::default()
+        }).await.unwrap();
+    }
+    async fn expecting(base: &Path, scope: &str, expected: Option<&serde_json::Value>) -> ClaimAttempt {
+        GovernedClaim::claim_expecting(control(base), base.join("cognition"), base.join("leases"), scope, expected).await.unwrap()
+    }
+    /// Recursive walk so a nested `.lock` cannot hide a lease footprint.
+    fn lock_files(root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(root) else { return found };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() { found.extend(lock_files(&path)); }
+            else if path.extension().and_then(|value| value.to_str()) == Some("lock") { found.push(path); }
+        }
+        found
+    }
+    /// Test-only external-writer fixture: it edits the persisted control document
+    /// under the store's OWN cross-process lock, but without the store's
+    /// generation CAS, so `control_generation` does not move. That is exactly the
+    /// external-writer shape the lock-internal fresh-versus-observed comparison in
+    /// `commit_governed` has to catch; routing the edit through
+    /// `WorkspaceIntelligenceStore::update` would commit a NEW generation instead
+    /// and could never model this case. Never a production path.
+    async fn raw_policy_edit_same_generation(base: &Path, policy: serde_json::Value) -> serde_json::Value {
+        let path = control_path(base);
+        let guard = JsonFileStore.acquire_cross_process_lock(&path).await.unwrap();
+        let previous: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(previous["control_generation"], serde_json::json!(1), "the fixture only models a same-generation edit");
+        let previous_object = previous.as_object().expect("the control record is a JSON object");
+        let mut document = previous_object.clone();
+        document.insert("policy".to_string(), policy);
+        let document = serde_json::Value::Object(document);
+        assert_eq!(document.as_object().unwrap().len(), previous_object.len(),
+            "the fixture must not add or remove root keys");
+        let changed: Vec<&str> = previous_object.keys()
+            .filter(|key| document.get(key.as_str()) != previous_object.get(key.as_str()))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(changed, ["policy"], "exactly one root key may differ");
+        assert_eq!(document["control_generation"], serde_json::json!(1),
+            "a same-generation edit must not move the generation");
+        JsonFileStore.write_text_atomic_strict(&path, &serde_json::to_string(&document).unwrap()).await.unwrap();
+        drop(guard);
+        previous
     }
     struct ReleasePause(std::sync::mpsc::Sender<()>);
     impl ReleasePause {
@@ -843,5 +1037,319 @@ mod tests {
         let cognition = include_str!("workspace_intelligence_cognition.rs");
         assert!(cognition.contains("pub(crate) fn advance_incarnation"));
         assert!(cognition.contains("pub(crate) fn verify_incarnation"));
+    }
+
+    #[tokio::test]
+    async fn claim_expecting_with_the_observed_policy_claims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let expected = bound_policy(HOST_ID);
+        seed_policy(tmp.path(), SCOPE, expected.clone()).await;
+        let ClaimAttempt::Claimed(claim) = expecting(tmp.path(), SCOPE, Some(&expected)).await else {
+            panic!("the observed binding must claim");
+        };
+        assert!(!claim.token.is_empty());
+        assert_eq!(stored(tmp.path(), SCOPE), claim.token);
+    }
+
+    #[tokio::test]
+    async fn claim_expecting_with_a_different_binding_refuses_with_zero_footprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_policy(tmp.path(), SCOPE, bound_policy(HOST_ID)).await;
+        let before = control_bytes(tmp.path());
+        let other = bound_policy(OTHER_HOST_ID);
+        refused_claim(expecting(tmp.path(), SCOPE, Some(&other)).await, GovernedClaimRefusal::AuthorityChanged);
+        // A caller-belief mismatch is decided from the observation alone: the
+        // control record, the lease root and the cognition root stay untouched.
+        assert_eq!(control_bytes(tmp.path()), before);
+        assert_eq!(cognition_bytes(tmp.path()), None);
+        assert!(lock_files(&tmp.path().join("leases")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn claim_expecting_compares_unknown_policy_keys_and_never_filters() {
+        // A whole-value comparison must carry keys this layer does not model,
+        // including keys nested inside other unknown keys.
+        let document = serde_json::json!({
+            "execution_binding": {"schema_version": 1, "host_id": HOST_ID,
+                "future_field": {"unknown": [1, 2, 3]}},
+            "domains": {"memory": {"enabled": true, "future_flag": "kept"}},
+            "future_policy_block": {"version": 9},
+        });
+        let text = serde_json::to_string(&document).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        seed_policy(tmp.path(), SCOPE, document.clone()).await;
+        let expected: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(expected, document);
+        let ClaimAttempt::Claimed(claim) = expecting(tmp.path(), SCOPE, Some(&expected)).await else {
+            panic!("unknown policy keys must compare exactly as stored, never be filtered out");
+        };
+        assert_eq!(stored(tmp.path(), SCOPE), claim.token);
+
+        // The other direction: an unknown key is not ignored either. Two temp
+        // roots keep the lease and claim state of the two assertions apart.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_policy(tmp.path(), SCOPE, document.clone()).await;
+        let mut drifted = expected.clone();
+        drifted["future_policy_block"]["version"] = serde_json::json!(10);
+        assert_ne!(drifted, document);
+        refused_claim(expecting(tmp.path(), SCOPE, Some(&drifted)).await, GovernedClaimRefusal::AuthorityChanged);
+        assert_eq!(cognition_bytes(tmp.path()), None);
+        assert_eq!(control(tmp.path()).read(SCOPE).await.unwrap().unwrap().policy.as_ref(), Some(&document));
+    }
+
+    #[tokio::test]
+    async fn claim_expecting_refuses_a_new_generation_policy_that_lands_after_observe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let observed = bound_policy(HOST_ID);
+        seed_policy(tmp.path(), SCOPE, observed.clone()).await;
+        let (hook, mut receiver, release) = pause();
+        let _registration = register_claim_pauses(tmp.path(), Some(hook), None);
+        let base = tmp.path().to_path_buf();
+        let expected = observed.clone();
+        let task = tokio::spawn(async move { expecting(&base, SCOPE, Some(&expected)).await });
+        entered(&mut receiver).await;
+        // The claim has observed the previous binding and already holds its
+        // lease; another writer now replaces the policy through the store's own
+        // generation CAS, so this commits generation 2.
+        let changed = bound_policy(OTHER_HOST_ID);
+        let write = control(tmp.path()).update(SCOPE, ControlGenerationExpectation::Exactly(1),
+            WorkspaceIntelligenceControlPatch { policy: ControlFieldUpdate::Set(changed.clone()), ..Default::default() })
+            .await.unwrap();
+        assert_eq!(write.record().control_generation, 2);
+        drop(release);
+        refused_claim(tokio::time::timeout(DEADLINE, task).await.unwrap().unwrap(), GovernedClaimRefusal::AuthorityChanged);
+        // Scope of this test: the writer committed generation 2, so the refusal
+        // here is explainable by the generation change alone. This proves the
+        // NEW-GENERATION path and deliberately says nothing about whether a
+        // same-generation policy edit is rejected; that is the separate
+        // same-generation test below.
+        let record = control(tmp.path()).read(SCOPE).await.unwrap().unwrap();
+        assert_eq!(record.control_generation, 2);
+        assert_eq!(record.policy.as_ref(), Some(&changed));
+        assert_eq!(cognition_bytes(tmp.path()), None);
+    }
+
+    #[tokio::test]
+    async fn claim_expecting_refuses_a_same_generation_policy_edit_that_lands_after_observe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let observed = bound_policy(HOST_ID);
+        seed_policy(tmp.path(), SCOPE, observed.clone()).await;
+        // The caller's belief and the persisted policy agree before the attempt,
+        // so the caller-belief gate cannot be the source of the refusal below.
+        let record = control(tmp.path()).read(SCOPE).await.unwrap().unwrap();
+        assert_eq!(record.control_generation, 1);
+        assert_eq!(record.policy.as_ref(), Some(&observed));
+        let (hook, mut receiver, release) = pause();
+        let _registration = register_claim_pauses(tmp.path(), Some(hook), None);
+        let base = tmp.path().to_path_buf();
+        let expected = observed.clone();
+        let task = tokio::spawn(async move { expecting(&base, SCOPE, Some(&expected)).await });
+        entered(&mut receiver).await;
+        let changed = bound_policy(OTHER_HOST_ID);
+        let previous = raw_policy_edit_same_generation(tmp.path(), changed.clone()).await;
+        assert_eq!(previous["control_generation"], serde_json::json!(1));
+        assert_eq!(previous["policy"], observed);
+        let edited = control(tmp.path()).read(SCOPE).await.unwrap().unwrap();
+        assert_eq!(edited.control_generation, 1, "the edit must not move the generation");
+        assert_eq!(edited.policy.as_ref(), Some(&changed));
+        let after_edit = control_bytes(tmp.path());
+        drop(release);
+        refused_claim(tokio::time::timeout(DEADLINE, task).await.unwrap().unwrap(), GovernedClaimRefusal::AuthorityChanged);
+        // The caller's expected value still equals the snapshot it observed and
+        // the generation never moved, so the only place that can reject here is
+        // the lock-internal fresh-read-versus-observed comparison inside
+        // commit_governed. A generation-only check would admit this attempt.
+        let record = control(tmp.path()).read(SCOPE).await.unwrap().unwrap();
+        assert_eq!(record.control_generation, 1);
+        assert_eq!(record.policy.as_ref(), Some(&changed));
+        assert_eq!(control_bytes(tmp.path()), after_edit);
+        assert_eq!(cognition_bytes(tmp.path()), None);
+        // The refusal came from the fence, after this attempt already held its
+        // lease, so the payload-free .lock file remains by design; the claim
+        // still wrote no control record and no cognition partition.
+    }
+
+    #[tokio::test]
+    async fn verify_expecting_refuses_a_same_generation_policy_edit_that_lands_after_observe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let observed = bound_policy(HOST_ID);
+        seed_policy(tmp.path(), SCOPE, observed.clone()).await;
+        let mut claim = match expecting(tmp.path(), SCOPE, Some(&observed)).await {
+            ClaimAttempt::Claimed(claim) => claim, other => panic!("{other:?}") };
+        assert_eq!(control(tmp.path()).read(SCOPE).await.unwrap().unwrap().policy.as_ref(), Some(&observed));
+        let bytes = std::fs::read(db(tmp.path(), SCOPE)).unwrap();
+        // Arming the gate hook after acquisition is the same test-only gate
+        // mutation the existing claim tests already rely on; it adds no
+        // production await point.
+        let (hook, mut receiver, release) = pause();
+        claim.gate.after_precheck = Some(hook);
+        let claim = Arc::new(claim);
+        let ticket = claim.ticket().clone();
+        let cloned = Arc::clone(&claim);
+        let expected = observed.clone();
+        let task = tokio::spawn(async move { cloned.verify_expecting(&ticket, Some(&expected)).await });
+        entered(&mut receiver).await;
+        let changed = bound_policy(OTHER_HOST_ID);
+        let previous = raw_policy_edit_same_generation(tmp.path(), changed.clone()).await;
+        assert_eq!(previous["control_generation"], serde_json::json!(1));
+        assert_eq!(previous["policy"], observed);
+        let edited = control(tmp.path()).read(SCOPE).await.unwrap().unwrap();
+        assert_eq!(edited.control_generation, 1, "the edit must not move the generation");
+        assert_eq!(edited.policy.as_ref(), Some(&changed));
+        drop(release);
+        refused(tokio::time::timeout(DEADLINE, task).await.unwrap().unwrap().unwrap(), GovernedClaimRefusal::AuthorityChanged);
+        // Rollback-only: the refused verification wrote no partition byte, and
+        // the record is still the same generation carrying the edited policy.
+        assert_eq!(std::fs::read(db(tmp.path(), SCOPE)).unwrap(), bytes);
+        let record = control(tmp.path()).read(SCOPE).await.unwrap().unwrap();
+        assert_eq!(record.control_generation, 1);
+        assert_eq!(record.policy.as_ref(), Some(&changed));
+        let mut claim = Arc::try_unwrap(claim).unwrap();
+        claim.gate.after_precheck = None;
+        // The refusal did not damage tenure: once the caller's belief matches the
+        // edited policy, the same live claim verifies again at generation 1.
+        assert!(matches!(claim.verify_expecting(claim.ticket(), Some(&changed)).await.unwrap(),
+            ClaimVerification::Verified { control_generation: 1 }));
+    }
+
+    #[tokio::test]
+    async fn verify_expecting_rejects_an_old_ticket_inside_a_new_live_claim_transaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let observed = bound_policy(HOST_ID);
+        seed_policy(tmp.path(), SCOPE, observed.clone()).await;
+        let ClaimAttempt::Claimed(first) = expecting(tmp.path(), SCOPE, Some(&observed)).await else {
+            panic!("the observed binding must claim");
+        };
+        let old = first.ticket().clone(); drop(first);
+        let mut next = match expecting(tmp.path(), SCOPE, Some(&observed)).await {
+            ClaimAttempt::Claimed(claim) => claim, other => panic!("{other:?}") };
+        let bytes = std::fs::read(db(tmp.path(), SCOPE)).unwrap();
+        let (hook, mut receiver, release) = pause();
+        next.gate.inside_verification = Some(hook);
+        let next = Arc::new(next);
+        let cloned = Arc::clone(&next);
+        let expected = observed.clone();
+        let task = tokio::spawn(async move { cloned.verify_expecting(&old, Some(&expected)).await });
+        // This hook runs only AFTER the store opened its IMMEDIATE transaction,
+        // so the stale-origin decision is made by the double-token check inside
+        // one transaction, not by the caller-belief gate above it.
+        entered(&mut receiver).await;
+        let mut probe = rusqlite::Connection::open(db(tmp.path(), SCOPE)).unwrap();
+        probe.busy_timeout(Duration::ZERO).unwrap();
+        let error = probe.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap_err();
+        assert_eq!(error.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy));
+        drop(probe);
+        drop(release);
+        refused(tokio::time::timeout(DEADLINE, task).await.unwrap().unwrap().unwrap(), GovernedClaimRefusal::StaleIncarnation);
+        assert_eq!(std::fs::read(db(tmp.path(), SCOPE)).unwrap(), bytes);
+        let mut next = Arc::try_unwrap(next).unwrap(); next.gate.inside_verification = None;
+        assert!(matches!(next.verify_expecting(next.ticket(), Some(&observed)).await.unwrap(),
+            ClaimVerification::Verified { .. }));
+    }
+
+    #[tokio::test]
+    async fn verify_expecting_with_the_observed_policy_verifies_and_with_a_different_one_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let observed = bound_policy(HOST_ID);
+        seed_policy(tmp.path(), SCOPE, observed.clone()).await;
+        let ClaimAttempt::Claimed(claim) = expecting(tmp.path(), SCOPE, Some(&observed)).await else {
+            panic!("the observed binding must claim");
+        };
+        let before = std::fs::read(db(tmp.path(), SCOPE)).unwrap();
+        assert!(matches!(claim.verify_expecting(claim.ticket(), Some(&observed)).await.unwrap(),
+            ClaimVerification::Verified { control_generation: 1 }));
+        let other = bound_policy(OTHER_HOST_ID);
+        refused(claim.verify_expecting(claim.ticket(), Some(&other)).await.unwrap(), GovernedClaimRefusal::AuthorityChanged);
+        // The refused verification stayed rollback-only.
+        assert_eq!(std::fs::read(db(tmp.path(), SCOPE)).unwrap(), before);
+        assert_eq!(stored(tmp.path(), SCOPE), claim.token);
+    }
+
+    #[tokio::test]
+    async fn claim_expecting_refuses_a_legacy_enabled_record_without_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), SCOPE, true).await;
+        let before = control_bytes(tmp.path());
+        let expected = bound_policy(HOST_ID);
+        refused_claim(expecting(tmp.path(), SCOPE, Some(&expected)).await, GovernedClaimRefusal::AuthorityChanged);
+        // A legacy ON record without a policy is never downgraded or rewritten.
+        let record = control(tmp.path()).read(SCOPE).await.unwrap().unwrap();
+        assert_eq!(record.enabled, Some(true));
+        assert_eq!(record.policy, None);
+        assert_eq!(control_bytes(tmp.path()), before);
+        assert_eq!(cognition_bytes(tmp.path()), None);
+        assert!(lock_files(&tmp.path().join("leases")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn claim_and_verify_keep_their_existing_behaviour() {
+        // The unbound fixture entry points ignore the policy entirely.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_policy(tmp.path(), SCOPE, bound_policy(HOST_ID)).await;
+        let claim = acquire(tmp.path(), SCOPE).await;
+        assert_eq!(stored(tmp.path(), SCOPE), claim.token);
+        assert!(matches!(claim.verify(claim.ticket()).await.unwrap(),
+            ClaimVerification::Verified { control_generation: 1 }));
+    }
+
+    #[tokio::test]
+    async fn claim_expecting_with_none_expectation_refuses_a_record_that_carries_a_policy() {
+        // `None` states "no policy is stored". It must not act as a wildcard:
+        // a scope enabled under some other host's binding must be refused, not
+        // admitted, when the caller cannot name that binding.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_policy(tmp.path(), SCOPE, bound_policy(HOST_ID)).await;
+        let before = control_bytes(tmp.path());
+        refused_claim(expecting(tmp.path(), SCOPE, None).await, GovernedClaimRefusal::AuthorityChanged);
+        assert_eq!(control_bytes(tmp.path()), before);
+        assert_eq!(cognition_bytes(tmp.path()), None);
+        assert!(lock_files(&tmp.path().join("leases")).is_empty());
+
+        // The other side of the same exact-equality rule: `None` against a
+        // record that really stores no policy is admitted, in its own root so
+        // the refused attempt above cannot influence it.
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), SCOPE, true).await;
+        let ClaimAttempt::Claimed(claim) = expecting(tmp.path(), SCOPE, None).await else {
+            panic!("an absent stored policy must satisfy a None expectation");
+        };
+        assert_eq!(stored(tmp.path(), SCOPE), claim.token);
+    }
+
+    #[tokio::test]
+    async fn verify_expecting_with_none_expectation_refuses_a_record_that_carries_a_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let observed = bound_policy(HOST_ID);
+        seed_policy(tmp.path(), SCOPE, observed.clone()).await;
+        let ClaimAttempt::Claimed(claim) = expecting(tmp.path(), SCOPE, Some(&observed)).await else {
+            panic!("the observed binding must claim");
+        };
+        let before = std::fs::read(db(tmp.path(), SCOPE)).unwrap();
+        refused(claim.verify_expecting(claim.ticket(), None).await.unwrap(), GovernedClaimRefusal::AuthorityChanged);
+        // Rollback-only: the partition bytes and the tenure are unchanged.
+        assert_eq!(std::fs::read(db(tmp.path(), SCOPE)).unwrap(), before);
+        assert_eq!(stored(tmp.path(), SCOPE), claim.token);
+        // The refusal left the live claim usable with its real binding.
+        assert!(matches!(claim.verify_expecting(claim.ticket(), Some(&observed)).await.unwrap(),
+            ClaimVerification::Verified { control_generation: 1 }));
+    }
+
+    #[tokio::test]
+    async fn claim_expecting_reports_not_enabled_before_a_policy_mismatch() {
+        // Pins the gate order: a disabled scope reports NotEnabled even when the
+        // caller's binding also mismatches, so a future reorder is detected.
+        let tmp = tempfile::tempdir().unwrap();
+        control(tmp.path()).update(SCOPE, ControlGenerationExpectation::Absent,
+            WorkspaceIntelligenceControlPatch {
+                enabled: ControlFieldUpdate::Set(false),
+                policy: ControlFieldUpdate::Set(bound_policy(HOST_ID)),
+                ..Default::default()
+            }).await.unwrap();
+        let before = control_bytes(tmp.path());
+        let other = bound_policy(OTHER_HOST_ID);
+        refused_claim(expecting(tmp.path(), SCOPE, Some(&other)).await, GovernedClaimRefusal::NotEnabled);
+        assert_eq!(control_bytes(tmp.path()), before);
+        assert_eq!(cognition_bytes(tmp.path()), None);
+        assert!(lock_files(&tmp.path().join("leases")).is_empty());
     }
 }
