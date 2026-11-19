@@ -30,6 +30,7 @@ export const forbiddenContentRules = [
     'catalog_readonly.rs',
     'host_binding.rs',
     'host_standby.rs',
+    'host_fixture.rs',
   ].map((file) => ({
     path: `src/crates/assembly/core/src/service/workspace_intelligence/${file}`,
     patterns: [{

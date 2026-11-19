@@ -145,7 +145,7 @@ export const requiredContentRules = [
   {
     path: 'src/crates/assembly/core/src/service/workspace_intelligence/mod.rs',
     reason:
-      'the internal workspace intelligence control and cognition slices must stay behind their explicit internal features and out of the default, product-full, and agent-runtime assembly',
+      'the internal workspace intelligence control and cognition slices must stay behind their explicit internal features and out of the default, product-full, and agent-runtime assembly, and the test-support fixture stays behind test-support AND the host feature',
     patterns: [
       {
         regex: /#\[cfg\(feature = "workspace-intelligence-control"\)\]\s*pub\(crate\) mod control;/,
@@ -179,6 +179,10 @@ export const requiredContentRules = [
       {
         regex: /#\[cfg\(feature = "workspace-intelligence-host"\)\]\s*pub\(crate\) mod host_standby;/,
         message: 'missing workspace-intelligence-host bounded fallback source gate',
+      },
+      {
+        regex: /#\[cfg\(all\(feature = "test-support", feature = "workspace-intelligence-host"\)\)\]\s*pub mod host_fixture;/,
+        message: 'missing test-support-gated workspace intelligence host fixture source gate',
       },
     ],
   },

@@ -5,6 +5,7 @@ use openbitfun_services_core::runtime_ownership::{
 };
 use tempfile::tempdir;
 
+use crate::infrastructure::PathManager;
 use crate::runtime_ownership::CoreRuntimeOwnership;
 #[cfg(feature = "dispatch-store")]
 use crate::service::dispatch::{DispatchTarget, OutboundDispatchRecord, OutboundDispatchStore};
@@ -264,4 +265,43 @@ fn ownership_conflict_guidance_matches_the_calling_product_surface() {
         assert!(message.contains("close its clients"), "{entrypoint}");
     }
     drop(shared);
+}
+
+#[test]
+fn embedded_deployment_is_reported_without_touching_ownership_storage() {
+    let temp = tempdir().expect("temp user root");
+    let paths = PathManager::with_user_root_for_tests(temp.path().join("user"));
+    let owner = CoreRuntimeOwnership::embedded(&paths, "embedded-test");
+
+    assert_eq!(owner.deployment(), RuntimeDeployment::Embedded);
+    // Embedded ownership acquires nothing at construction time, so the
+    // deployment fact is reported without any ownership directory existing.
+    assert!(!paths.agent_runtime_ownership_dir().exists());
+}
+
+#[test]
+fn shared_deployment_is_reported_and_holds_one_exclusive_lease() {
+    let temp = tempdir().expect("temp user root");
+    let paths = PathManager::with_user_root_for_tests(temp.path().join("user"));
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("a real workspace directory");
+
+    let owner =
+        CoreRuntimeOwnership::shared(&paths, "shared-test", &workspace).expect("shared owner");
+    assert_eq!(owner.deployment(), RuntimeDeployment::Shared);
+
+    // The reported deployment is the acquired one: the lease inside the temp
+    // ownership root is exclusive, so no second owner can take this workspace.
+    let key = RuntimeOwnershipKey::for_workspace(
+        &workspace,
+        CoreRuntimeOwnership::distribution_identity(),
+    )
+    .expect("ownership key");
+    assert!(WorkspaceRuntimeOwnership::try_acquire(
+        &paths.agent_runtime_ownership_dir(),
+        &key,
+        RuntimeDeployment::Shared,
+    )
+    .is_err());
+    drop(owner);
 }

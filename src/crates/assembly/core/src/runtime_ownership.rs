@@ -264,6 +264,18 @@ impl CoreRuntimeOwnership {
         product_id()
     }
 
+    /// The deployment this process owner selected.
+    ///
+    /// A read-only projection of a fact the owner already holds: it neither widens
+    /// nor changes what was acquired, and it is not an admission gate. Callers that
+    /// must refuse a delivery profile decide that from their own surface.
+    pub fn deployment(&self) -> RuntimeDeployment {
+        match self.deployment {
+            CoreRuntimeOwnershipDeployment::Embedded { .. } => RuntimeDeployment::Embedded,
+            CoreRuntimeOwnershipDeployment::Shared { .. } => RuntimeDeployment::Shared,
+        }
+    }
+
     pub fn error_message(&self, error: &CoreRuntimeOwnershipError) -> String {
         let deployment = match &self.deployment {
             CoreRuntimeOwnershipDeployment::Embedded { .. } => RuntimeDeployment::Embedded,

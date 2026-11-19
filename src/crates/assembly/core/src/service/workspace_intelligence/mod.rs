@@ -54,15 +54,21 @@
 //! are gated on `workspace-intelligence-host` together with the rest of the host
 //! slice.
 //!
-//! This is WP1.4 S3+S4 phase A only, and it is neither a WP1.4 nor a P1 exit. It
-//! adds no first enable, no `allow_off`, no pending cursor, no content mutation,
-//! no model run, no Tauri command, no Product Operation Registry row and no UI.
-//! `bootstrap` returns a handle nobody promotes yet; a real enable later must pass
-//! the P2.4/P3 gate. Nothing here is selected by `default`, `product-full` or
-//! `agent-runtime`.
+//! This is neither a WP1.4 nor a P1 exit: it adds no first enable, no
+//! `allow_off`, no pending cursor, no content mutation, no model run, no Tauri
+//! command, no Product Operation Registry row and no UI. `bootstrap` returns a
+//! handle nobody promotes yet; a real enable later must pass the P2.4/P3 gate.
+//! Nothing here is selected by `default`, `product-full` or `agent-runtime`.
+//!
+//! The `test-support`-gated `host_fixture` module is a test-only writer that
+//! publishes one real enabled scope through those same owners, for a test that
+//! needs that persisted shape and cannot obtain it from a production entry point.
+//! Outside `#[cfg(test)]` fixtures it is the only mint site of a host anchor in
+//! this crate, and no production caller names it.
 
 // Crate-internal modules: reachable inside the crate. Only the facade re-exported at
-// the end of this module is public API; `host` itself stays crate-private.
+// the end of this module and the `test-support`-gated `host_fixture` below are public
+// API; `host` itself stays crate-private.
 // Nothing in this tree has a production consumer yet. The allowances are per module
 // so each one disappears with the change that gives that module its caller.
 #[allow(dead_code)]
@@ -96,6 +102,11 @@ pub(crate) mod commit;
 #[allow(dead_code)]
 #[cfg(feature = "workspace-intelligence-claim")]
 pub(crate) mod claim;
+// Test-only, and behind both features: it publishes an enabled scope for a test
+// that must have one, while the production enable gate stays outside this tree.
+// Nothing a `test-support` build produces is part of a product assembly.
+#[cfg(all(feature = "test-support", feature = "workspace-intelligence-host"))]
+pub mod host_fixture;
 
 // The application-facing surface of this tree. A host handle is opaque and is
 // obtained only through `bootstrap` (host feature compiled) or `not_compiled`
