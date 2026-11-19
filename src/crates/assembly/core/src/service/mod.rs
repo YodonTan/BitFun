@@ -53,7 +53,7 @@ pub mod token_usage; // Token usage tracking
 pub mod web_search; // Provider-neutral WebSearch runtime and local credentials
 #[cfg(feature = "workspace-runtime")]
 pub mod workspace; // Workspace management // Diff calculation and merge service
-pub(crate) mod workspace_intelligence; // Workspace intelligence tier derivation (P0, private)
+pub mod workspace_intelligence; // Workspace intelligence host facade; everything except it stays crate-internal
 #[cfg(feature = "workspace-runtime")]
 pub mod workspace_runtime; // Workspace runtime layout / migration / initialization
 #[cfg(all(feature = "agent-runtime", feature = "git"))]
@@ -152,3 +152,123 @@ pub use worktree::WorktreeService;
 /// Session-scoped output projection shared by remote delivery surfaces.
 #[cfg(feature = "remote-connect")]
 pub mod output_files;
+
+// Consumed from outside `workspace_intelligence` on purpose: this module is an
+// ordinary caller of the facade, so it proves the app-facing surface is nameable
+// from a sibling module without reaching past it.
+#[cfg(test)]
+mod workspace_intelligence_facade_contract {
+    #[cfg(not(feature = "workspace-intelligence-host"))]
+    use super::workspace_intelligence::{
+        WorkspaceIntelligenceHost, WorkspaceIntelligenceHostReason, WorkspaceIntelligenceHostState,
+    };
+
+    /// A build without the feature answers `NotCompiled` through the same facade,
+    /// performs no IO and needs no host id from the caller.
+    #[cfg(not(feature = "workspace-intelligence-host"))]
+    #[tokio::test]
+    async fn the_app_facing_facade_answers_not_compiled_without_the_host_feature() {
+        let host = WorkspaceIntelligenceHost::not_compiled();
+
+        let status = host.status().await;
+        assert_eq!(status.state(), WorkspaceIntelligenceHostState::NotCompiled);
+        assert_eq!(
+            status.reason(),
+            Some(WorkspaceIntelligenceHostReason::NotCompiled)
+        );
+        assert_eq!(status.counts().active(), 0);
+        assert_eq!(status.counts().standby(), 0);
+        assert!(!status.anchor_present());
+        assert_eq!(status.host_marker(), None);
+        assert!(status.scopes().is_empty());
+
+        let shutdown = host.shutdown().await;
+        assert_eq!(shutdown.state(), WorkspaceIntelligenceHostState::NotCompiled);
+    }
+
+    /// An ordinary caller sees the redacted marker and nothing that would let it
+    /// recover the anchor identity, a storage root or a tenure handle.
+    #[cfg(feature = "workspace-intelligence-host")]
+    #[tokio::test]
+    async fn the_app_facing_facade_reports_only_redacted_identity() {
+        use std::sync::Arc;
+
+        use openbitfun_services_core::runtime_ownership::RuntimeDeployment;
+        use openbitfun_services_core::workspace_intelligence_host_anchor::{
+            HostAnchorEnsure, HostAnchorStore, HOST_ID_PREFIX,
+        };
+        use tempfile::tempdir;
+
+        use super::workspace_intelligence::{
+            WorkspaceIntelligenceHost, WorkspaceIntelligenceHostSurface,
+        };
+        use crate::infrastructure::PathManager;
+
+        let temp = tempdir().expect("a temp user root");
+        let paths = Arc::new(PathManager::with_user_root_for_tests(
+            temp.path().join("user"),
+        ));
+
+        // The anchor is published by its own owner, exactly as first enable does,
+        // before any caller can ask the host about it.
+        let store = HostAnchorStore::new(paths.workspace_intelligence_dir());
+        let host_id = match store.ensure().await.expect("the anchor is mintable") {
+            HostAnchorEnsure::Created(anchor) | HostAnchorEnsure::Existing(anchor) => {
+                anchor.host_id().to_owned()
+            }
+        };
+        let anchor_suffix = host_id
+            .strip_prefix(HOST_ID_PREFIX)
+            .expect("a validated host id carries the version prefix")
+            .to_owned();
+
+        let host = WorkspaceIntelligenceHost::bootstrap(
+            Arc::clone(&paths),
+            None,
+            WorkspaceIntelligenceHostSurface::Desktop,
+            RuntimeDeployment::Embedded,
+        )
+        .await;
+
+        let status = host.status().await;
+        assert!(status.anchor_present(), "the minted anchor is consulted");
+        let marker = status
+            .host_marker()
+            .expect("an anchored host reports a marker");
+        assert!(
+            marker.starts_with(HOST_ID_PREFIX) && marker.ends_with("..."),
+            "the marker is the versioned redaction, not the identity: {marker}"
+        );
+        assert_ne!(marker, host_id, "the marker is not the host id");
+        assert_eq!(
+            marker.len(),
+            HOST_ID_PREFIX.len() + 7,
+            "the marker keeps only four suffix characters"
+        );
+
+        // The whole public rendering of status must never carry the identity or a
+        // storage location, whatever an app logs or forwards.
+        let rendered = format!("{status:?}");
+        assert!(
+            !rendered.contains(&host_id),
+            "status must not carry the full host id: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&anchor_suffix),
+            "status must not carry the anchor suffix: {rendered}"
+        );
+        assert!(
+            !rendered.contains("workspace-intelligence") && !rendered.contains("host-anchor"),
+            "status must not carry a storage location: {rendered}"
+        );
+
+        let shutdown = host.shutdown().await;
+        let shutdown_rendered = format!("{shutdown:?}");
+        assert!(
+            !shutdown_rendered.contains(&host_id)
+                && !shutdown_rendered.contains(&anchor_suffix)
+                && !shutdown_rendered.contains("workspace-intelligence"),
+            "a drain result must not carry identity or a root: {shutdown_rendered}"
+        );
+    }
+}

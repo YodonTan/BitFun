@@ -4690,6 +4690,128 @@ test('workspace intelligence core claim selects only the services claim owner', 
   )));
 });
 
+test('workspace intelligence host selects only the narrow host owner set', async () => {
+  const manifestPath = 'src/crates/assembly/core/Cargo.toml';
+  const manifest = await readFile(new URL(`../${manifestPath}`, import.meta.url), 'utf8');
+  const features = parseManifestFeatures(manifest);
+  const expectedReferences = [
+    'workspace-intelligence-control',
+    'workspace-intelligence-cognition',
+    'workspace-intelligence-commit',
+    'workspace-intelligence-claim',
+    'openbitfun-services-core/workspace-intelligence-host-anchor',
+    'openbitfun-services-core/workspace-persistence',
+    'openbitfun-services-core/local-storage',
+    'openbitfun-services-core/runtime-ownership',
+    'tokio/macros',
+    'tokio/rt',
+    'tokio/sync',
+    'tokio/time',
+  ];
+  assert.deepEqual(features['workspace-intelligence-host'], expectedReferences);
+  for (const assembly of ['default', 'product-full', 'agent-runtime']) {
+    assert.ok(
+      !features[assembly].includes('workspace-intelligence-host'),
+      `${assembly} must not assemble the internal host slice`,
+    );
+  }
+  // The host compiles the persisted registry and the owners it fences claims
+  // with; it must never compile a workspace runtime, an agent tool contract, a
+  // process runtime or a second control write path.
+  for (const forbidden of [
+    'workspace-runtime',
+    'local-storage',
+    'process-runtime',
+    'dep:openbitfun-agent-tools',
+    'dep:serde_yaml',
+  ]) {
+    assert.ok(
+      !features['workspace-intelligence-host'].includes(forbidden),
+      `workspace-intelligence-host must not select ${forbidden}`,
+    );
+  }
+  const rule = coreClosedFeatureProfileRules.find(
+    (candidate) => candidate.manifestPath === manifestPath
+      && candidate.featureName === 'workspace-intelligence-host',
+  );
+  assert.equal(rule?.exact, true);
+  assert.deepEqual(rule.requiredFeatureRefs, expectedReferences);
+
+  // The reviewed Tokio contract is exactly `macros`, `rt`, `sync` and `time`: the
+  // host drives owner futures with a bounded drain and fallback backoff, names
+  // `watch` and `Mutex` directly, and performs no IO, network or process work
+  // itself.
+  const hostMessages = (references) => findTokioDependencyFeatureViolations([{
+    name: 'openbitfun-core',
+    manifest_path: manifestPath,
+    dependencies: [],
+    features: { 'workspace-intelligence-host': references },
+  }]).map((violation) => violation.message)
+    .filter((message) => message.includes(':workspace-intelligence-host '));
+  const hostTokio = ['tokio/macros', 'tokio/rt', 'tokio/sync', 'tokio/time'];
+  assert.deepEqual(hostMessages(hostTokio), []);
+  for (const widened of ['tokio/process', 'tokio/net', 'tokio/fs', 'tokio/io-util', 'tokio/rt-multi-thread']) {
+    const messages = hostMessages([...hostTokio, widened]);
+    assert.ok(
+      messages.length > 0 && messages.every((message) => message.includes('Tokio')),
+      `workspace-intelligence-host must reject widening with ${widened}`,
+    );
+  }
+
+  const modulePath = 'src/crates/assembly/core/src/service/workspace_intelligence/mod.rs';
+  const source = await readFile(new URL(`../${modulePath}`, import.meta.url), 'utf8');
+  for (const name of ['catalog_readonly', 'host_binding', 'host_standby']) {
+    assert.match(
+      source,
+      new RegExp(`#\\[cfg\\(feature = "workspace-intelligence-host"\\)\\]\\s*pub\\(crate\\) mod ${name};`),
+    );
+  }
+  // The host module itself stays unconditional so a feature-off build answers
+  // `NotCompiled` rather than failing to build or silently reporting success.
+  assert.match(source, /^pub\(crate\) mod host;$/m);
+  const sourceRule = requiredContentRules.find((candidate) => candidate.path === modulePath);
+  for (const name of ['catalog_readonly', 'host_binding', 'host_standby']) {
+    assert.ok(sourceRule?.patterns.some((pattern) => pattern.regex.test(
+      `#[cfg(feature = "workspace-intelligence-host")]\npub(crate) mod ${name};`,
+    )), `core workspace intelligence source rule must require the ${name} host gate`);
+  }
+  assert.ok(sourceRule?.patterns.some((pattern) => pattern.regex.test('pub(crate) mod host;\n')));
+
+  // The gate itself is pinned: a cfg in front of `mod host;` is a violation.
+  const gatedHostRule = forbiddenContentRules.find(
+    (candidate) => candidate.path === modulePath,
+  );
+  const gatedPattern = gatedHostRule?.patterns.find((pattern) => pattern.wholeFile);
+  assert.ok(gatedPattern, 'the workspace intelligence module must forbid gating `mod host`');
+  assert.equal(
+    findForbiddenContentMatches(
+      '#[cfg(feature = "workspace-intelligence-host")]\npub(crate) mod host;\n',
+      [gatedPattern],
+      modulePath,
+    ).length,
+    1,
+  );
+  assert.equal(findForbiddenContentMatches(source, [gatedPattern], modulePath).length, 0);
+
+  // The host slice must never reach the core workspace runtime owner: that
+  // import is what turned the host into a workspace-runtime consumer.
+  for (const file of ['host.rs', 'catalog_readonly.rs', 'host_binding.rs', 'host_standby.rs']) {
+    const filePath = `src/crates/assembly/core/src/service/workspace_intelligence/${file}`;
+    const runtimeRule = forbiddenContentRules.find((candidate) => candidate.path === filePath);
+    assert.ok(runtimeRule, `${file} must forbid reaching the workspace runtime owner`);
+    assert.equal(
+      findForbiddenContentMatches('use crate::service::workspace::WorkspaceService;\n', runtimeRule.patterns, filePath).length,
+      1,
+    );
+    const fileSource = await readFile(new URL(`../${filePath}`, import.meta.url), 'utf8');
+    assert.equal(
+      findForbiddenContentMatches(fileSource, runtimeRule.patterns, filePath).length,
+      0,
+      `${file} must not name the workspace runtime owner`,
+    );
+  }
+});
+
 test('workspace intelligence cognition cannot acquire Tokio capabilities', () => {
   const cognitionMessages = (references) => findTokioDependencyFeatureViolations([{
     name: 'openbitfun-services-core',
@@ -4750,6 +4872,7 @@ test('Core Tokio capabilities cannot hide behind an unreviewed owner feature', (
       'legacy-migration': [],
       'mcp-runtime': ['agent-runtime', 'tokio/rt-multi-thread'],
       'browser-control': ['tokio/net', 'tokio/rt', 'tokio/time'],
+      'workspace-intelligence-host': ['tokio/macros', 'tokio/rt', 'tokio/sync', 'tokio/time'],
       sneaky: ['agent-runtime', 'browser-control'],
     },
   };
@@ -4772,6 +4895,7 @@ test('reviewed Tokio aggregates cannot declare runtime capabilities directly', (
       'legacy-migration': [],
       'mcp-runtime': ['agent-runtime', 'tokio/rt-multi-thread'],
       'browser-control': ['tokio/net', 'tokio/rt', 'tokio/time'],
+      'workspace-intelligence-host': ['tokio/macros', 'tokio/rt', 'tokio/sync', 'tokio/time'],
       'product-full': ['agent-runtime', 'tokio/net'],
     },
   };

@@ -1788,6 +1788,33 @@ export const coreClosedFeatureProfileRules = [
     exact: true,
     reason: 'openbitfun-core workspace-intelligence-claim selects only the services claim owner, without product policy, model resolution, timer, runtime, UI, a second control write path, or core control/cognition/commit features',
   },
+  // WP1.4 S3+S4 phase A: the host slice. The profile is closed on purpose: the
+  // host composes the four workspace intelligence owners plus the persisted
+  // registry/locality/ownership owners and four Tokio capabilities, and it must
+  // never reach the core `workspace-runtime` aggregate (which would compile a
+  // workspace runtime into the host), the core `local-storage` aggregate (which
+  // pulls the agent tool contracts), or the process runtime.
+  {
+    manifestPath: 'src/crates/assembly/core/Cargo.toml',
+    featureName: 'workspace-intelligence-host',
+    requiredFeatureRefs: [
+      'workspace-intelligence-control',
+      'workspace-intelligence-cognition',
+      'workspace-intelligence-commit',
+      'workspace-intelligence-claim',
+      'openbitfun-services-core/workspace-intelligence-host-anchor',
+      'openbitfun-services-core/workspace-persistence',
+      'openbitfun-services-core/local-storage',
+      'openbitfun-services-core/runtime-ownership',
+      'tokio/macros',
+      'tokio/rt',
+      'tokio/sync',
+      'tokio/time',
+    ],
+    exact: true,
+    reason:
+      'openbitfun-core workspace-intelligence-host must select exactly the host anchor, control/cognition/commit/claim owners, the persisted workspace registry, local storage, runtime ownership and the four Tokio capabilities it uses, without a workspace runtime, an agent tool contract, a process runtime, a scheduler, a second control write path, or UI',
+  },
   {
     manifestPath: 'src/crates/assembly/core/Cargo.toml',
     featureName: 'dispatch-store',

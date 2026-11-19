@@ -14,10 +14,16 @@
 
 /// Host and execution domain that own a control record.
 ///
-/// The key is a pure pair of caller-supplied identifiers. It is never derived
-/// from a device identity, a connection id, a PID, a hostname probe, or the
-/// current machine, so two different hosts can never be merged by an ambient
-/// discovery step.
+/// The key is a pure pair of caller-supplied identifiers. The host id comes from
+/// the write-once persisted host anchor of the storage/user-data namespace (the
+/// `workspace-intelligence-host-anchor` document); it is never derived from
+/// hardware, an account, a device id, a PID, a hostname probe, a Session id or a
+/// connection id. Nothing here performs ambient discovery of any kind, so two
+/// different hosts can never be merged by one.
+///
+/// A scope is never persisted as a document of its own: it exists only as the
+/// composition of that persisted anchor (as the host id) and the execution domain
+/// of the caller, and there is no second encoding of it anywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostExecutionDomainKey {
     host_id: String,

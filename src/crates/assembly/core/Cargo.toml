@@ -474,6 +474,33 @@ workspace-intelligence-commit = ["openbitfun-services-core/workspace-intelligenc
 # Internal already-enabled owner lifecycle; selects only the services claim owner.
 # Not selected by `default`, `product-full` or `agent-runtime`.
 workspace-intelligence-claim = ["openbitfun-services-core/workspace-intelligence-claim"]
+# Internal workspace intelligence host slice (WP1.4 S3+S4 phase A). This list is
+# exact and narrow: the host compiles the anchor, the control store, the cognition
+# partition, the commit fence, the claim owner, the persisted workspace registry,
+# local storage, runtime ownership and the four Tokio capabilities it uses, and
+# nothing else. It deliberately omits the core `workspace-runtime` aggregate, the
+# core `local-storage` aggregate, the process runtime and every scheduler, so the
+# host never becomes a workspace-runtime or process consumer. It is not selected
+# by `default`, `product-full` or `agent-runtime`; a future real narrow consumer
+# selects it explicitly in its own manifest. The child-process fixture needs the
+# shared process manager only in tests, through the `[dev-dependencies]` entry.
+#
+# `tokio/sync` is declared because this slice names `watch` and `Mutex` directly, so
+# the capability must not arrive by feature unification with a services owner.
+workspace-intelligence-host = [
+    "workspace-intelligence-control",
+    "workspace-intelligence-cognition",
+    "workspace-intelligence-commit",
+    "workspace-intelligence-claim",
+    "openbitfun-services-core/workspace-intelligence-host-anchor",
+    "openbitfun-services-core/workspace-persistence",
+    "openbitfun-services-core/local-storage",
+    "openbitfun-services-core/runtime-ownership",
+    "tokio/macros",
+    "tokio/rt",
+    "tokio/sync",
+    "tokio/time",
+]
 workspace-runtime = [
     "openbitfun-services-core/workspace-persistence",
     "dep:serde_yaml",
@@ -506,6 +533,10 @@ tokio-tungstenite = { workspace = true, default-features = true }
 openbitfun-runtime-services = { path = "../../execution/runtime-services", features = ["test-support"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# Test-only process spawn for the workspace intelligence host two-process fixture.
+# Keeping it here means the production `workspace-intelligence-host` feature never
+# carries process / tokio-process / win32job / which capability.
+openbitfun-services-core = { path = "../../services/services-core", features = ["process-runtime"] }
 
 [[test]]
 name = "git_contracts"

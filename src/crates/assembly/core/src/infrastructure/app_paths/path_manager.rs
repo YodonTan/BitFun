@@ -291,24 +291,36 @@ impl PathManager {
             .join("coordination.sqlite")
     }
 
+    /// Shared user-data namespace root for workspace intelligence.
+    ///
+    /// This is the one directory that owns all four host-local children: the
+    /// `control` record root, the `cognition` partition root, the `lease` root and
+    /// the `host-anchor.json` document. It is named after the namespace rather than
+    /// after the anchor because the anchor document is only one of its children: an
+    /// `workspace_intelligence_host_anchor_dir` accessor would suggest an
+    /// anchor-specific directory while returning this shared parent.
+    ///
+    /// A pure path derivation: it creates no directory and takes no lock. This is
+    /// the only place the shared parent is spelled; the three sibling roots below
+    /// and the anchor document location all resolve against it.
+    pub fn workspace_intelligence_dir(&self) -> PathBuf {
+        self.user_data_dir().join("workspace-intelligence")
+    }
+
     /// Host-local authoritative control-record root for workspace intelligence.
     ///
     /// Separate from the memory database and memory workspace roots so the legacy
     /// memory reset cannot reach it. This is a host-local config root, not a
     /// workspace file root.
     pub fn workspace_intelligence_control_dir(&self) -> PathBuf {
-        self.user_data_dir()
-            .join("workspace-intelligence")
-            .join("control")
+        self.workspace_intelligence_dir().join("control")
     }
 
     /// Host-local authoritative cognition partition root for workspace intelligence.
     /// Sibling of the control root and deliberately outside the memory database and
     /// the memory workspace root, so the legacy memory reset cannot reach it.
     pub fn workspace_intelligence_cognition_dir(&self) -> PathBuf {
-        self.user_data_dir()
-            .join("workspace-intelligence")
-            .join("cognition")
+        self.workspace_intelligence_dir().join("cognition")
     }
 
     /// Single stable host-local lease root for workspace intelligence owner tenure.
@@ -317,9 +329,7 @@ impl PathManager {
     /// database and memory workspace roots, so the legacy memory reset cannot reach it.
     /// A pure path derivation: it creates no directory and takes no lock.
     pub fn workspace_intelligence_lease_dir(&self) -> PathBuf {
-        self.user_data_dir()
-            .join("workspace-intelligence")
-            .join("lease")
+        self.workspace_intelligence_dir().join("lease")
     }
 
     /// Process-level ownership locks for local Agent Runtime deployments.
@@ -876,6 +886,76 @@ mod tests {
                 .join("agent-runtime")
                 .join("ownership")
         );
+    }
+
+    /// The workspace intelligence namespace root owns every host-local child.
+    ///
+    /// The anchor document sits directly in this directory and the three record
+    /// roots are its children, so one accessor describes all four locations and a
+    /// nesting change cannot silently orphan the anchor.
+    #[test]
+    fn workspace_intelligence_namespace_root_is_the_single_parent_of_every_host_root() {
+        let fixture = tempfile::tempdir().expect("temp dir");
+        let paths = PathManager::with_user_root_for_tests(fixture.path().join("user"));
+        let namespace = paths.workspace_intelligence_dir();
+
+        assert_eq!(
+            namespace,
+            paths.user_data_dir().join("workspace-intelligence")
+        );
+        for root in [
+            paths.workspace_intelligence_control_dir(),
+            paths.workspace_intelligence_cognition_dir(),
+            paths.workspace_intelligence_lease_dir(),
+        ] {
+            assert_eq!(
+                root.parent(),
+                Some(namespace.as_path()),
+                "every host root must be a direct child of the namespace root: {root:?}"
+            );
+        }
+        assert!(
+            !paths.memories_root_dir().starts_with(&namespace),
+            "the namespace root must not be an ancestor of the memory workspace root"
+        );
+        let memories_database_parent = paths
+            .memories_database_file()
+            .parent()
+            .expect("the memory database file must have a parent")
+            .to_path_buf();
+        assert!(
+            !memories_database_parent.starts_with(&namespace),
+            "the memory database directory must not live under the namespace root"
+        );
+        // The anchor store appends its own file name to the root it is given, so the
+        // namespace root is exactly what it must be constructed with and the
+        // document lands one level below the user-data root.
+        #[cfg(feature = "workspace-intelligence-host")]
+        assert_eq!(
+            namespace.join(
+                openbitfun_services_core::workspace_intelligence_host_anchor::HOST_ANCHOR_FILE_NAME
+            ),
+            paths
+                .user_data_dir()
+                .join("workspace-intelligence")
+                .join("host-anchor.json"),
+        );
+    }
+
+    /// The namespace root is a pure derivation: nothing is created on disk.
+    #[test]
+    fn workspace_intelligence_namespace_root_creates_nothing() {
+        let fixture = tempfile::tempdir().expect("temp dir");
+        let paths = PathManager::with_user_root_for_tests(fixture.path().join("user"));
+        for path in [
+            paths.workspace_intelligence_dir(),
+            paths.workspace_intelligence_control_dir(),
+            paths.workspace_intelligence_cognition_dir(),
+            paths.workspace_intelligence_lease_dir(),
+        ] {
+            assert!(!path.exists(), "a path derivation must not create {path:?}");
+        }
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 0);
     }
 
     /// P1 core control slice: WP1.1 core assembly + WP1.2a control-vs-control.

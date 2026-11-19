@@ -14,8 +14,11 @@
 //! compare-and-swap. The feature-gated `partition` module adds the internal
 //! cognition partition handle over the authoritative per-scope partition store.
 //!
-//! These slices are internal and have no production caller, app bootstrap,
-//! legacy confirmation gate, UI, command, registry or capability. A real enable
+//! The P0/P1 control and cognition slices are internal and have no production
+//! caller, no app entry point of their own, no legacy confirmation gate, UI,
+//! command, registry or capability. The gated `host` facade re-exported at the end
+//! of this module is the only app-facing entry point, and no in-tree composition
+//! root calls it yet. A real enable
 //! later must pass the P2.4/P3 gate; nothing here turns workspace intelligence
 //! on, and no product feature selects `workspace-intelligence-control`.
 //!
@@ -37,19 +40,74 @@
 //! identity source, execution-binding change detection, Shared-profile gate,
 //! pending cursor, revision/epoch, model run, background task or registry.
 //! It is not selected by `default`, `product-full` or `agent-runtime`.
+//!
+//! The unconditional `host` module is the workspace intelligence host handle:
+//! bootstrap over one owner-decoded persisted catalog, per-scope lease tenure, a
+//! typed status snapshot and a bounded shutdown. It is unconditional so
+//! that a build without the feature can answer `NotCompiled` instead of
+//! failing to link or silently reporting success. Its handle, its three entry
+//! points and the plain status data around them are re-exported at the end of
+//! this module as the one app-facing surface of this tree; every other type here
+//! stays crate-internal. The `catalog_readonly` module
+//! (read-only persisted registry snapshot), the `host_binding` module (execution
+//! binding resolution) and the `host_standby` module (bounded fallback wake-up)
+//! are gated on `workspace-intelligence-host` together with the rest of the host
+//! slice.
+//!
+//! This is WP1.4 S3+S4 phase A only, and it is neither a WP1.4 nor a P1 exit. It
+//! adds no first enable, no `allow_off`, no pending cursor, no content mutation,
+//! no model run, no Tauri command, no Product Operation Registry row and no UI.
+//! `bootstrap` returns a handle nobody promotes yet; a real enable later must pass
+//! the P2.4/P3 gate. Nothing here is selected by `default`, `product-full` or
+//! `agent-runtime`.
 
-#![allow(dead_code)] // P0 has no production consumer yet; remove once a later phase wires it in.
-
-// Crate-internal modules for P1+ consumers: reachable inside the crate, never a public API.
+// Crate-internal modules: reachable inside the crate. Only the facade re-exported at
+// the end of this module is public API; `host` itself stays crate-private.
+// Nothing in this tree has a production consumer yet. The allowances are per module
+// so each one disappears with the change that gives that module its caller.
+#[allow(dead_code)]
 pub(crate) mod scope;
+#[allow(dead_code)]
 pub(crate) mod mode;
+#[allow(dead_code)]
 pub(crate) mod policy;
+#[allow(dead_code)]
 pub(crate) mod read_contract;
+// Unconditional: a feature-off build must be able to answer `NotCompiled`.
+pub(crate) mod host;
+#[allow(dead_code)] // Internal to the host slice; consumed only by `host`.
+#[cfg(feature = "workspace-intelligence-host")]
+pub(crate) mod catalog_readonly;
+#[allow(dead_code)] // Internal to the host slice; consumed only by `host`.
+#[cfg(feature = "workspace-intelligence-host")]
+pub(crate) mod host_binding;
+#[allow(dead_code)] // Internal to the host slice; consumed only by `host`.
+#[cfg(feature = "workspace-intelligence-host")]
+pub(crate) mod host_standby;
+#[allow(dead_code)]
 #[cfg(feature = "workspace-intelligence-control")]
 pub(crate) mod control;
+#[allow(dead_code)]
 #[cfg(feature = "workspace-intelligence-cognition")]
 pub(crate) mod partition;
+#[allow(dead_code)]
 #[cfg(feature = "workspace-intelligence-commit")]
 pub(crate) mod commit;
+#[allow(dead_code)]
 #[cfg(feature = "workspace-intelligence-claim")]
 pub(crate) mod claim;
+
+// The application-facing surface of this tree. A host handle is opaque and is
+// obtained only through `bootstrap` (host feature compiled) or `not_compiled`
+// (host feature absent); the rest is plain status data an app renders or logs.
+// Tenure, tickets, tokens, lease paths, control/cognition roots and the raw
+// anchor stay crate-internal, as does every type of `host_binding`,
+// `host_standby` and `catalog_readonly`.
+pub use host::{
+    WorkspaceIntelligenceHost, WorkspaceIntelligenceHostBlock, WorkspaceIntelligenceHostCounts,
+    WorkspaceIntelligenceHostDrain, WorkspaceIntelligenceHostReason,
+    WorkspaceIntelligenceHostScopeReport, WorkspaceIntelligenceHostScopeState,
+    WorkspaceIntelligenceHostShutdown, WorkspaceIntelligenceHostState,
+    WorkspaceIntelligenceHostStatus, WorkspaceIntelligenceHostSurface,
+    WorkspaceIntelligenceHostUnsupportedProfile, WorkspaceIntelligenceHostUnsupportedScope,
+};

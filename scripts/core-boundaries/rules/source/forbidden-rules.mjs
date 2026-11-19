@@ -9,6 +9,38 @@ const agentRuntimeRootUnexpectedLine = new RegExp(
 
 export const forbiddenContentRules = [
   {
+    path: 'src/crates/assembly/core/src/service/workspace_intelligence/mod.rs',
+    reason:
+      'the workspace intelligence host module answers NotCompiled in a feature-off build, so it must never be gated',
+    patterns: [{
+      regex: /#\[cfg\([\s\S]*?\)\][ \t]*\r?\n(?:[ \t]*\/\/[^\n]*\r?\n)*[ \t]*pub\(crate\) mod host;/,
+      message: 'the workspace intelligence host module must not sit behind a cfg gate',
+      wholeFile: true,
+    }],
+  },
+  // The host slice must never reach the core workspace runtime: `service::workspace`
+  // is gated on `workspace-runtime`, so importing it would silently make the host a
+  // workspace-runtime consumer. The catalog reader therefore depends on the
+  // services persistence owner only, and the host takes an owned catalog source.
+  // `wholeFile` is what makes `ignoreRustComments` effective: the scanner strips
+  // comments only on that path, so a doc line that merely mentions the token stays
+  // legal while real code may not reach the owner.
+  ...[
+    'host.rs',
+    'catalog_readonly.rs',
+    'host_binding.rs',
+    'host_standby.rs',
+  ].map((file) => ({
+    path: `src/crates/assembly/core/src/service/workspace_intelligence/${file}`,
+    patterns: [{
+      regex: /\bcrate::service::workspace\b/,
+      message:
+        'the workspace intelligence host slice must not reach the workspace runtime owner',
+      wholeFile: true,
+      ignoreRustComments: true,
+    }],
+  })),
+  {
     path: 'src/apps/desktop/src/api/path_target.rs',
     patterns: [{
       regex: /\b(?:lookup_remote_entry_for_path|lookup_remote_connection(?:_scoped|_with_hint)?|should_force_local_assistant_path)\b/,

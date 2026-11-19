@@ -163,6 +163,23 @@ export const requiredContentRules = [
         regex: /#\[cfg\(feature = "workspace-intelligence-claim"\)\]\s*pub\(crate\) mod claim;/,
         message: 'missing workspace-intelligence-claim core wrapper source gate',
       },
+      {
+        regex: /^pub\(crate\) mod host;[ \t]*\r?$/m,
+        message:
+          'the workspace intelligence host module must stay unconditional so a feature-off build answers NotCompiled instead of failing to build',
+      },
+      {
+        regex: /#\[cfg\(feature = "workspace-intelligence-host"\)\]\s*pub\(crate\) mod catalog_readonly;/,
+        message: 'missing workspace-intelligence-host read-only persisted catalog source gate',
+      },
+      {
+        regex: /#\[cfg\(feature = "workspace-intelligence-host"\)\]\s*pub\(crate\) mod host_binding;/,
+        message: 'missing workspace-intelligence-host execution binding source gate',
+      },
+      {
+        regex: /#\[cfg\(feature = "workspace-intelligence-host"\)\]\s*pub\(crate\) mod host_standby;/,
+        message: 'missing workspace-intelligence-host bounded fallback source gate',
+      },
     ],
   },
   {

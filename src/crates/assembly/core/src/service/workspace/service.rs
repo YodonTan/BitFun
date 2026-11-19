@@ -4038,6 +4038,232 @@ mod tests {
             vec![assistant_id, project_a.id, project_b.id]
         );
     }
+
+    /// A rescan re-derives the real git worktree facts from disk and keeps the
+    /// stable workspace id.
+    ///
+    /// What this asserts:
+    ///
+    /// (a) one rescan recomputes the worktree facts from the working tree instead of
+    ///     reusing the worktree block the workspace record already carries;
+    /// (b) the stable workspace id survives the rescan unchanged;
+    /// (c) the refreshed facts reach the persisted registry, which is what a
+    ///     read-only catalog consumer reads.
+    ///
+    /// The fixture drives real git: a linked worktree is opened as a worktree child,
+    /// then the fact is changed on disk (the link is removed and the same directory
+    /// becomes its own main workspace) and the rescan has to observe that.
+    ///
+    /// What this does NOT assert: it does not distinguish
+    /// `WorktreeTopologyFreshness::ForceRefresh` from `Cached`. This particular fact
+    /// change moves the directory to a new `common_git_dir` (a new cache key with no
+    /// cached entry) AND changes the metadata fingerprint the cache is invalidated
+    /// on, so a `Cached` resolve would re-read the same facts and the test would
+    /// stay green. The `ForceRefresh` argument of `rescan_workspace` is therefore
+    /// NOT pinned by this test.
+    #[cfg(feature = "git")]
+    #[tokio::test]
+    async fn rescan_rereads_changed_worktree_facts_from_disk_and_keeps_the_stable_id() {
+        /// Runs real git through the shared test command, which keeps a GUI-less
+        /// Windows host from flashing a console window.
+        fn git(root: &Path, args: &[&str]) {
+            let output = crate::util::create_test_command("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .expect("git should be available for the worktree facts test");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        /// Compares one persisted/git-rendered path against a host path.
+        ///
+        /// On Windows the comparison normalizes separators and case, which is what
+        /// git itself reports, and deliberately does not canonicalize: a canonical
+        /// Windows path gains a `\\?\` prefix, which would make two spellings of the
+        /// same directory compare unequal. On every other host both sides exist at
+        /// this point, so they are canonicalized first — a macOS `temp_dir()` under
+        /// `/var` and its `/private/var` resolution are one directory, and only the
+        /// canonical form says so. A side that cannot be canonicalized falls back to
+        /// the plain normalized comparison.
+        fn same_path(left: &str, right: &Path) -> bool {
+            if !cfg!(windows) {
+                if let (Ok(left), Ok(right)) = (
+                    std::fs::canonicalize(Path::new(left)),
+                    std::fs::canonicalize(right),
+                ) {
+                    return left == right;
+                }
+            }
+            let left = left.replace('\\', "/");
+            let right = right.to_string_lossy().replace('\\', "/");
+            if cfg!(windows) {
+                left.eq_ignore_ascii_case(&right)
+            } else {
+                left == right
+            }
+        }
+
+        let env = TestEnvironment::new();
+        let repositories = tempfile::tempdir().expect("temporary repositories should be created");
+        let main_path = repositories.path().join("main-repo");
+        std::fs::create_dir_all(&main_path).expect("main repository should be created");
+        git(&main_path, &["init"]);
+        git(&main_path, &["config", "user.name", "OpenBitFun Tests"]);
+        git(&main_path, &["config", "user.email", "openbitfun@example.com"]);
+        std::fs::write(main_path.join("tracked.txt"), "initial\n")
+            .expect("fixture file should be written");
+        git(&main_path, &["add", "tracked.txt"]);
+        git(&main_path, &["commit", "-m", "initial"]);
+        let linked_path = repositories.path().join("linked");
+        git(
+            &main_path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-test",
+                linked_path.to_string_lossy().as_ref(),
+            ],
+        );
+
+        let service = build_test_workspace_service(env.path_manager.clone()).await;
+        let main = service
+            .open_workspace(main_path.clone())
+            .await
+            .expect("the main repository opens");
+        let linked = service
+            .open_workspace(linked_path.clone())
+            .await
+            .expect("the linked worktree opens");
+        let tree = linked
+            .worktree
+            .as_ref()
+            .expect("the linked record carries worktree facts");
+        assert!(!tree.is_main, "the linked worktree is not the main workspace");
+        assert_eq!(tree.main_workspace_id.as_deref(), Some(main.id.as_str()));
+        assert!(
+            same_path(&tree.main_repo_path, &main_path),
+            "the linked record points at the main repository: {}",
+            tree.main_repo_path
+        );
+        assert!(
+            same_path(&tree.path, &linked_path),
+            "the linked record points at its own root: {}",
+            tree.path
+        );
+
+        // The same record is persisted as a worktree child of the main workspace, so
+        // the catalog assertions below are a real before/after pair.
+        #[cfg(feature = "workspace-intelligence-host")]
+        {
+            use crate::service::workspace_intelligence::catalog_readonly::read_persisted_catalog;
+
+            let catalog = read_persisted_catalog(&env.path_manager)
+                .await
+                .expect("the persisted registry stays readable");
+            let persisted = catalog
+                .workspace(&linked.id)
+                .expect("the linked record is an eligible worktree child");
+            assert_eq!(persisted.id(), linked.id.as_str());
+            assert!(
+                persisted.is_worktree_child(),
+                "the persisted record starts out as a worktree child"
+            );
+            assert_eq!(
+                persisted.worktree_parent_id(),
+                Some(main.id.as_str()),
+                "the persisted child points at the main workspace"
+            );
+            assert_eq!(
+                persisted.worktree_is_main(),
+                Some(false),
+                "the persisted child is not the main workspace"
+            );
+        }
+
+        // Change the fact on disk: the directory is no longer a worktree of the main
+        // repository but its own repository, so it is now a main workspace.
+        git(
+            &main_path,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                linked_path.to_string_lossy().as_ref(),
+            ],
+        );
+        std::fs::create_dir_all(&linked_path).expect("the former link should be recreated");
+        git(&linked_path, &["init"]);
+
+        let rescanned = service
+            .rescan_workspace(&linked.id)
+            .await
+            .expect("the workspace rescans");
+        assert_eq!(rescanned.id, linked.id, "a rescan never recomputes the stable id");
+        let tree = rescanned
+            .worktree
+            .as_ref()
+            .expect("the refreshed record still carries worktree facts");
+        assert!(
+            tree.is_main,
+            "a rescan must not reuse the record's stored worktree facts"
+        );
+        assert_eq!(tree.main_workspace_id, None, "a main workspace has no parent id");
+        assert!(
+            same_path(&tree.main_repo_path, &linked_path),
+            "the refreshed record points at itself: {}",
+            tree.main_repo_path
+        );
+        assert!(
+            same_path(&tree.path, &linked_path),
+            "the refreshed record still points at its own root: {}",
+            tree.path
+        );
+
+        // The refreshed facts reached the persisted registry, which is what a
+        // read-only catalog consumer sees.
+        #[cfg(feature = "workspace-intelligence-host")]
+        {
+            use crate::service::workspace_intelligence::catalog_readonly::{
+                read_persisted_catalog, PersistedWorkspaceKind,
+            };
+
+            let catalog = read_persisted_catalog(&env.path_manager)
+                .await
+                .expect("the persisted registry stays readable");
+            let persisted = catalog
+                .workspace(&linked.id)
+                .expect("the same persisted id is still an eligible record");
+            assert_eq!(
+                persisted.id(),
+                linked.id.as_str(),
+                "the persisted id is unchanged"
+            );
+            assert_eq!(
+                persisted.kind(),
+                PersistedWorkspaceKind::LocalWorkspace,
+                "the record is no longer a worktree child"
+            );
+            assert!(!persisted.is_worktree_child());
+            assert_eq!(
+                persisted.worktree_parent_id(),
+                None,
+                "the refreshed record has no parent id"
+            );
+            assert_eq!(
+                persisted.worktree_is_main(),
+                Some(true),
+                "the refreshed record is the main workspace"
+            );
+        }
+
+        drop(service);
+    }
 }
 
 fn workspace_catalog_revision() -> &'static tokio::sync::watch::Sender<u64> {

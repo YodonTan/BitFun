@@ -205,6 +205,11 @@ const CORE_TOKIO_FEATURES = new Map([
   ['legacy-migration', []],
   ['mcp-runtime', ['io-util', 'macros', 'rt', 'rt-multi-thread', 'time']],
   ['browser-control', ['net', 'rt', 'time']],
+  // The workspace intelligence host is single-threaded around one owned catalog:
+  // it needs `macros` for the owner futures, `rt` for the handles it drives,
+  // `sync` for the `watch` hint and the `Mutex` around its book, and `time` for
+  // its bounded drain and fallback backoff. No IO, net or process.
+  ['workspace-intelligence-host', ['macros', 'rt', 'sync', 'time']],
 ]);
 const CORE_TOKIO_AGGREGATES = new Set([
   // PTC composes the Agent Runtime baseline and the service-owned Node runtime.
