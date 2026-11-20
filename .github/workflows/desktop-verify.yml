@@ -217,6 +217,14 @@ jobs:
             '  return [pscustomobject]@{ ExitCode = $code; Stdout = $out; Stderr = $err; CommandLine = $commandLine }'
             '}'
             ''
+            '# Cargo reports the kinds a lib target compiles to, which is not always ''lib''.'
+            '# The real desktop suite builds a Tauri crate whose lib target reports'
+            '# [''staticlib'', ''cdylib'', ''rlib''], so the harness must be recognised by the set'
+            '# of kinds Cargo uses for libraries, never by an assumed ''lib'' alone. Every kind'
+            '# on the artifact must belong to that set, so bin, custom-build, proc-macro,'
+            '# example and test targets stay excluded.'
+            '$LibraryTargetKinds = @(''lib'', ''rlib'', ''staticlib'', ''cdylib'', ''dylib'')'
+            ''
             'function Select-DesktopTestExecutable {'
             '  param([string[]]$Messages)'
             '  $found = [System.Collections.Generic.List[string]]::new()'
@@ -226,12 +234,26 @@ jobs:
             '    try { $message = ConvertFrom-Json -InputObject $line -ErrorAction Stop } catch { $message = $null }'
             '    if ($null -eq $message) { Write-Host "[cargo stdout, not JSON] $line"; continue }'
             '    if ($message.reason -eq ''compiler-message'' -and $message.message.rendered) { Write-Host $message.message.rendered }'
-            '    if ($message.reason -eq ''compiler-artifact'' -and $message.profile.test -eq $true -and $message.executable -and'
-            '        $message.target.name -eq ''openbitfun_desktop_lib'' -and $message.target.kind -contains ''lib'' -and'
-            '        $message.package_id -match ''openbitfun-desktop@'') { $found.Add([string]$message.executable) }'
+            '    if ($message.reason -ne ''compiler-artifact'') { continue }'
+            '    if ($message.profile.test -ne $true -or -not $message.executable) { continue }'
+            '    if ($message.target.name -ne ''openbitfun_desktop_lib'') { continue }'
+            '    if ($message.package_id -notmatch ''openbitfun-desktop@'') { continue }'
+            '    $kinds = @($message.target.kind)'
+            '    if ($kinds.Count -eq 0) { continue }'
+            '    if (@($kinds | Where-Object { $LibraryTargetKinds -notcontains $_ }).Count -ne 0) { continue }'
+            '    $found.Add([string]$message.executable)'
             '  }'
             '  if ($found.Count -ne 1) { throw "expected exactly one openbitfun-desktop lib test executable artifact, found $($found.Count)" }'
+            '  Write-Host "selected desktop lib test harness: $($found[0])"'
             '  return $found[0]'
+            '}'
+            ''
+            'function Assert-TestExecutableExists {'
+            '  param([string]$Executable)'
+            '  if ([string]::IsNullOrWhiteSpace($Executable)) { throw ''the selected test executable path is empty'' }'
+            '  $path = [System.IO.Path]::GetFullPath($Executable)'
+            '  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "the selected test executable does not exist: $path" }'
+            '  return $path'
             '}'
             ''
             'function Add-DesktopManifest {'
@@ -242,6 +264,10 @@ jobs:
             '  $mt = Get-ChildItem -LiteralPath $kitsBin -Directory | Sort-Object { try { [version]$_.Name } catch { [version]''0.0'' } } -Descending |'
             '    ForEach-Object { Join-Path $_.FullName ''x64/mt.exe'' } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1'
             '  if (-not $mt) { throw "no Windows SDK x64 mt.exe under $kitsBin" }'
+            '  # The copy stays in the directory the artifact was built into, because that is'
+            '  # where its dependent DLLs resolve from. Cargo does not always emit a lib test'
+            '  # harness into target/debug/deps; the real desktop suite emits it next to a'
+            '  # build-script out directory, so this must never hardcode or move to deps.'
             '  $copy = Join-Path (Split-Path -Parent $Executable) (''{0}-mt-{1}.exe'' -f [IO.Path]::GetFileNameWithoutExtension($Executable), [guid]::NewGuid().ToString(''N''))'
             '  Copy-Item -LiteralPath $Executable -Destination $copy -Force'
             '  # mt.exe takes the manifest as a separate argument; "-manifest:<path>" is rejected.'
@@ -298,7 +324,7 @@ jobs:
             '      $record.build_exit_code = $build.ExitCode'
             '      $build.Stderr | ForEach-Object { Write-Host $_ }'
             '      if ($build.ExitCode -ne 0) { throw "cargo test --no-run --message-format=json failed with exit code $($build.ExitCode)" }'
-            '      $embedded = Add-DesktopManifest -Executable (Select-DesktopTestExecutable -Messages $build.Stdout)'
+            '      $embedded = Add-DesktopManifest -Executable (Assert-TestExecutableExists -Executable (Select-DesktopTestExecutable -Messages $build.Stdout))'
             '      $record.mt_exit_code = $embedded.MtExit'
             '      $record.mt_path = $embedded.MtPath'
             '      $record.test_executable_copy = $embedded.Copy'
@@ -438,11 +464,14 @@ jobs:
         timeout-minutes: 90
         run: |
           $ErrorActionPreference = 'Stop'
+          # No --lib here: each state checks the whole package, so the desktop
+          # entries cover the binary and the library together. The suites below
+          # stay filtered with --lib; this step is the compile-scope gate.
           $checks = @(
             @{ Name = 'server default'; Args = @('check', '--locked', '-p', 'openbitfun-server') },
             @{ Name = 'server no-default'; Args = @('check', '--locked', '-p', 'openbitfun-server', '--no-default-features') },
-            @{ Name = 'desktop default lib'; Args = @('check', '--locked', '-p', 'openbitfun-desktop', '--lib') },
-            @{ Name = 'desktop no-default lib'; Args = @('check', '--locked', '-p', 'openbitfun-desktop', '--lib', '--no-default-features') }
+            @{ Name = 'desktop default'; Args = @('check', '--locked', '-p', 'openbitfun-desktop') },
+            @{ Name = 'desktop no-default'; Args = @('check', '--locked', '-p', 'openbitfun-desktop', '--no-default-features') }
           )
           foreach ($check in $checks) {
             Write-Host "::group::cargo $($check.Args -join ' ')"
