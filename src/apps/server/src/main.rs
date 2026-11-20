@@ -32,6 +32,7 @@ use tower_http::cors::CorsLayer;
 mod app_server;
 mod bootstrap;
 mod routes;
+mod workspace_intelligence;
 
 pub(crate) struct DispatchHostState {
     path_manager: Arc<openbitfun_core::infrastructure::PathManager>,
@@ -97,8 +98,10 @@ async fn main() -> Result<()> {
     openbitfun_core::service::remote_connect::ensure_rustls_crypto_provider();
 
     let args = ServerArgs::parse();
+    // Borrowed, not moved: `args` is handed to the server body as a whole below.
     let external_workspace_root = args
         .workspace
+        .as_ref()
         .map(|path| {
             if !path.is_absolute() {
                 return Err(anyhow::anyhow!("--workspace must be an absolute path"));
@@ -120,6 +123,38 @@ async fn main() -> Result<()> {
     )
     .await?;
 
+    // Everything from here to the serve loop runs behind one fallible call, so a
+    // setup or listener failure is carried to the exit below instead of returning
+    // early: the host admitted by startup is drained on every path out of `main`.
+    let serve_result =
+        run_loopback_server(args, external_workspace_root, server_state.clone()).await;
+
+    // The host's tenure ends with the listener that admitted it: the one release path
+    // runs on every exit from the serve body, before the plugin host stops.
+    let workspace_intelligence_drain =
+        workspace_intelligence::release_admitted_host(&server_state.workspace_intelligence_host)
+            .await;
+    tracing::info!(
+        host_drain = workspace_intelligence_drain,
+        "Workspace intelligence host drained"
+    );
+    let shutdown_result = openbitfun_core::plugin_host::shutdown_configured_plugin_host().await;
+    serve_result?;
+    shutdown_result?;
+
+    Ok(())
+}
+
+/// Brings up the agent runtime, the loopback listener and the serve loop.
+///
+/// The value this returns is a result, not a shutdown: `main` drains the workspace
+/// intelligence host before propagating it, so a failure in any step here still ends
+/// the host's tenure instead of skipping it.
+async fn run_loopback_server(
+    args: ServerArgs,
+    external_workspace_root: Option<PathBuf>,
+    server_state: Arc<bootstrap::ServerAppState>,
+) -> Result<()> {
     // Build the agent runtime the same way the Desktop session application does,
     // then build an in-process `OpenBitFunAppServer` for it. Each WebSocket
     // connection is handed straight to `OpenBitFunAppServer::serve` over a WS-bridged
@@ -241,10 +276,7 @@ async fn main() -> Result<()> {
             tracing::error!(error = %error, "Failed to listen for Server shutdown signal");
         }
     });
-    let serve_result = server.await;
-    let shutdown_result = openbitfun_core::plugin_host::shutdown_configured_plugin_host().await;
-    serve_result?;
-    shutdown_result?;
+    server.await?;
 
     Ok(())
 }
