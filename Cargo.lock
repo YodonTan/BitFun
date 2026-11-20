@@ -6692,6 +6692,7 @@ dependencies = [
  "openbitfun-events",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower-http",
  "tracing",

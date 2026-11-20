@@ -9,9 +9,10 @@ use openbitfun_core::product_runtime::{
     ensure_product_dialog_scheduler, CoreProductEventQueueOwner, CoreRuntimeServicesProvider,
 };
 use openbitfun_core::runtime_ownership::CoreRuntimeOwnership;
+use openbitfun_core::service::workspace_intelligence::WorkspaceIntelligenceHost;
 use openbitfun_core::service::{config, filesystem, mcp, token_usage, workspace};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// Shared application state for the server (mirrors Desktop's AppState).
 ///
@@ -36,6 +37,12 @@ pub(crate) struct ServerAppState {
     pub scheduler: Arc<coordination::DialogScheduler>,
     pub agent_event_queue_owner: CoreProductEventQueueOwner,
     pub tool_registry_snapshot: Arc<Vec<Arc<dyn tools::framework::Tool>>>,
+    /// Workspace intelligence host this server admitted on its loopback surface.
+    ///
+    /// Startup stores the handle here and the shutdown path takes it back out, so
+    /// the host's tenure ends with the listener instead of outliving it. `None`
+    /// means startup admitted none, for the code it reported.
+    pub workspace_intelligence_host: Mutex<Option<WorkspaceIntelligenceHost>>,
     pub start_time: std::time::Instant,
 }
 
@@ -73,6 +80,10 @@ pub(crate) async fn initialize(workspace: Option<String>) -> anyhow::Result<Arc<
         path_manager.as_ref(),
         "server",
     ));
+    // The deployment the workspace intelligence host has to report is the one this
+    // server's own runtime ownership holds, so it is read from that owner here
+    // instead of being chosen at the install site.
+    let deployment = runtime_ownership.deployment();
     let agentic_system = system::init_agentic_system_for_profile_with_runtime_ownership(
         system::DeliveryProfile::ProductFull,
         runtime_ownership,
@@ -155,6 +166,21 @@ pub(crate) async fn initialize(workspace: Option<String>) -> anyhow::Result<Arc<
         workspace_service.get_current_workspace().await
     };
 
+    // The loopback surface admits the workspace intelligence host on the deployment
+    // this server already owns. The code is reported, not enforced: no HTTP route,
+    // health response or event name depends on it, so a refusal never fails startup.
+    let (workspace_intelligence_code, workspace_intelligence_host) =
+        crate::workspace_intelligence::install(
+            path_manager.clone(),
+            Some(workspace::WorkspaceService::subscribe_catalog_changes()),
+            deployment,
+        )
+        .await;
+    log::info!(
+        "workspace intelligence host placement resolved: code={}",
+        workspace_intelligence_code
+    );
+
     if let Err(error) = openbitfun_core::plugin_host::initialize_configured_plugin_host(
         openbitfun_core::plugin_host::PluginHostLaunchPolicy::Enabled,
     )
@@ -200,6 +226,7 @@ pub(crate) async fn initialize(workspace: Option<String>) -> anyhow::Result<Arc<
         scheduler,
         agent_event_queue_owner,
         tool_registry_snapshot,
+        workspace_intelligence_host: Mutex::new(workspace_intelligence_host),
         start_time: std::time::Instant::now(),
     });
 

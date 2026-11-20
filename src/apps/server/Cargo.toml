@@ -9,6 +9,13 @@ description = "OpenBitFun Server - Web-based AI Code Assistant"
 name = "openbitfun-server"
 path = "src/main.rs"
 
+[features]
+default = ["workspace-intelligence-host"]
+# The loopback app server admits the workspace intelligence host on the
+# deployment its own runtime ownership selected. A build without the feature
+# answers the typed `NotCompiled` refusal instead of failing to link.
+workspace-intelligence-host = ["openbitfun-core/workspace-intelligence-host"]
+
 [dependencies]
 openbitfun-core = { path = "../../crates/assembly/core", features = ["product-full"] }
 
@@ -39,6 +46,13 @@ futures = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+# Test-only constructors for the isolated user-data root and the enabled scope the
+# host lifecycle tests need. The product capability closure stays on the normal
+# dependency edge above.
+openbitfun-core = { path = "../../crates/assembly/core", features = ["test-support"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
