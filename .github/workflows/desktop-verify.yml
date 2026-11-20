@@ -459,7 +459,10 @@ jobs:
 
       # Blocking, not advisory: a state that does not compile must fail here with
       # a readable cargo error instead of surfacing later as a missing artifact.
+      # The suites gate on this step's outcome, so each one still runs after
+      # another suite's assertion failure but never after a compile failure.
       - name: Check the four narrow build states
+        id: build_checks
         shell: pwsh
         timeout-minutes: 90
         run: |
@@ -482,6 +485,7 @@ jobs:
           }
 
       - name: Run server workspace intelligence tests (default features)
+        if: ${{ !cancelled() && steps.build_checks.outcome == 'success' }}
         shell: pwsh
         timeout-minutes: 60
         run: |
@@ -489,6 +493,7 @@ jobs:
           Invoke-NarrowSuite -Suite 'server-default'
 
       - name: Run server workspace intelligence tests (no default features)
+        if: ${{ !cancelled() && steps.build_checks.outcome == 'success' }}
         shell: pwsh
         timeout-minutes: 60
         run: |
@@ -496,6 +501,7 @@ jobs:
           Invoke-NarrowSuite -Suite 'server-no-default-features'
 
       - name: Run desktop workspace intelligence tests (default features)
+        if: ${{ !cancelled() && steps.build_checks.outcome == 'success' }}
         shell: pwsh
         timeout-minutes: 90
         run: |
@@ -503,6 +509,7 @@ jobs:
           Invoke-NarrowSuite -Suite 'desktop-lib-default'
 
       - name: Run desktop workspace intelligence tests (no default features)
+        if: ${{ !cancelled() && steps.build_checks.outcome == 'success' }}
         shell: pwsh
         timeout-minutes: 90
         run: |
