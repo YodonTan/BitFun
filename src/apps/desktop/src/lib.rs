@@ -55,6 +55,7 @@ mod window_material;
 mod window_state_support;
 #[cfg(target_os = "windows")]
 mod window_webview_geometry;
+mod workspace_intelligence;
 
 use openbitfun_agent_runtime::sdk::{attach_session_event_cursor, SessionEventJournal};
 use openbitfun_core::agentic::tools::computer_use_capability::set_computer_use_host_available;
@@ -656,14 +657,21 @@ pub async fn run() {
     }
 
     let step_started = Instant::now();
-    let (coordinator, scheduler, event_queue, event_router, ai_client_factory, token_usage_service) =
-        match init_agentic_system().await {
-            Ok(state) => state,
-            Err(e) => {
-                log::error!("Failed to initialize agentic system: {}", e);
-                return;
-            }
-        };
+    let (
+        coordinator,
+        scheduler,
+        event_queue,
+        event_router,
+        ai_client_factory,
+        token_usage_service,
+        runtime_deployment,
+    ) = match init_agentic_system().await {
+        Ok(state) => state,
+        Err(e) => {
+            log::error!("Failed to initialize agentic system: {}", e);
+            return;
+        }
+    };
     startup_timings.record_elapsed("init_agentic_system", step_started);
     startup_trace.record_elapsed_step("native_pre_tauri", "init_agentic_system", step_started);
 
@@ -1133,6 +1141,41 @@ pub async fn run() {
                 window_phase_duration_ms,
                 since_process_start_ms
             );
+
+            // The workspace intelligence host is installed once per process, after
+            // the main window exists and before any exit path can run. The drain
+            // lives on the one graceful exit path, not on window or workspace
+            // events, and an install that cannot resolve its user-data root is
+            // reported without failing startup.
+            match app
+                .try_state::<Arc<openbitfun_core::infrastructure::PathManager>>()
+                .map(|state| Arc::clone(state.inner()))
+            {
+                Some(paths) => {
+                    // Started on the app's own async runtime: the setup callback is
+                    // not guaranteed to run on a Tokio worker, so the install must
+                    // not block here. A spawn that races the exit path is safe
+                    // because the slot refuses an install that arrives after the
+                    // drain.
+                    tauri::async_runtime::spawn(async move {
+                        let install_code = workspace_intelligence::install_once(
+                            paths,
+                            Some(
+                                openbitfun_core::service::workspace::WorkspaceService::subscribe_catalog_changes(),
+                            ),
+                            runtime_deployment,
+                        )
+                        .await;
+                        log::info!(
+                            "Desktop workspace intelligence host install: code={}",
+                            install_code
+                        );
+                    });
+                }
+                None => log::warn!(
+                    "Desktop workspace intelligence host install skipped: path manager state unavailable"
+                ),
+            }
 
             #[cfg(target_os = "macos")]
             {
@@ -2110,6 +2153,7 @@ async fn init_agentic_system() -> anyhow::Result<(
     Arc<openbitfun_core::agentic::events::EventRouter>,
     Arc<AIClientFactory>,
     Arc<openbitfun_core::service::token_usage::TokenUsageService>,
+    openbitfun_core::runtime_ownership::RuntimeDeployment,
 )> {
     use openbitfun_core::agentic::*;
 
@@ -2191,6 +2235,9 @@ async fn init_agentic_system() -> anyhow::Result<(
             "desktop",
         ),
     );
+    // The deployment this process really selected, reported to the composition
+    // root that installs the workspace intelligence host.
+    let runtime_deployment = runtime_ownership.deployment();
     let coordinator = Arc::new(coordination::ConversationCoordinator::new(
         session_manager.clone(),
         execution_engine,
@@ -2271,6 +2318,7 @@ async fn init_agentic_system() -> anyhow::Result<(
         event_router,
         ai_client_factory,
         token_usage_service,
+        runtime_deployment,
     ))
 }
 
@@ -2401,6 +2449,14 @@ pub(crate) async fn perform_process_exit_cleanup() -> bool {
     }
     openbitfun_core::util::process_manager::cleanup_all_processes();
     api::remote_connect_api::cleanup_on_exit();
+    // The workspace intelligence host drains here, before the process declares its
+    // cleanup complete. It waits for an install that is still in flight, so a host
+    // bootstrapped late cannot outlive the process that took its leases.
+    let drain_code = workspace_intelligence::drain_once().await;
+    log::info!(
+        "Desktop workspace intelligence host drain: code={}",
+        drain_code
+    );
     PROCESS_EXIT_CLEANUP_COMPLETE.store(true, Ordering::Release);
     notify.notify_waiters();
     log::info!("Desktop process graceful shutdown completed");
