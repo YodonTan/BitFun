@@ -1,19 +1,33 @@
 name: Desktop Verify (unsigned)
 
-# Unsigned Desktop verification build for one pinned commit.
+# Unsigned Desktop verification build for the workspace-intelligence S7 tip.
+#
+# This is the verification suite for the final S7 integration tip candidate, a
+# single commit that carries both the S5 and the S7 changes. It is not a
+# separate verification of the S5 commit e3e8885f: S5 has no server-side
+# workspace_intelligence module, so that commit cannot run this complete
+# server + desktop suite at all. The candidate is pinned by SHA
+# 979e9da62b7271646b371cd028ba232fcf159b96.
+#
+# The job runs the four narrow workspace_intelligence suites (server and
+# desktop, each with default features and with --no-default-features) before
+# packaging, so the suites are evidence in their own right rather than a side
+# effect of packaging. Only a 40-hex commit that actually contains these
+# suites can pass: a commit without them reports zero collected tests and
+# fails instead of looking green.
 #
 # Derived from .github/workflows/desktop-package.yml, with every signing and
 # release-publication stage removed. This workflow never signs an artifact,
 # never creates a tag or a release, never uploads an update manifest, and never
-# pushes a container image. Its only output is an unsigned Windows NSIS
-# installer artifact plus the commit/SHA-256 metadata that proves which commit
-# produced it.
+# pushes a container image. Its outputs are an unsigned Windows NSIS installer
+# artifact, the commit/SHA-256 metadata that proves which commit produced it,
+# and the narrow-test evidence artifact.
 
 on:
   workflow_dispatch:
     inputs:
       checkout_ref:
-        description: "Commit SHA, branch, or tag to build. Resolved to a pinned commit SHA before any build step runs; the default 'main' is this repository's own main branch."
+        description: "Commit SHA, branch, or tag to build. Resolved to a pinned commit SHA before any build step runs; the default 'main' is this repository's own main branch. This workflow verifies the workspace intelligence S7 integration tip, which carries both the S5 and the S7 changes, and only passes for a commit that already contains the server and desktop workspace_intelligence suites it runs."
         required: false
         default: main
         type: string
@@ -126,11 +140,434 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify(selected)}\n`);
           NODE
 
+  # ── Narrow unit tests: workspace intelligence host (Desktop + Server) ──
+  # Packaging is not a substitute for tests. One helper, written by the first
+  # step into the runner temp directory, runs all four suites, so the gate, the
+  # output parsing and the Windows manifest workaround exist once instead of
+  # four times. Every suite must run its exact expected test set with the exact
+  # expected pass count, zero failed and zero ignored; any deviation fails this
+  # job, and `package` needs this job, so a commit whose suites fail produces no
+  # installer. The per-step limits are unit-test time bounds, not a promise.
+  narrow-tests:
+    name: Narrow Tests (windows-latest)
+    runs-on: windows-latest
+    needs: prepare
+    if: needs.prepare.outputs.target_platform == 'windows'
+    timeout-minutes: 240
+    env:
+      NODE_OPTIONS: --max-old-space-size=6144
+      CARGO_INCREMENTAL: '0'
+      # Keep the debug and test profiles inside the hosted runner disk budget.
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      # The desktop suites spawn worker threads and drive real filesystem work.
+      RUST_MIN_STACK: '8388608'
+      # Two parallel rustc jobs is the memory guardrail for this runner.
+      CARGO_BUILD_JOBS: '2'
+      CHECKOUT_SHA: ${{ needs.prepare.outputs.checkout_sha }}
+    steps:
+      - name: Checkout the pinned build commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_sha }}
+
+      - name: Verify the checked-out commit is the pinned commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:CHECKOUT_SHA -notmatch '^[0-9a-f]{40}$') {
+            throw "prepare did not publish a 40-hex checkout SHA: '$env:CHECKOUT_SHA'"
+          }
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "git rev-parse HEAD failed with exit code $LASTEXITCODE" }
+          if ($head -ne $env:CHECKOUT_SHA) {
+            throw "Checked out $head, expected pinned commit $env:CHECKOUT_SHA."
+          }
+          Write-Host "Narrow suites run against pinned commit $head."
+
+      # The candidate commit cannot supply a helper that this workflow executes,
+      # so the job writes its own. One copy is what keeps the four suites on the
+      # same gate, the same evidence shape and the same loader workaround.
+      - name: Write the narrow suite helper and suite manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidenceDir = Join-Path $env:RUNNER_TEMP 'wi-narrow-tests'
+          New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
+          $helperText = (@(
+            'Set-StrictMode -Version Latest'
+            '$ErrorActionPreference = ''Stop'''
+            ''
+            'function Get-NarrowSuite {'
+            '  param([string]$Suite)'
+            '  $path = Join-Path $env:RUNNER_TEMP ''wi-narrow-tests/suites.json'''
+            '  $found = @((Get-Content -LiteralPath $path -Raw | ConvertFrom-Json).suites | Where-Object { $_.id -eq $Suite })'
+            '  if ($found.Count -ne 1) { throw "no suite spec named ''$Suite'' in $path" }'
+            '  return $found[0]'
+            '}'
+            ''
+            'function Invoke-Captured {'
+            '  param([string]$FilePath, [string[]]$Arguments, [string]$WorkingDirectory, [string]$StdoutPath, [string]$StderrPath)'
+            '  $commandLine = "{0} {1}" -f $FilePath, ($Arguments -join '' '')'
+            '  Write-Host $commandLine'
+            '  $p = Start-Process -FilePath $FilePath -ArgumentList $Arguments -WorkingDirectory $WorkingDirectory -NoNewWindow -Wait -PassThru -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath'
+            '  $code = $p.ExitCode'
+            '  $out = @(); if (Test-Path -LiteralPath $StdoutPath) { $out = @(Get-Content -LiteralPath $StdoutPath) }'
+            '  $err = @(); if (Test-Path -LiteralPath $StderrPath) { $err = @(Get-Content -LiteralPath $StderrPath) }'
+            '  return [pscustomobject]@{ ExitCode = $code; Stdout = $out; Stderr = $err; CommandLine = $commandLine }'
+            '}'
+            ''
+            'function Select-DesktopTestExecutable {'
+            '  param([string[]]$Messages)'
+            '  $found = [System.Collections.Generic.List[string]]::new()'
+            '  foreach ($line in $Messages) {'
+            '    if ([string]::IsNullOrWhiteSpace($line)) { continue }'
+            '    $message = $null'
+            '    try { $message = ConvertFrom-Json -InputObject $line -ErrorAction Stop } catch { $message = $null }'
+            '    if ($null -eq $message) { Write-Host "[cargo stdout, not JSON] $line"; continue }'
+            '    if ($message.reason -eq ''compiler-message'' -and $message.message.rendered) { Write-Host $message.message.rendered }'
+            '    if ($message.reason -eq ''compiler-artifact'' -and $message.profile.test -eq $true -and $message.executable -and'
+            '        $message.target.name -eq ''openbitfun_desktop_lib'' -and $message.target.kind -contains ''lib'' -and'
+            '        $message.package_id -match ''openbitfun-desktop@'') { $found.Add([string]$message.executable) }'
+            '  }'
+            '  if ($found.Count -ne 1) { throw "expected exactly one openbitfun-desktop lib test executable artifact, found $($found.Count)" }'
+            '  return $found[0]'
+            '}'
+            ''
+            'function Add-DesktopManifest {'
+            '  param([string]$Executable)'
+            '  $manifest = Join-Path $env:GITHUB_WORKSPACE ''src/apps/desktop/windows-app.manifest'''
+            '  if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { throw "missing desktop manifest: $manifest" }'
+            '  $kitsBin = Join-Path ${env:ProgramFiles(x86)} ''Windows Kits/10/bin'''
+            '  $mt = Get-ChildItem -LiteralPath $kitsBin -Directory | Sort-Object { try { [version]$_.Name } catch { [version]''0.0'' } } -Descending |'
+            '    ForEach-Object { Join-Path $_.FullName ''x64/mt.exe'' } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1'
+            '  if (-not $mt) { throw "no Windows SDK x64 mt.exe under $kitsBin" }'
+            '  $copy = Join-Path (Split-Path -Parent $Executable) (''{0}-mt-{1}.exe'' -f [IO.Path]::GetFileNameWithoutExtension($Executable), [guid]::NewGuid().ToString(''N''))'
+            '  Copy-Item -LiteralPath $Executable -Destination $copy -Force'
+            '  # mt.exe takes the manifest as a separate argument; "-manifest:<path>" is rejected.'
+            '  & $mt -nologo -manifest $manifest "-outputresource:$copy;#1"'
+            '  $mtExit = $LASTEXITCODE'
+            '  if ($mtExit -ne 0) { throw "mt.exe failed with exit code $mtExit while embedding $manifest into $copy" }'
+            '  return [pscustomobject]@{ Copy = $copy; MtExit = $mtExit; MtPath = $mt }'
+            '}'
+            ''
+            'function Assert-NarrowOutput {'
+            '  param([string[]]$Lines, [string[]]$Expected, [int]$ExpectedPassed)'
+            '  $resultLines = @($Lines | Where-Object { $_ -match ''^test result: '' })'
+            '  if ($resultLines.Count -ne 1) { throw "expected exactly one ''test result:'' line, found $($resultLines.Count)" }'
+            '  $result = [regex]::Match($resultLines[0], ''^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;'')'
+            '  if (-not $result.Success) { throw "unrecognised test result line: $($resultLines[0])" }'
+            '  $passed = [int]$result.Groups[2].Value; $failed = [int]$result.Groups[3].Value; $ignored = [int]$result.Groups[4].Value'
+            '  if ($result.Groups[1].Value -ne ''ok'') { throw ''the test harness reported FAILED'' }'
+            '  if ($failed -ne 0) { throw "the test harness reported $failed failed test(s)" }'
+            '  if ($ignored -ne 0) { throw "the test harness reported $ignored ignored test(s)" }'
+            '  if ($passed -ne $ExpectedPassed) { throw "expected exactly $ExpectedPassed passing test(s), the harness reported $passed" }'
+            '  $notOk = @($Lines | Where-Object { $_ -match ''^test .* \.\.\. (ignored|FAILED|skipped)$'' })'
+            '  if ($notOk.Count -ne 0) { throw "tests were ignored, skipped or failed: $($notOk -join '' | '')" }'
+            '  $loader = @($Lines | Where-Object { $_ -match ''0xc0000139|STATUS_ENTRYPOINT_NOT_FOUND'' })'
+            '  if ($loader.Count -ne 0) { throw ''the harness could not load (STATUS_ENTRYPOINT_NOT_FOUND); the manifest workaround did not take effect'' }'
+            '  $missing = @($Expected | Where-Object { $Lines -notcontains "test $_ ... ok" })'
+            '  if ($missing.Count -ne 0) { throw "missing passing test(s): $($missing -join '', '')" }'
+            '  return [pscustomobject]@{ Passed = $passed; Failed = 0; Ignored = 0 }'
+            '}'
+            ''
+            'function Invoke-NarrowSuite {'
+            '  param([Parameter(Mandatory)][string]$Suite)'
+            '  $spec = Get-NarrowSuite -Suite $Suite'
+            '  $evidenceDir = Join-Path $env:RUNNER_TEMP ''wi-narrow-tests'''
+            '  $stdoutLog = Join-Path $evidenceDir "$Suite.stdout.log"'
+            '  $stderrLog = Join-Path $evidenceDir "$Suite.stderr.log"'
+            '  $record = [ordered]@{'
+            '    id = $spec.id; suite = $spec.suite; features = $spec.features'
+            '    command = $spec.command; run_command = $null'
+            '    expected_passed = [int]$spec.expected_passed; actual_passed = $null; failed = $null; ignored = $null'
+            '    exit_code = $null; build_exit_code = $null; mt_exit_code = $null'
+            '    manifest_workaround = [bool]$spec.manifest_workaround; actual_head = '''''
+            '    test_executable_copy = $null; mt_path = $null'
+            '    status = ''failed''; detail = ''''; log = "$Suite.stdout.log"; stderr_log = "$Suite.stderr.log"'
+            '    build_json = $null'
+            '  }'
+            '  Write-Host "::group::$($spec.title)"'
+            '  try {'
+            '    $record.actual_head = (git rev-parse HEAD).Trim()'
+            '    if ($LASTEXITCODE -ne 0) { throw "git rev-parse HEAD failed with exit code $LASTEXITCODE" }'
+            '    $cargoTest = @(''test'', ''--locked'', ''-p'', $spec.package) + @($spec.cargo_flags)'
+            '    if ($spec.manifest_workaround) {'
+            '      $record.build_json = "$Suite.build.json"'
+            '      $build = Invoke-Captured -FilePath ''cargo'' -Arguments ($cargoTest + @(''--no-run'', ''--message-format=json'')) -WorkingDirectory $env:GITHUB_WORKSPACE -StdoutPath (Join-Path $evidenceDir "$Suite.build.json") -StderrPath (Join-Path $evidenceDir "$Suite.build.stderr.log")'
+            '      $record.build_exit_code = $build.ExitCode'
+            '      $build.Stderr | ForEach-Object { Write-Host $_ }'
+            '      if ($build.ExitCode -ne 0) { throw "cargo test --no-run --message-format=json failed with exit code $($build.ExitCode)" }'
+            '      $embedded = Add-DesktopManifest -Executable (Select-DesktopTestExecutable -Messages $build.Stdout)'
+            '      $record.mt_exit_code = $embedded.MtExit'
+            '      $record.mt_path = $embedded.MtPath'
+            '      $record.test_executable_copy = $embedded.Copy'
+            '      $run = Invoke-Captured -FilePath $embedded.Copy -Arguments @(''workspace_intelligence'', ''--test-threads=1'') -WorkingDirectory (Join-Path $env:GITHUB_WORKSPACE ''src/apps/desktop'') -StdoutPath $stdoutLog -StderrPath $stderrLog'
+            '    } else {'
+            '      $run = Invoke-Captured -FilePath ''cargo'' -Arguments ($cargoTest + @(''workspace_intelligence'', ''--'', ''--test-threads=1'')) -WorkingDirectory $env:GITHUB_WORKSPACE -StdoutPath $stdoutLog -StderrPath $stderrLog'
+            '    }'
+            '    $record.exit_code = $run.ExitCode'
+            '    $record.run_command = $run.CommandLine'
+            '    $run.Stderr | ForEach-Object { Write-Host $_ }'
+            '    $run.Stdout | ForEach-Object { Write-Host $_ }'
+            '    if ($run.ExitCode -ne 0) { throw "the test harness exited with code $($run.ExitCode)" }'
+            '    $asserted = Assert-NarrowOutput -Lines $run.Stdout -Expected @($spec.expected_tests) -ExpectedPassed ([int]$spec.expected_passed)'
+            '    $record.actual_passed = $asserted.Passed; $record.failed = $asserted.Failed; $record.ignored = $asserted.Ignored'
+            '    $record.status = ''passed''; $record.detail = "exactly $($asserted.Passed) passed, 0 failed, 0 ignored"'
+            '  } catch {'
+            '    $record.status = ''failed'''
+            '    $record.detail = $_.Exception.Message'
+            '    Write-Host "::error title=Narrow suite failed::$($spec.title): $($_.Exception.Message)"'
+            '    throw'
+            '  } finally {'
+            '    $record | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $evidenceDir "$Suite.json") -Encoding utf8'
+            '    Write-Host ''::endgroup::'''
+            '  }'
+            '}'
+          ) -join [Environment]::NewLine)
+          Set-Content -LiteralPath (Join-Path $evidenceDir 'narrow-suite.ps1') -Value $helperText -Encoding utf8
+
+          $suites = @(
+            [ordered]@{ id = 'server-default'; title = 'Server default features'; suite = 'server'; package = 'openbitfun-server'
+              cargo_flags = @(); features = 'default'; expected_passed = 5; manifest_workaround = $false
+              command = 'cargo test --locked -p openbitfun-server workspace_intelligence -- --test-threads=1'
+              expected_tests = @(
+                'workspace_intelligence::tests::a_seeded_scope_is_installed_for_the_loopback_surface_and_drained'
+                'workspace_intelligence::tests::a_shared_deployment_is_refused_without_touching_the_filesystem'
+                'workspace_intelligence::tests::a_stdio_only_surface_is_never_admitted_here'
+                'workspace_intelligence::tests::an_opened_but_disabled_workspace_is_admitted_without_writing_host_state'
+                'workspace_intelligence::tests::an_error_exit_still_releases_the_admitted_host'
+              )
+            }
+            [ordered]@{ id = 'server-no-default-features'; title = 'Server --no-default-features'; suite = 'server'; package = 'openbitfun-server'
+              cargo_flags = @('--no-default-features'); features = 'no-default-features'; expected_passed = 2; manifest_workaround = $false
+              command = 'cargo test --locked -p openbitfun-server --no-default-features workspace_intelligence -- --test-threads=1'
+              expected_tests = @(
+                'workspace_intelligence::tests::a_stdio_only_surface_is_never_admitted_here'
+                'workspace_intelligence::tests::the_feature_off_build_answers_not_compiled_and_creates_nothing'
+              )
+            }
+            [ordered]@{ id = 'desktop-lib-default'; title = 'Desktop --lib default features'; suite = 'desktop'; package = 'openbitfun-desktop'
+              cargo_flags = @('--lib'); features = 'default'; expected_passed = 7; manifest_workaround = $true
+              command = 'cargo test --locked -p openbitfun-desktop --lib --no-run --message-format=json'
+              expected_tests = @(
+                'workspace_intelligence::tests::a_seeded_scope_is_claimed_then_drained_and_its_lease_is_released'
+                'workspace_intelligence::tests::a_shared_deployment_is_refused_without_touching_the_filesystem'
+                'workspace_intelligence::tests::a_catalog_with_no_enabled_scope_installs_inactive_and_writes_nothing'
+                'workspace_intelligence::tests::an_install_in_flight_makes_a_concurrent_drain_wait_instead_of_returning_early'
+                'workspace_intelligence::tests::a_drain_before_any_install_closes_the_slot_and_a_late_install_is_refused'
+                'workspace_intelligence::tests::a_repeated_install_and_a_repeated_drain_answer_the_same_codes_with_one_lease'
+                'workspace_intelligence::tests::a_real_rescan_that_flips_worktree_facts_blocks_the_scope_and_the_latch_holds'
+              )
+            }
+            [ordered]@{ id = 'desktop-lib-no-default-features'; title = 'Desktop --lib --no-default-features'; suite = 'desktop'; package = 'openbitfun-desktop'
+              cargo_flags = @('--lib', '--no-default-features'); features = 'no-default-features'; expected_passed = 1; manifest_workaround = $true
+              command = 'cargo test --locked -p openbitfun-desktop --lib --no-default-features --no-run --message-format=json'
+              expected_tests = @(
+                'workspace_intelligence::tests::the_feature_off_build_answers_not_compiled_and_creates_nothing'
+              )
+            }
+          )
+          [ordered]@{ candidate_checkout_sha = $env:CHECKOUT_SHA; suites = $suites } |
+            ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $evidenceDir 'suites.json') -Encoding utf8
+          Write-Host "Wrote narrow-suite.ps1 and $($suites.Count) suite specs to $evidenceDir"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # src/apps/extension-host is installed and built with Bun.
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+          no-cache: true
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: "desktop-verify-narrow-tests-windows"
+          cache-bin: false
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm install --frozen-lockfile
+          $exit = $LASTEXITCODE
+          if ($exit -ne 0) { throw "pnpm install --frozen-lockfile failed with exit code $exit" }
+
+      # The Tauri build script references resource roots at compile time, so both
+      # products must exist before any cargo command runs here: frontend:build-all
+      # produces dist/ and src/mobile-web/dist, plugin-host:prepare produces
+      # src/apps/extension-host/dist, which frontend:build-all does not create.
+      - name: Build frontend resources
+        shell: pwsh
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm run frontend:build-all
+          $exit = $LASTEXITCODE
+          if ($exit -ne 0) { throw "pnpm run frontend:build-all failed with exit code $exit" }
+
+      - name: Prepare plugin host resources
+        shell: pwsh
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm run plugin-host:prepare
+          $exit = $LASTEXITCODE
+          if ($exit -ne 0) { throw "pnpm run plugin-host:prepare failed with exit code $exit" }
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'src/apps/extension-host/dist'
+          if (-not (Test-Path -LiteralPath $dist -PathType Container)) {
+            throw "pnpm run plugin-host:prepare reported success but produced no $dist"
+          }
+
+      # Blocking, not advisory: a state that does not compile must fail here with
+      # a readable cargo error instead of surfacing later as a missing artifact.
+      - name: Check the four narrow build states
+        shell: pwsh
+        timeout-minutes: 90
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $checks = @(
+            @{ Name = 'server default'; Args = @('check', '--locked', '-p', 'openbitfun-server') },
+            @{ Name = 'server no-default'; Args = @('check', '--locked', '-p', 'openbitfun-server', '--no-default-features') },
+            @{ Name = 'desktop default lib'; Args = @('check', '--locked', '-p', 'openbitfun-desktop', '--lib') },
+            @{ Name = 'desktop no-default lib'; Args = @('check', '--locked', '-p', 'openbitfun-desktop', '--lib', '--no-default-features') }
+          )
+          foreach ($check in $checks) {
+            Write-Host "::group::cargo $($check.Args -join ' ')"
+            cargo @($check.Args)
+            $exit = $LASTEXITCODE
+            Write-Host '::endgroup::'
+            if ($exit -ne 0) { throw "cargo check ($($check.Name)) failed with exit code $exit" }
+          }
+
+      - name: Run server workspace intelligence tests (default features)
+        shell: pwsh
+        timeout-minutes: 60
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'wi-narrow-tests/narrow-suite.ps1')
+          Invoke-NarrowSuite -Suite 'server-default'
+
+      - name: Run server workspace intelligence tests (no default features)
+        shell: pwsh
+        timeout-minutes: 60
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'wi-narrow-tests/narrow-suite.ps1')
+          Invoke-NarrowSuite -Suite 'server-no-default-features'
+
+      - name: Run desktop workspace intelligence tests (default features)
+        shell: pwsh
+        timeout-minutes: 90
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'wi-narrow-tests/narrow-suite.ps1')
+          Invoke-NarrowSuite -Suite 'desktop-lib-default'
+
+      - name: Run desktop workspace intelligence tests (no default features)
+        shell: pwsh
+        timeout-minutes: 90
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'wi-narrow-tests/narrow-suite.ps1')
+          Invoke-NarrowSuite -Suite 'desktop-lib-no-default-features'
+
+      # Always runs, so a suite that never started is recorded as not_run instead
+      # of disappearing from the evidence. It never rewrites a failure into a pass.
+      - name: Aggregate narrow test evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidenceDir = Join-Path $env:RUNNER_TEMP 'wi-narrow-tests'
+          $manifestPath = Join-Path $evidenceDir 'suites.json'
+          if (-not (Test-Path -LiteralPath $manifestPath)) {
+            throw "No suite manifest at $manifestPath; the job failed before any suite could be recorded."
+          }
+          $specs = (Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json).suites
+          $head = ''
+          if (Test-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.git')) {
+            $head = (git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim()
+            if ($LASTEXITCODE -ne 0) { $head = '' }
+          }
+          $suites = @()
+          foreach ($spec in $specs) {
+            $path = Join-Path $evidenceDir ("{0}.json" -f $spec.id)
+            if (Test-Path -LiteralPath $path) { $suites += (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json); continue }
+            $suites += [pscustomobject][ordered]@{
+              id = $spec.id; suite = $spec.suite; features = $spec.features
+              command = $spec.command; run_command = $null
+              expected_passed = $spec.expected_passed; actual_passed = $null; failed = $null; ignored = $null
+              exit_code = $null; build_exit_code = $null; mt_exit_code = $null
+              manifest_workaround = [bool]$spec.manifest_workaround; actual_head = ''
+              test_executable_copy = $null; mt_path = $null
+              status = 'not_run'; detail = 'the suite never ran'
+              log = "$($spec.id).stdout.log"; stderr_log = "$($spec.id).stderr.log"; build_json = $null
+            }
+          }
+          $notPassed = @($suites | Where-Object { $_.status -ne 'passed' })
+          $sourceVerified = ($env:CHECKOUT_SHA -match '^[0-9a-f]{40}$') -and ($head -eq $env:CHECKOUT_SHA)
+          $overall = 'failed'
+          if ($notPassed.Count -eq 0 -and $sourceVerified) { $overall = 'passed' }
+          $evidence = [ordered]@{
+            kind = 'openbitfun-desktop-verify-narrow-tests'; signed = $false; release_published = $false
+            candidate_checkout_sha = $env:CHECKOUT_SHA; actual_head = $head; source_verified = $sourceVerified
+            workflow = [ordered]@{
+              repository = $env:GITHUB_REPOSITORY; github_sha = $env:GITHUB_SHA; github_ref = $env:GITHUB_REF
+              workflow_ref = $env:GITHUB_WORKFLOW_REF; run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT
+              run_url = "$($env:GITHUB_SERVER_URL)/$($env:GITHUB_REPOSITORY)/actions/runs/$($env:GITHUB_RUN_ID)"
+              runner_os = $env:RUNNER_OS
+            }
+            overall = $overall; suites = $suites
+            generated_utc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+          }
+          $evidence | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $evidenceDir 'narrow-tests-evidence.json') -Encoding utf8
+          $summary = @('', '### Narrow unit tests (workspace intelligence host)', '',
+            "Candidate commit: $($env:CHECKOUT_SHA) (checked-out HEAD: $head, source verified: $sourceVerified)", '',
+            '| Suite | Features | Expected | Actual | Failed | Ignored | Exit | Status | Manifest workaround | Log |',
+            '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |')
+          foreach ($suite in $suites) {
+            # A failed suite has no counts, which is not the same as a suite that
+            # never ran; keep the two states visually distinct.
+            $blank = if ($suite.status -eq 'not_run') { 'not_run' } else { 'n/a' }
+            $cells = foreach ($value in @($suite.expected_passed, $suite.actual_passed, $suite.failed, $suite.ignored, $suite.exit_code)) {
+              if ($null -eq $value) { $blank } else { [string]$value }
+            }
+            $summary += "| $($suite.id) | $($suite.features) | $($cells[0]) | $($cells[1]) | $($cells[2]) | $($cells[3]) | $($cells[4]) | $($suite.status) | $($suite.manifest_workaround) | $($suite.log) |"
+          }
+          $summary += ''
+          $summary += 'The per-suite logs and cargo build JSON in this artifact are the evidence; this table is a summary.'
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
+          if ($overall -ne 'passed') {
+            $detail = ($notPassed | ForEach-Object { "$($_.id)=$($_.status) ($($_.detail))" }) -join '; '
+            throw "Narrow suites did not pass: source_verified=$sourceVerified; $detail"
+          }
+          Write-Host "All narrow suites passed: $(($suites | ForEach-Object { "$($_.id)=$($_.actual_passed)" }) -join ', ')"
+
+      - name: Upload narrow test evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: openbitfun-desktop-verify-narrow-tests-${{ needs.prepare.outputs.checkout_sha }}
+          path: ${{ runner.temp }}/wi-narrow-tests
+          if-no-files-found: error
+          retention-days: 7
+
   # ── Build the unsigned Windows installer ───────────────────────────
   package:
     name: Package (${{ matrix.platform.name }})
     runs-on: ${{ matrix.platform.os }}
-    needs: prepare
+    # A failed or unfinished narrow test job skips packaging, so an installer is
+    # never produced from a commit whose own suites did not pass.
+    needs: [prepare, narrow-tests]
     if: needs.prepare.outputs.target_platform == 'windows'
     timeout-minutes: 180
     env:
