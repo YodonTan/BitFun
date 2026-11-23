@@ -12,15 +12,20 @@
 //! opaque and NOT a secret, which is why it is neither hashed nor given any
 //! privacy guarantee.
 //!
-//! No production caller exists in this tree yet. The bootstrap that reads the
-//! anchor lands later, and the only production `ensure` caller arrives at first
-//! workspace-intelligence enable. This module supplies no bootstrap sequencing,
-//! policy, runtime, process, network, or UI behavior.
+//! No production caller of the writing path exists in this tree yet: the core
+//! host bootstrap reads the anchor through `read_strict`, and the only
+//! production `ensure_for_initial_enable` caller arrives at first
+//! workspace-intelligence enable.
+//! The protected first-enable entry point is
+//! [`HostAnchorStore::ensure_for_initial_enable`], which additionally proves the
+//! same-namespace control root vacant before it may mint. This module supplies
+//! no bootstrap sequencing, policy, runtime, process, network, or UI behavior.
 //!
 //! `read_strict` never creates the root, a directory, a file, or a `.lock`, never
-//! takes a lock, and never deletes or resets anything. `ensure` is the single
-//! writer: it runs the mint as an owned task, re-reads under the JSON
-//! cross-process guard, and publishes the minted document with a strict
+//! takes a lock, and never deletes or resets anything. `ensure` and the
+//! protected [`ensure_for_initial_enable`](HostAnchorStore::ensure_for_initial_enable)
+//! are the only writers: each runs the mint as an owned task, re-reads under the
+//! JSON cross-process guard, and publishes the minted document with a strict
 //! create-new atomic write that fails with `AlreadyExists` instead of replacing a
 //! racing writer. No stored variant is ever repaired, overwritten, or adopted.
 //!
@@ -57,7 +62,7 @@
 use crate::bounded_fs::{is_symlink_or_reparse, BoundedTextRead};
 use crate::json_store::{JsonFileStore, JsonFileStoreError};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// File name of the anchor document inside the caller-selected root.
 pub const HOST_ANCHOR_FILE_NAME: &str = "host-anchor.json";
@@ -77,14 +82,15 @@ pub enum HostAnchorState {
     ///
     /// On Windows, `ERROR_BAD_NETPATH` and `ERROR_BAD_NET_NAME` decode to
     /// `NotFound`, so an offline network home also reports `Absent`; `ensure`
-    /// would then attempt to mint there, which is why only an explicit
-    /// first-enable path may call it.
+    /// and `ensure_for_initial_enable` would then attempt to mint there, which
+    /// is why only an explicit first-enable path may call either.
     Absent,
     /// The anchor file exists and passed strict validation.
     Present(HostAnchor),
 }
 
-/// Outcome of an [`HostAnchorStore::ensure`] call.
+/// Outcome of an [`HostAnchorStore::ensure`] or
+/// [`HostAnchorStore::ensure_for_initial_enable`] call.
 #[derive(Debug, Clone)]
 pub enum HostAnchorEnsure {
     /// This call published the anchor.
@@ -140,6 +146,38 @@ pub enum HostAnchorError {
     UnsupportedFormat { observed: String },
     #[error("Host anchor mint raced an external writer and the target stayed absent")]
     MintRaced,
+    /// A protected initial-enable mint was refused because its control root is
+    /// not a plain direct child of this store's anchor root.
+    #[error("Host anchor initial-enable control root is out of scope for this anchor root")]
+    InitialEnableControlOutOfScope,
+    /// A protected initial-enable mint was refused because the namespace root is
+    /// a symlink or reparse point.
+    #[error("Host anchor root is a symlink or reparse point")]
+    InitialEnableRootReparse,
+    /// A protected initial-enable mint was refused because the namespace root
+    /// exists but is not a directory.
+    #[error("Host anchor root is not a directory")]
+    InitialEnableRootNotDirectory,
+    /// A protected initial-enable mint was refused because the namespace root
+    /// could not be inspected.
+    #[error("Host anchor root could not be inspected: {0}")]
+    InitialEnableRootUnreadable(#[source] std::io::Error),
+    /// A protected initial-enable mint was refused because the control root is a
+    /// symlink or reparse point.
+    #[error("Host anchor initial-enable control root is a symlink or reparse point")]
+    InitialEnableControlReparse,
+    /// A protected initial-enable mint was refused because the control root
+    /// exists but is not a directory.
+    #[error("Host anchor initial-enable control root is not a directory")]
+    InitialEnableControlNotDirectory,
+    /// A protected initial-enable mint was refused because the control root
+    /// could not be proven empty.
+    #[error("Host anchor initial-enable control root could not be read: {0}")]
+    InitialEnableControlUnreadable(#[source] std::io::Error),
+    /// A protected initial-enable mint was refused because the control root
+    /// holds at least one entry.
+    #[error("Host anchor initial-enable control root holds entries")]
+    InitialEnableControlOccupied,
     #[error("Host anchor lock failed: {0}")]
     Lock(#[from] JsonFileStoreError),
     #[error("Host anchor IO failed: {0}")]
@@ -158,6 +196,20 @@ impl HostAnchorError {
             Self::UnsupportedSchema { .. } => "host_anchor_unsupported_schema",
             Self::UnsupportedFormat { .. } => "host_anchor_unsupported_format",
             Self::MintRaced => "host_anchor_mint_raced",
+            Self::InitialEnableControlOutOfScope => {
+                "host_anchor_initial_enable_control_out_of_scope"
+            }
+            Self::InitialEnableRootReparse => "host_anchor_initial_enable_root_reparse",
+            Self::InitialEnableRootNotDirectory => "host_anchor_initial_enable_root_not_directory",
+            Self::InitialEnableRootUnreadable(_) => "host_anchor_initial_enable_root_unreadable",
+            Self::InitialEnableControlReparse => "host_anchor_initial_enable_control_reparse",
+            Self::InitialEnableControlNotDirectory => {
+                "host_anchor_initial_enable_control_not_directory"
+            }
+            Self::InitialEnableControlUnreadable(_) => {
+                "host_anchor_initial_enable_control_unreadable"
+            }
+            Self::InitialEnableControlOccupied => "host_anchor_initial_enable_control_occupied",
             Self::Lock(_) => "host_anchor_lock",
             Self::Io(_) => "host_anchor_io",
         }
@@ -284,6 +336,11 @@ impl HostAnchorStore {
     /// Publish the anchor exactly once. An existing anchor of any shape is
     /// returned or reported unchanged; this call never overwrites, adopts, or
     /// deletes stored data.
+    ///
+    /// This is the unprotected primitive: an explicit first-enable caller must
+    /// use [`ensure_for_initial_enable`](Self::ensure_for_initial_enable)
+    /// instead, which additionally proves the same-namespace control root
+    /// vacant before it may mint.
     pub async fn ensure(&self) -> Result<HostAnchorEnsure, HostAnchorError> {
         match self.read_strict().await? {
             HostAnchorState::Present(anchor) => Ok(HostAnchorEnsure::Existing(anchor)),
@@ -299,6 +356,80 @@ impl HostAnchorStore {
                     .map_err(|error| HostAnchorError::Io(std::io::Error::other(error)))?
             }
         }
+    }
+
+    /// Protected write-once mint for the explicit first workspace-intelligence
+    /// enable.
+    ///
+    /// This is the mint entry point a first-enable flow may consume, and it is
+    /// deliberately stricter than [`ensure`](Self::ensure):
+    ///
+    /// 1. `control_root` must be the same-namespace control directory: a plain
+    ///    direct child of this store's anchor root, built by the `PathManager`
+    ///    owner from that same root. `..` segments, deeper descendants, the
+    ///    anchor root itself, and sibling namespaces are refused with
+    ///    [`HostAnchorError::InitialEnableControlOutOfScope`] before any IO. The
+    ///    directory *name* is never duplicated or inferred here, and spellings
+    ///    that normalize to the same direct child (interior `.` segments,
+    ///    repeated separators) are accepted as that child.
+    /// 2. An existing anchor is returned unchanged whatever the control state;
+    ///    nothing is overwritten, adopted, repaired, or deleted.
+    /// 3. Only an anchor that is strictly `Absent` and a control root that is
+    ///    proven vacant may mint. Occupied, unreadable, linked/reparse, and
+    ///    non-directory roots, and every unknown entry (including `.lock` and
+    ///    `_tmp`/`*.tmp` residue), refuse with a typed error.
+    /// 4. The vacancy pre-check runs before the anchor guard is acquired, so a
+    ///    refusal leaves no directory, no lock, and no `.tmp` behind.
+    /// 5. The mint is the same owned task shape as [`ensure`](Self::ensure):
+    ///    under the anchor's cross-process OS guard it re-reads the anchor
+    ///    strictly, re-proves control vacancy immediately before publishing, and
+    ///    publishes with a strict create-new write that fails with
+    ///    `AlreadyExists` instead of replacing a racing writer.
+    ///
+    /// # Trust and residual races
+    ///
+    /// The parent of the anchor root is trusted: the `PathManager` owner selects
+    /// it, and this module cannot defend against a hostile parent, a renamed
+    /// namespace, or a path swapped for a link between a check and the publish.
+    /// The control root is only probed, never opened, locked, created, or
+    /// modified, and proving vacancy is a conservative refusal gate, not a
+    /// cross-store transaction: a control record that appears after the in-lock
+    /// vacancy re-check cannot be detected here, so every cooperative control
+    /// writer must be anchor-first and must not create a control record for a
+    /// namespace whose anchor it has not obtained first. A refusal inside the
+    /// lock can leave the anchor root and the inert `host-anchor.json.lock`
+    /// behind; that lock is not a tenancy marker and no read path ever cleans it
+    /// up. On Windows, `ERROR_BAD_NETPATH` and `ERROR_BAD_NET_NAME` decode to
+    /// `NotFound`, so an offline redirected home can appear anchor-absent and
+    /// control-vacant and reach the mint, which then fails closed on the first
+    /// real write.
+    ///
+    /// Like [`ensure`](Self::ensure), this method belongs only to the explicit
+    /// first-enable path, never to startup, bootstrap, or any automatic retry.
+    pub async fn ensure_for_initial_enable(
+        &self,
+        control_root: &Path,
+    ) -> Result<HostAnchorEnsure, HostAnchorError> {
+        let control_root = initial_enable_control_root(&self.root, control_root)?;
+        if let HostAnchorState::Present(anchor) = self.read_strict().await? {
+            return Ok(HostAnchorEnsure::Existing(anchor));
+        }
+        // Pre-check vacancy without taking the guard: an occupied control root
+        // refuses here, before the anchor root or a lock file is created.
+        let precheck_root = self.root.clone();
+        let precheck_control = control_root.clone();
+        tokio::task::spawn_blocking(move || {
+            prove_initial_enable_vacancy(&precheck_root, &precheck_control)
+        })
+        .await
+        .map_err(|error| HostAnchorError::Io(std::io::Error::other(error)))??;
+        // As in `ensure`, the mint is an owned task, so caller cancellation can
+        // lose only the result and the guarded re-check plus publish still
+        // complete.
+        let root = self.root.clone();
+        tokio::spawn(async move { mint_anchor_for_initial_enable(root, control_root).await })
+            .await
+            .map_err(|error| HostAnchorError::Io(std::io::Error::other(error)))?
     }
 }
 
@@ -503,6 +634,139 @@ async fn mint_anchor(root: PathBuf) -> Result<HostAnchorEnsure, HostAnchorError>
     }
 }
 
+/// Mint body for [`HostAnchorStore::ensure_for_initial_enable`].
+///
+/// Twin of [`mint_anchor`], with the control-vacancy gate added at the last
+/// possible check point: after the guard is held and the anchor was strictly
+/// re-read as absent, and immediately before the create-new publish. The
+/// publish, race mapping, and round-trip verification are the same reviewed
+/// steps `ensure` uses.
+async fn mint_anchor_for_initial_enable(
+    root: PathBuf,
+    control_root: PathBuf,
+) -> Result<HostAnchorEnsure, HostAnchorError> {
+    let probe_root = root.clone();
+    let store = HostAnchorStore::new(root);
+    let path = store.anchor_path();
+    #[cfg(test)]
+    let pauses = test_pauses::anchor_pauses_for(&path);
+    // The mint path is the only place that may bring up the caller-selected root.
+    // The lock helper and the atomic write below both create it idempotently
+    // (`create_dir_all`); no read path ever does.
+    let _lock = JsonFileStore.acquire_cross_process_lock(&path).await?;
+    // Same-winner read: another process may have published while we queued here.
+    if let HostAnchorState::Present(anchor) = store.read_strict().await? {
+        return Ok(HostAnchorEnsure::Existing(anchor));
+    }
+    // Test-only check point: the guard is held and the anchor was just re-read
+    // as absent. A record that lands while this pause is open must be refused by
+    // the vacancy re-check below instead of being minted over.
+    #[cfg(test)]
+    if let Some(pause) = pauses.guard_pause.as_ref() {
+        test_pauses::wait_pause(pause).await;
+    }
+    // Re-prove vacancy under the same anchor guard, immediately before minting.
+    // This refuses a record that arrived after the caller-side pre-check; no
+    // atomicity beyond this check point is claimed.
+    tokio::task::spawn_blocking(move || prove_initial_enable_vacancy(&probe_root, &control_root))
+        .await
+        .map_err(|error| HostAnchorError::Io(std::io::Error::other(error)))??;
+    let anchor = uuid::Uuid::new_v4().simple().to_string();
+    let text = serialize_document(&anchor)?;
+    let publish = JsonFileStore.write_text_atomic_create_new(&path, &text).await;
+    match resolve_create_new_publish(publish, store.read_strict()).await? {
+        AnchorPublish::Existing(anchor) => return Ok(HostAnchorEnsure::Existing(anchor)),
+        AnchorPublish::Published => {}
+    }
+    // The published document must round-trip to the minted value; anything else
+    // is corrupt storage and is reported, never overwritten.
+    let expected = format!("{HOST_ID_PREFIX}{anchor}");
+    match store.read_strict().await? {
+        HostAnchorState::Present(anchor) if anchor.host_id() == expected => {
+            Ok(HostAnchorEnsure::Created(anchor))
+        }
+        HostAnchorState::Present(_) | HostAnchorState::Absent => Err(HostAnchorError::Corrupt),
+    }
+}
+
+/// Pure structural check of the caller-supplied initial-enable control root.
+///
+/// The root must resolve to a direct child of the anchor root, built by the owner
+/// that selected it (`PathManager`) from that same root. This module deliberately
+/// does not know or reproduce the directory *name*; it only verifies the
+/// namespace position, because that position is what makes the vacancy proof
+/// same-namespace. `Path::parent` is lexical and never normalizes `..`, so an
+/// escaping path such as `root/../control` keeps a parent outside the root and is
+/// refused, and `..`/leading `.` components are rejected explicitly as well.
+/// Interior `.` segments and repeated separators are filesystem no-ops that
+/// resolve to the same direct child, so they are accepted as that child.
+fn initial_enable_control_root(
+    root: &Path,
+    control_root: &Path,
+) -> Result<PathBuf, HostAnchorError> {
+    if control_root.parent() != Some(root)
+        || control_root.file_name().is_none()
+        || control_root
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(HostAnchorError::InitialEnableControlOutOfScope);
+    }
+    Ok(control_root.to_path_buf())
+}
+
+/// Proves that the namespace cannot hide control records. Runs on a blocking
+/// worker (see [`HostAnchorStore::ensure_for_initial_enable`]).
+///
+/// "Vacant" means the control root is absent, or a real (non-linked) directory
+/// with no entry at all. Anything else refuses: a link or reparse point, a
+/// non-directory, an unreadable entry, and every entry whatever its name or type
+/// — scoped records, `.lock` files, `_tmp`/`*.tmp` residue, unknown names. The
+/// directory is never opened for writing, locked, created, or modified, and
+/// nothing found here is deleted, filtered, or repaired. The anchor root is
+/// checked in the same pass so a linked or replaced namespace root cannot host a
+/// mint.
+fn prove_initial_enable_vacancy(
+    anchor_root: &Path,
+    control_root: &Path,
+) -> Result<(), HostAnchorError> {
+    match std::fs::symlink_metadata(anchor_root) {
+        Ok(metadata) if is_symlink_or_reparse(&metadata) => {
+            return Err(HostAnchorError::InitialEnableRootReparse);
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(HostAnchorError::InitialEnableRootNotDirectory);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(HostAnchorError::InitialEnableRootUnreadable(error)),
+    }
+    let control = match std::fs::symlink_metadata(control_root) {
+        Ok(metadata) => metadata,
+        // An absent control root cannot hold records: the control store keeps
+        // them inside this directory only.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(HostAnchorError::InitialEnableControlUnreadable(error)),
+    };
+    if is_symlink_or_reparse(&control) {
+        return Err(HostAnchorError::InitialEnableControlReparse);
+    }
+    if !control.is_dir() {
+        return Err(HostAnchorError::InitialEnableControlNotDirectory);
+    }
+    // One bounded take, no name or type filter. One entry of any kind refuses the
+    // mint, and an enumeration failure is not "empty".
+    let mut entries = match std::fs::read_dir(control_root) {
+        Ok(entries) => entries,
+        Err(error) => return Err(HostAnchorError::InitialEnableControlUnreadable(error)),
+    };
+    match entries.next() {
+        None => Ok(()),
+        Some(Ok(_)) => Err(HostAnchorError::InitialEnableControlOccupied),
+        Some(Err(error)) => Err(HostAnchorError::InitialEnableControlUnreadable(error)),
+    }
+}
+
 /// Test-only pause and completion registry keyed by anchor path.
 ///
 /// The commit owner's `TestPause` is unreachable here: this feature deliberately
@@ -526,6 +790,9 @@ mod test_pauses {
         pub(super) before_open_pause: Option<TestPause>,
         /// Fires with the cross-process guard held, after the fresh read
         /// confirmed still-absent and before anything is minted or published.
+        /// For the protected initial-enable mint it fires at the vacancy check
+        /// point: a record that lands while the pause is open must be refused by
+        /// the re-check that follows, never minted over.
         pub(super) guard_pause: Option<TestPause>,
         /// Fires after the create-new publish succeeded, before the final read.
         pub(super) published_pause: Option<TestPause>,
@@ -1063,6 +1330,369 @@ mod tests {
             document["anchor"].as_str().unwrap(),
             anchor.host_id().strip_prefix(HOST_ID_PREFIX).unwrap()
         );
+    }
+
+    /// Links a directory for tests: a junction on Windows, a symlink elsewhere.
+    #[cfg(windows)]
+    fn link_directory(target: &Path, link: &Path) -> std::io::Result<()> {
+        use std::os::windows::process::CommandExt;
+        // A directory junction is a reparse point that needs no
+        // SeCreateSymbolicLinkPrivilege, and CREATE_NO_WINDOW keeps the fixture
+        // from flashing a console window.
+        let status = std::process::Command::new(
+            std::env::var_os("ComSpec").unwrap_or_else(|| "cmd".into()),
+        )
+        .creation_flags(0x0800_0000)
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "mklink /J failed with {status}"
+            )))
+        }
+    }
+
+    #[cfg(unix)]
+    fn link_directory(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    /// A same-root direct-child control name the platform refuses to inspect.
+    fn unreadable_control_name(root: &Path) -> PathBuf {
+        #[cfg(windows)]
+        {
+            // Win32 rejects `?` with ERROR_INVALID_NAME, which is not `NotFound`
+            // and therefore cannot masquerade as a vacant directory.
+            root.join("control?bad")
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            // An interior NUL is refused by the path conversion itself.
+            root.join(std::ffi::OsStr::from_bytes(b"control\0bad"))
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_enable_mints_once_on_vacant_control_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // (a) A fresh namespace: neither the anchor root nor the control root
+        // exists, so the control store cannot hold any record.
+        let absent_root = tmp.path().join("absent-namespace");
+        let absent_control = absent_root.join("control");
+        let absent_store = HostAnchorStore::new(absent_root.clone());
+        let minted = created(
+            absent_store
+                .ensure_for_initial_enable(&absent_control)
+                .await
+                .unwrap(),
+        );
+        let suffix = minted.host_id().strip_prefix(HOST_ID_PREFIX).unwrap();
+        assert_eq!(
+            String::from_utf8(std::fs::read(absent_store.anchor_path()).unwrap()).unwrap(),
+            anchor_document(suffix)
+        );
+        // Proving vacancy is read-only: the control root is never created.
+        assert!(!absent_control.exists());
+
+        // The same anchor is reused by every later first-enable attempt.
+        let reused = existing(
+            absent_store
+                .ensure_for_initial_enable(&absent_control)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(reused.host_id(), minted.host_id());
+        assert_eq!(
+            entry_names(&absent_root),
+            vec![
+                HOST_ANCHOR_FILE_NAME.to_owned(),
+                format!("{HOST_ANCHOR_FILE_NAME}.lock"),
+            ]
+        );
+
+        // (b) An existing but empty control root is proven vacant too.
+        let empty_root = tmp.path().join("empty-namespace");
+        let empty_control = empty_root.join("control");
+        std::fs::create_dir_all(&empty_control).unwrap();
+        let empty_store = HostAnchorStore::new(empty_root.clone());
+        let minted = created(
+            empty_store
+                .ensure_for_initial_enable(&empty_control)
+                .await
+                .unwrap(),
+        );
+        let reused = existing(
+            empty_store
+                .ensure_for_initial_enable(&empty_control)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(reused.host_id(), minted.host_id());
+        assert!(entry_names(&empty_control).is_empty());
+        assert_eq!(
+            entry_names(&empty_root),
+            vec![
+                "control".to_owned(),
+                HOST_ANCHOR_FILE_NAME.to_owned(),
+                format!("{HOST_ANCHOR_FILE_NAME}.lock"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_enable_returns_an_existing_anchor_untouched_even_with_control_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("namespace");
+        let control = root.join("control");
+        std::fs::create_dir_all(&control).unwrap();
+        let store = HostAnchorStore::new(root.clone());
+        std::fs::write(store.anchor_path(), anchor_document(ANCHOR)).unwrap();
+        // A record that would refuse a mint must not affect an existing anchor.
+        let record = control.join("scope.json");
+        std::fs::write(&record, b"existing control record").unwrap();
+        let anchor_before = std::fs::read(store.anchor_path()).unwrap();
+        let record_before = std::fs::read(&record).unwrap();
+
+        let anchor = existing(store.ensure_for_initial_enable(&control).await.unwrap());
+        assert_eq!(anchor.host_id(), format!("{HOST_ID_PREFIX}{ANCHOR}"));
+        // Nothing was written, locked, adopted, or repaired.
+        assert_eq!(std::fs::read(store.anchor_path()).unwrap(), anchor_before);
+        assert_eq!(std::fs::read(&record).unwrap(), record_before);
+        assert_eq!(
+            entry_names(&root),
+            vec!["control".to_owned(), HOST_ANCHOR_FILE_NAME.to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_enable_refuses_occupied_control_roots_without_touching_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Every entry counts, with no name or type filter: a scoped record, a
+        // lock, temp residue, and an unknown name.
+        for entry in [
+            "scope.json",
+            ".scope.json.lock",
+            ".scope.json.1234.5678.0.tmp",
+            "unknown-entry",
+        ] {
+            let root = tmp.path().join(entry);
+            let control = root.join("control");
+            std::fs::create_dir_all(&control).unwrap();
+            let entry_path = control.join(entry);
+            std::fs::write(&entry_path, b"control record bytes").unwrap();
+            let before = std::fs::read(&entry_path).unwrap();
+            let store = HostAnchorStore::new(root.clone());
+
+            let error = store
+                .ensure_for_initial_enable(&control)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code(),
+                "host_anchor_initial_enable_control_occupied",
+                "{entry}"
+            );
+            // The pre-check refuses before the guard: no anchor, no lock, no temp.
+            assert!(!store.anchor_path().exists(), "{entry}");
+            assert_eq!(entry_names(&root), vec!["control".to_owned()], "{entry}");
+            assert_eq!(entry_names(&control), vec![entry.to_owned()], "{entry}");
+            assert_eq!(std::fs::read(&entry_path).unwrap(), before, "{entry}");
+        }
+
+        // A nested directory is an entry too.
+        let root = tmp.path().join("nested-directory");
+        let control = root.join("control");
+        std::fs::create_dir_all(control.join("nested")).unwrap();
+        let store = HostAnchorStore::new(root.clone());
+        let error = store
+            .ensure_for_initial_enable(&control)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "host_anchor_initial_enable_control_occupied");
+        assert!(!store.anchor_path().exists());
+        assert_eq!(entry_names(&root), vec!["control".to_owned()]);
+        assert_eq!(entry_names(&control), vec!["nested".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn initial_enable_refuses_control_roots_outside_the_anchor_namespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("namespace");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = HostAnchorStore::new(root.clone());
+        for control in [
+            tmp.path().join("sibling"),
+            root.join(".."),
+            root.join("..").join("control"),
+            root.join("nested").join("control"),
+            root.clone(),
+        ] {
+            let error = store
+                .ensure_for_initial_enable(&control)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code(),
+                "host_anchor_initial_enable_control_out_of_scope",
+                "{}",
+                control.display()
+            );
+        }
+        // Every refusal is decided before any IO: the namespace root stays empty.
+        assert_eq!(entry_names(&root), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn initial_enable_refuses_malformed_or_unreadable_control_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // (a) A plain file where the control directory should be.
+        let root = tmp.path().join("file-shaped");
+        let control = root.join("control");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&control, b"not a directory").unwrap();
+        let before = std::fs::read(&control).unwrap();
+        let store = HostAnchorStore::new(root.clone());
+        let error = store
+            .ensure_for_initial_enable(&control)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "host_anchor_initial_enable_control_not_directory"
+        );
+        assert!(!store.anchor_path().exists());
+        assert_eq!(std::fs::read(&control).unwrap(), before);
+        assert_eq!(entry_names(&root), vec!["control".to_owned()]);
+
+        // (b) A linked control root is never traversed to "prove" vacancy.
+        let root = tmp.path().join("linked-shaped");
+        let target = tmp.path().join("linked-target");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let control = root.join("control");
+        link_directory(&target, &control).unwrap();
+        let store = HostAnchorStore::new(root.clone());
+        let error = store
+            .ensure_for_initial_enable(&control)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "host_anchor_initial_enable_control_reparse");
+        assert!(!store.anchor_path().exists());
+        assert_eq!(entry_names(&root), vec!["control".to_owned()]);
+        assert!(entry_names(&target).is_empty());
+
+        // (c) A control name the filesystem refuses to inspect is a typed
+        // refusal, not a vacant directory.
+        let root = tmp.path().join("unreadable-name");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = HostAnchorStore::new(root.clone());
+        let error = store
+            .ensure_for_initial_enable(&unreadable_control_name(&root))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "host_anchor_initial_enable_control_unreadable"
+        );
+        assert!(!store.anchor_path().exists());
+        assert!(entry_names(&root).is_empty());
+
+        // (d) A plain file where the anchor root should be is refused by the
+        // vacancy probe itself.
+        let root = tmp.path().join("file-root");
+        std::fs::write(&root, b"not a directory").unwrap();
+        let error = prove_initial_enable_vacancy(&root, &root.join("control")).unwrap_err();
+        assert_eq!(error.code(), "host_anchor_initial_enable_root_not_directory");
+        assert_eq!(std::fs::read(&root).unwrap(), b"not a directory".to_vec());
+    }
+
+    #[tokio::test]
+    async fn initial_enable_refuses_a_linked_anchor_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("namespace-target");
+        std::fs::create_dir_all(&target).unwrap();
+        let root = tmp.path().join("namespace");
+        link_directory(&target, &root).unwrap();
+        let store = HostAnchorStore::new(root.clone());
+        let error = store
+            .ensure_for_initial_enable(&root.join("control"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "host_anchor_initial_enable_root_reparse");
+        // Neither the linked root nor its target received anything.
+        assert!(entry_names(&target).is_empty());
+        assert!(!store.anchor_path().exists());
+    }
+
+    #[tokio::test]
+    async fn initial_enable_late_control_record_is_refused_at_the_check_point() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("namespace");
+        let control = root.join("control");
+        let store = HostAnchorStore::new(root.clone());
+        // The pre-check sees a vacant namespace, so the caller proceeds to the
+        // guard; the barrier then holds exactly at the in-lock check point.
+        let (guard_pause, mut guard_entered, release_guard) = pause();
+        let registration = test_pauses::register_anchor_pauses(
+            &store.anchor_path(),
+            test_pauses::AnchorPauses {
+                guard_pause: Some(guard_pause),
+                ..Default::default()
+            },
+        );
+
+        let caller_store = HostAnchorStore::new(root.clone());
+        let caller_control = control.clone();
+        let caller = tokio::spawn(async move {
+            caller_store.ensure_for_initial_enable(&caller_control).await
+        });
+        entered(&mut guard_entered).await;
+        // The guard is held, the anchor is still absent, and nothing is published.
+        assert!(!store.anchor_path().exists());
+
+        // The record arrives after the caller-side pre-check and before the
+        // in-lock vacancy re-check: the mint must refuse it, not mint over it.
+        std::fs::create_dir_all(&control).unwrap();
+        let record = control.join("scope.json");
+        std::fs::write(&record, b"late control record").unwrap();
+        release_guard.send(()).unwrap();
+        // Never park a later firing: release and disconnect the pause.
+        drop(release_guard);
+
+        let error = caller.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), "host_anchor_initial_enable_control_occupied");
+        assert!(
+            !store.anchor_path().exists(),
+            "a late record is never minted over"
+        );
+        assert_eq!(std::fs::read(&record).unwrap(), b"late control record".to_vec());
+        // Residual inert guard file only: the control record is untouched, and
+        // the in-lock refusal never repairs or deletes anything.
+        assert_eq!(
+            entry_names(&root),
+            vec![
+                "control".to_owned(),
+                format!("{HOST_ANCHOR_FILE_NAME}.lock"),
+            ]
+        );
+
+        // The refusal is stable: a second attempt stays refused, barrier gone.
+        drop(registration);
+        let error = store
+            .ensure_for_initial_enable(&control)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "host_anchor_initial_enable_control_occupied");
+        assert!(!store.anchor_path().exists());
     }
 
     /// Creates a FIFO at `path`, failing the test with the OS error otherwise.
