@@ -3,15 +3,20 @@
 //!
 //! This module is the narrow app-facing surface of the internal host slice. It
 //! answers three questions and nothing else: start (bootstrap), `status()`, and
-//! `shutdown()`. The returned handle never exposes a claim, an origin ticket, a
-//! token, a lease path, a control root, or the raw anchor value.
+//! `shutdown()`. One crate-internal preparation entry point additionally serves
+//! the future sole confirmed enable owner: it turns an admission observation into
+//! the host's own storage anchor and never starts by itself. The returned handle
+//! never exposes a claim, an origin ticket, a token, a lease path, a control root,
+//! or the raw anchor value.
 //!
 //! ## Visibility
 //!
 //! `bootstrap`, `status`, `shutdown` and the plain-data result types are `pub`, and
 //! an opaque handle is the only way to reach this slice. Tenure, tickets, tokens,
 //! lease paths, control and cognition roots, the raw anchor and the full host id
-//! are deliberately not part of that surface.
+//! are deliberately not part of that surface. The preparation entry point is
+//! `pub(super)`: it has no app-facing caller, no command and no registry row in
+//! this tree, and no caller can hand it a namespace, a host id or an anchor value.
 //!
 //! ## Authority
 //!
@@ -46,6 +51,9 @@
 //! cognition partition, no control write and no anchor mint. A missing anchor next
 //! to a non-empty control directory is a bounded existence probe only: the foreign
 //! files are never opened, parsed or guessed from, and every byte is preserved.
+//! The one explicit exception is the crate-internal anchor preparation described
+//! below: for one admitted eligible OFF scope it may publish the guarded anchor
+//! document and its own anchor guard lock, and it writes nothing else.
 //!
 //! ## Naming
 //!
@@ -90,6 +98,39 @@
 //! to any file, and cannot remember an observation across a process restart. A
 //! restarted host starts from the persisted facts alone, exactly as the first
 //! build to see them would.
+//!
+//! ## Anchor preparation
+//!
+//! A host that starts without an anchor still never mints: bootstrap only reads.
+//! The crate-internal preparation path is the single exception, and it is reached
+//! only with the admission observation of the future sole confirmed enable owner.
+//! It revalidates the candidate against fresh persisted facts (the candidate is
+//! never trusted for a write), mints only through
+//! `HostAnchorStore::ensure_for_initial_enable` over this host's own `PathManager`
+//! roots, verifies the anchor strictly one last time, and attaches it to this host
+//! exactly once under the book lock that also carries the drain transition. An
+//! already attached anchor is reused, never replaced; a corrupt, replaced or
+//! missing-with-records anchor is refused, never repaired or re-minted. Preparation
+//! adopts the storage namespace in memory: it writes no control record, takes no
+//! lease, opens no cognition partition, starts no standby worker, schedules no
+//! background wake-up and enables nothing. It runs as one host-owned task, so a
+//! dropped caller cannot leave a drain with unaccounted work.
+//!
+//! An anchor that appears between the fresh read and the guarded step is adopted
+//! only after a second, new admission observation binds exactly that anchor
+//! identity and exactly the admitted workspace facts, with the scope derived from
+//! that host id and that workspace id; that path is never looser than the adoption
+//! of an anchor observed before the step.
+//!
+//! ## Enable ordering
+//!
+//! The order around the future first enable is fixed and may not be inverted:
+//! anchor first (mint or adopt, as above), then the per-scope owner lease and
+//! claim, then the governed enable write, which must run under the same guard as
+//! the claim that legitimizes it. An ON-first sequence, or any write that precedes
+//! its claim, is forbidden: a control record written for a namespace whose anchor
+//! was never obtained cannot be attributed to a host, and an enabled scope without
+//! tenure cannot be reconciled.
 //!
 //! ## Configuration
 //!
@@ -594,7 +635,7 @@ mod compiled {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
 
     use log::{info, warn};
@@ -606,7 +647,7 @@ mod compiled {
         GovernedClaimRefusal, WorkspaceIntelligenceCommitError,
     };
     use openbitfun_services_core::workspace_intelligence_host_anchor::{
-        HostAnchorError, HostAnchorState, HostAnchorStore, HOST_ID_PREFIX,
+        HostAnchorEnsure, HostAnchorError, HostAnchorState, HostAnchorStore, HOST_ID_PREFIX,
     };
     use openbitfun_services_core::workspace_intelligence_store::{
         WorkspaceIntelligenceStore, WorkspaceIntelligenceStoreError,
@@ -740,7 +781,23 @@ mod compiled {
         },
     }
 
-    /// Only typed reasons leave the admission check, never the underlying errors.
+    impl InitialEnableAdmission {
+        /// Persisted workspace id of the admitted target.
+        ///
+        /// The candidate carries the workspace the future confirm owner selected
+        /// from this host's own persisted catalog; no caller supplies a namespace,
+        /// a host id or an anchor value here.
+        #[allow(dead_code, reason = "only the future confirmed enable owner consumes it")]
+        pub(super) fn workspace_id(&self) -> &str {
+            match self {
+                Self::NeedsAnchor { workspace } => workspace.id(),
+                Self::Anchored { binding, .. } => binding.workspace_id(),
+            }
+        }
+    }
+
+    /// Only typed reasons leave the admission check or the preparation of one
+    /// admitted candidate, never the underlying errors.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum InitialEnableRefusal {
         Stopping,
@@ -752,6 +809,10 @@ mod compiled {
         AlreadyEnabled,
         ControlSchemaUnsupported,
         ControlPolicyUnreadable,
+        /// The guarded anchor step, or the host-owned task running it, did not
+        /// complete. The underlying error never leaves this module: only its
+        /// stable code is logged.
+        AnchorPreparationFailed,
     }
 
     /// Validated storage-namespace tenancy of this host.
@@ -931,7 +992,10 @@ mod compiled {
         paths: Arc<PathManager>,
         catalog: WorkspaceCatalogSource,
         timing: HostTiming,
-        tenancy: Option<Tenancy>,
+        /// Storage-namespace tenancy, attached exactly once: at bootstrap when the
+        /// anchor is already present, or by the explicit preparation path. The
+        /// `OnceLock` makes "never rebind" a type property instead of a convention.
+        tenancy: OnceLock<Tenancy>,
         control: WorkspaceIntelligenceStore,
         cognition_root: PathBuf,
         lease_root: PathBuf,
@@ -978,6 +1042,10 @@ mod compiled {
             #[cfg(test)]
             let drain_window =
                 super::pauses::for_user_root_of(&paths, super::pauses::PausePoint::DrainWait);
+            let tenancy_slot = OnceLock::new();
+            if let Some(tenancy) = tenancy {
+                let _ = tenancy_slot.set(tenancy);
+            }
             Self {
                 cognition_root: paths.workspace_intelligence_cognition_dir(),
                 lease_root: paths.workspace_intelligence_lease_dir(),
@@ -988,7 +1056,7 @@ mod compiled {
                 pass: Mutex::new(()),
                 book: Mutex::new(Book::new()),
                 timing,
-                tenancy,
+                tenancy: tenancy_slot,
                 catalog,
                 paths,
                 #[cfg(test)]
@@ -1087,7 +1155,7 @@ mod compiled {
                 .map_err(|_| Refusal::Host(Reason::AnchorUnreadable))?;
             let host = match anchor {
                 HostAnchorState::Absent => {
-                    if self.tenancy.is_some() {
+                    if self.tenancy.get().is_some() {
                         return Err(Refusal::AnchorChanged);
                     }
                     if !control_directory_is_vacant(&self.paths).await {
@@ -1102,7 +1170,7 @@ mod compiled {
                         .expect("a validated anchor id is never blank")
                 }
             };
-            if self.tenancy.as_ref().is_some_and(|tenancy| tenancy.host != host) {
+            if self.tenancy.get().is_some_and(|tenancy| tenancy.host != host) {
                 return Err(Refusal::AnchorChanged);
             }
             // Observing a valid anchor does not adopt it into the running host.
@@ -1152,6 +1220,30 @@ mod compiled {
             Ok(InitialEnableAdmission::Anchored { scope, binding, control })
         }
 
+        /// Registers one explicit anchor preparation in the in-flight account.
+        ///
+        /// The registration happens under the same Book lock the drain transition
+        /// is written under, so the two can never be observed in an order that lets
+        /// a drain declare itself complete while this preparation still runs:
+        /// either this call registered first and the drain loop observes it, or the
+        /// drain happened first and this call refuses without any work. Nothing is
+        /// held across later IO: the lock is released before this returns.
+        async fn begin_anchor_preparation(
+            self: &Arc<Self>,
+        ) -> Result<InFlight, InitialEnableRefusal> {
+            let book = self.book.lock().await;
+            if self.shutdown_requested()
+                || matches!(
+                    book.state,
+                    WorkspaceIntelligenceHostState::Draining
+                        | WorkspaceIntelligenceHostState::Stopped
+                )
+            {
+                return Err(InitialEnableRefusal::Stopping);
+            }
+            Ok(InFlight::enter(Arc::clone(self)))
+        }
+
         /// One full re-evaluation pass over the persisted facts.
         ///
         /// Never called concurrently with itself: a second call returns
@@ -1164,7 +1256,7 @@ mod compiled {
             if self.shutdown_requested() {
                 return;
             }
-            let Some(tenancy) = self.tenancy.as_ref() else {
+            let Some(tenancy) = self.tenancy.get() else {
                 return;
             };
             let catalog = match self.read_catalog().await {
@@ -1718,8 +1810,8 @@ mod compiled {
                 state: book.state,
                 reason: book.reason,
                 counts: book.counts(),
-                anchor_present: self.tenancy.is_some(),
-                host_marker: self.tenancy.as_ref().map(|tenancy| tenancy.marker.clone()),
+                anchor_present: self.tenancy.get().is_some(),
+                host_marker: self.tenancy.get().map(|tenancy| tenancy.marker.clone()),
                 scopes: book.scopes.clone(),
             }
         }
@@ -1813,6 +1905,23 @@ mod compiled {
         /// `Stopped` and never claims that in-flight work ended.
         fn settle_state_after_timeout(&mut self) {
             self.state = WorkspaceIntelligenceHostState::Draining;
+        }
+
+        /// Clears the one recoverable startup latch.
+        ///
+        /// A supported host that started with a vacant control root and no anchor is
+        /// `Inactive` with a `NoRecords` fatal. Once an anchor is prepared that
+        /// latch no longer describes the host, so it is cleared and the state is
+        /// re-derived. Any other fatal reason is not recoverable by preparing an
+        /// anchor (an unsupported profile, an unreadable anchor, foreign control
+        /// records) and stays exactly as it is.
+        fn clear_recoverable_no_records(&mut self) {
+            if self.state == WorkspaceIntelligenceHostState::Inactive
+                && self.fatal == Some(WorkspaceIntelligenceHostReason::NoRecords)
+            {
+                self.fatal = None;
+                self.settle();
+            }
         }
     }
 
@@ -2078,6 +2187,32 @@ mod compiled {
         error.code()
     }
 
+    /// True when one observed binding describes exactly this persisted workspace.
+    ///
+    /// Both sides were observed from one live snapshot: the binding under the live
+    /// anchor and the workspace under the live registry. The comparison is used
+    /// when a fresh admission already carries an anchor, because that path
+    /// constructs no [`PersistedWorkspace`] of its own.
+    fn binding_describes(binding: &ExecutionBinding, workspace: &PersistedWorkspace) -> bool {
+        binding.workspace_id() == workspace.id()
+            && binding.workspace_root() == workspace.root()
+            && binding.workspace_kind() == workspace.kind().code()
+            && binding.is_worktree_child() == workspace.is_worktree_child()
+            && binding.worktree_parent_id() == workspace.worktree_parent_id()
+            && binding.worktree_is_main() == workspace.worktree_is_main()
+            && binding.main_repo_path() == workspace.main_repo_path()
+    }
+
+    /// The one scope a live host id and a workspace id must compose to.
+    ///
+    /// Used when a guarded step adopted an anchor it did not mint: the live facts
+    /// must claim exactly the scope built from that anchor's host id and the
+    /// admitted workspace id, never a scope derived from anything else.
+    fn expected_scope(host_id: &str, workspace_id: &str) -> Option<WorkspaceControlScope> {
+        let host = HostExecutionDomainKey::new(host_id, LOCAL_EXECUTION_DOMAIN)?;
+        WorkspaceControlScope::new(&host, workspace_id)
+    }
+
     /// Internal bootstrap options. The public
     /// [`WorkspaceIntelligenceHost::bootstrap`] never needs this type.
     #[derive(Debug, Clone, Copy, Default)]
@@ -2244,6 +2379,251 @@ mod compiled {
             observed
         }
 
+        /// Explicit anchor preparation for one admitted initial-enable candidate.
+        ///
+        /// This is the crate-internal preparation path of the future sole confirmed
+        /// enable owner; it has no app-facing caller and no command. It accepts only
+        /// the candidate the host's own admission produced, and no namespace, host
+        /// id or anchor value ever comes from a caller. The candidate is revalidated
+        /// against fresh persisted facts, the anchor is minted only through the
+        /// guarded `ensure_for_initial_enable` over this host's own `PathManager`
+        /// roots (or adopted when the fresh facts already bind one), and the result
+        /// is attached to this host exactly once. It writes no control record, takes
+        /// no lease, opens no cognition partition, starts no standby worker,
+        /// schedules no background wake-up and never enables a scope. The enable
+        /// order is fixed: anchor, then lease/claim, then the governed enable under
+        /// the same guard as its claim; this entry point never writes an ON record.
+        #[allow(dead_code, reason = "the confirmed enable preparation owner is not wired yet")]
+        pub(super) async fn prepare_initial_enable_anchor(
+            &self,
+            admitted: InitialEnableAdmission,
+        ) -> Result<(), InitialEnableRefusal> {
+            // The preparation is owned by the host, not by the caller's future:
+            // dropping the caller loses only the result, while the in-flight account
+            // and the guarded step keep running to completion. A drain therefore
+            // cannot declare itself complete while that work is still outstanding.
+            let host = self.clone();
+            let job = tokio::spawn(async move {
+                host.run_initial_enable_anchor_preparation(admitted).await
+            });
+            match job.await {
+                Ok(result) => result,
+                Err(_) => Err(InitialEnableRefusal::AnchorPreparationFailed),
+            }
+        }
+
+        async fn run_initial_enable_anchor_preparation(
+            &self,
+            admitted: InitialEnableAdmission,
+        ) -> Result<(), InitialEnableRefusal> {
+            use InitialEnableAdmission as Admission;
+            use InitialEnableRefusal as Refusal;
+            use WorkspaceIntelligenceHostReason as Reason;
+
+            // In flight from the same Book lock the drain transition is written
+            // under: either this registration happens first and the drain observes
+            // it, or the drain happened first and this refuses before any IO.
+            let _in_flight = self.core.begin_anchor_preparation().await?;
+
+            #[cfg(test)]
+            if let Some(pause) = super::pauses::for_user_root_of(
+                &self.core.paths,
+                super::pauses::PausePoint::PreparingAnchor,
+            ) {
+                pause.wait().await;
+            }
+
+            // Fresh authority: the candidate only selects the target workspace. The
+            // anchor, the persisted registry and the control facts are re-read, and
+            // the admission gate re-checks the stop state.
+            let workspace_id = admitted.workspace_id().to_owned();
+            let fresh = self.initial_enable_admission(&workspace_id).await?;
+
+            // One durable step: adopt the anchor those live facts bind, or mint
+            // through the guarded owner when they still prove the anchor absent and
+            // the control root vacant. Every mismatch refuses; nothing here can
+            // rebind a host that already holds an anchor or replace a stored one.
+            let expected_host_id = match (&admitted, &fresh) {
+                (
+                    Admission::NeedsAnchor {
+                        workspace: admitted_workspace,
+                    },
+                    Admission::NeedsAnchor {
+                        workspace: fresh_workspace,
+                    },
+                ) => {
+                    if admitted_workspace != fresh_workspace {
+                        return Err(Refusal::AnchorChanged);
+                    }
+                    // A cheap non-authoritative stop check: the authoritative one
+                    // is the Book critical section below, which also covers a
+                    // durable step that already ran before the drain started.
+                    if self.core.shutdown_requested() {
+                        return Err(Refusal::Stopping);
+                    }
+                    #[cfg(test)]
+                    if let Some(pause) = super::pauses::for_user_root_of(
+                        &self.core.paths,
+                        super::pauses::PausePoint::BeforeGuardedMint,
+                    ) {
+                        pause.wait().await;
+                    }
+                    let store = HostAnchorStore::new(anchor_root(&self.core.paths));
+                    let outcome = store
+                        .ensure_for_initial_enable(
+                            &self.core.paths.workspace_intelligence_control_dir(),
+                        )
+                        .await
+                        .map_err(|error| {
+                            warn!(
+                                "Workspace intelligence host could not prepare its storage anchor: code={}",
+                                anchor_error_code(&error)
+                            );
+                            Refusal::AnchorPreparationFailed
+                        })?;
+                    match outcome {
+                        // The guarded step minted this document under its own guard
+                        // after proving this namespace's control root vacant inside
+                        // that critical section, so the identity is this host's own
+                        // and no foreign facts can be attached to it here.
+                        HostAnchorEnsure::Created(anchor) => anchor.host_id().to_owned(),
+                        // An anchor appeared between the fresh read above and the
+                        // guarded step. Adopting it is never looser than the
+                        // `(NeedsAnchor, Anchored)` arm: a second, new admission
+                        // observation must bind exactly this anchor identity and
+                        // exactly the admitted workspace facts (root, kind, worktree
+                        // parentage, main-repo ownership and id), with the scope
+                        // derived from that host id and that workspace id. Anything
+                        // else is a stale candidate or a namespace this host did not
+                        // observe, and is refused without a write.
+                        HostAnchorEnsure::Existing(anchor) => {
+                            let recheck = self.initial_enable_admission(&workspace_id).await?;
+                            let Admission::Anchored {
+                                scope: recheck_scope,
+                                binding: recheck_binding,
+                                ..
+                            } = recheck
+                            else {
+                                return Err(Refusal::AnchorChanged);
+                            };
+                            let scope = expected_scope(anchor.host_id(), admitted_workspace.id())
+                                .ok_or(Refusal::AnchorChanged)?;
+                            if recheck_binding.host_id() != anchor.host_id()
+                                || recheck_scope.as_str() != scope.as_str()
+                                || !binding_describes(&recheck_binding, admitted_workspace)
+                            {
+                                return Err(Refusal::AnchorChanged);
+                            }
+                            anchor.host_id().to_owned()
+                        }
+                    }
+                }
+                (
+                    Admission::NeedsAnchor { workspace },
+                    Admission::Anchored { binding, .. },
+                ) => {
+                    // An anchor appeared between the admission and this preparation.
+                    // It is adopted only because the fresh facts bind exactly this
+                    // workspace under it; nothing is minted over it.
+                    if !binding_describes(binding, workspace) {
+                        return Err(Refusal::AnchorChanged);
+                    }
+                    binding.host_id().to_owned()
+                }
+                (
+                    Admission::Anchored { scope, binding, .. },
+                    Admission::Anchored {
+                        scope: fresh_scope,
+                        binding: fresh_binding,
+                        ..
+                    },
+                ) => {
+                    // Both observations must describe the same anchor and the same
+                    // workspace facts, or the candidate is stale and is refused.
+                    if fresh_scope != scope || !fresh_binding.matches(binding) {
+                        return Err(Refusal::AnchorChanged);
+                    }
+                    fresh_binding.host_id().to_owned()
+                }
+                (Admission::Anchored { .. }, Admission::NeedsAnchor { .. }) => {
+                    // The anchor this candidate was admitted against is gone; this
+                    // host never mints a replacement for an observation that
+                    // expected one, and never rebinds.
+                    return Err(Refusal::AnchorChanged);
+                }
+            };
+
+            #[cfg(test)]
+            if let Some(pause) = super::pauses::for_user_root_of(
+                &self.core.paths,
+                super::pauses::PausePoint::BeforeAnchorAdoption,
+            ) {
+                pause.wait().await;
+            }
+
+            // The anchor is verified strictly one last time, so only a document that
+            // is present and identical in identity to the guarded outcome is
+            // adopted. A corrupt, replaced or deleted document refuses here and is
+            // never repaired or re-minted.
+            let anchor = HostAnchorStore::new(anchor_root(&self.core.paths))
+                .read_strict()
+                .await
+                .map_err(|error| {
+                    warn!(
+                        "Workspace intelligence host could not verify its storage anchor before adoption: code={}",
+                        anchor_error_code(&error)
+                    );
+                    Refusal::Host(Reason::AnchorUnreadable)
+                })?;
+            let verified = matches!(
+                &anchor,
+                HostAnchorState::Present(anchor) if anchor.host_id() == expected_host_id.as_str()
+            );
+            if !verified {
+                return Err(Refusal::AnchorChanged);
+            }
+
+            // Adoption publication, in the same critical section as the drain
+            // transition: the stop state is read under the book lock and the tenancy
+            // is attached under it, so a drain that started first always wins and a
+            // preparation that started first always leaves the drain something to
+            // wait for. No IO runs while the lock is held.
+            let mut book = self.core.book.lock().await;
+            if self.core.shutdown_requested()
+                || matches!(
+                    book.state,
+                    WorkspaceIntelligenceHostState::Draining
+                        | WorkspaceIntelligenceHostState::Stopped
+                )
+            {
+                return Err(Refusal::Stopping);
+            }
+            let host = HostExecutionDomainKey::new(&expected_host_id, LOCAL_EXECUTION_DOMAIN)
+                .expect("a validated anchor id is never blank");
+            match self.core.tenancy.get() {
+                // A different anchor never replaces the one this host already
+                // adopted: that is a rebind and is refused.
+                Some(existing) if existing.host != host => return Err(Refusal::AnchorChanged),
+                // The same anchor is already attached: reuse, identity stable.
+                Some(_) => {}
+                None => {
+                    let _ = self.core.tenancy.set(Tenancy {
+                        marker: redacted_marker(&expected_host_id),
+                        host,
+                    });
+                }
+            }
+            // Only the recoverable startup latch is cleared. An unsupported
+            // profile, an unreadable anchor or a foreign control root is not
+            // recovered by preparing an anchor and stays exactly as it is.
+            book.clear_recoverable_no_records();
+            info!(
+                "Workspace intelligence host adopted its storage anchor: marker={}",
+                redacted_marker(&expected_host_id)
+            );
+            Ok(())
+        }
+
         /// Current typed status.
         pub async fn status(&self) -> WorkspaceIntelligenceHostStatus {
             self.core.status().await
@@ -2383,6 +2763,16 @@ mod pauses {
         AtBookLock,
         /// After initial-enable reads, before checking the owner gate again.
         AfterInitialEnableObservation,
+        /// After an explicit anchor preparation registered itself in the in-flight
+        /// account, before it reads any persisted fact.
+        PreparingAnchor,
+        /// After the fresh revalidation of an explicit anchor preparation and before
+        /// its guarded mint/adopt step, so a fixture can make an anchor and control
+        /// state appear in exactly that window.
+        BeforeGuardedMint,
+        /// After the guarded anchor step committed, before the adoption publishes
+        /// under the book lock.
+        BeforeAnchorAdoption,
         /// In the drain loop, between the in-flight check and the wait.
         DrainWait,
     }
@@ -3423,6 +3813,709 @@ mod tests {
             assert!(matches!(preflight.await.unwrap(), Err(Refusal::Stopping)));
             refuse(&host, ID, Refusal::Stopping).await;
             assert_eq!(fixture.tree_hash(), before);
+        }
+    }
+
+    mod initial_enable_anchor_preparation {
+        use super::super::compiled::{
+            InitialEnableAdmission, InitialEnableRefusal, WorkspaceIntelligenceHost,
+        };
+        use super::*;
+        use openbitfun_services_core::workspace_intelligence_host_anchor::HostAnchorState;
+        use InitialEnableRefusal as Refusal;
+        use WorkspaceIntelligenceHostReason as Reason;
+        use WorkspaceIntelligenceHostUnsupportedProfile as Profile;
+        use WorkspaceIntelligenceHostUnsupportedScope as Unsupported;
+
+        const ID: &str = "  persisted:workspace/a  ";
+
+        async fn bootstrap(fixture: &Fixture) -> WorkspaceIntelligenceHost {
+            WorkspaceIntelligenceHost::bootstrap_with_options(
+                Arc::clone(&fixture.paths),
+                source(),
+                WorkspaceIntelligenceHostSurface::Desktop,
+                RuntimeDeployment::Embedded,
+                options(sleeping()),
+            )
+            .await
+        }
+
+        /// A drain budget long enough to park the drain loop on a registered pause.
+        async fn bootstrap_with_long_drain(fixture: &Fixture) -> WorkspaceIntelligenceHost {
+            WorkspaceIntelligenceHost::bootstrap_with_options(
+                Arc::clone(&fixture.paths),
+                source(),
+                WorkspaceIntelligenceHostSurface::Desktop,
+                RuntimeDeployment::Embedded,
+                options(HostTiming::new(
+                    Duration::from_secs(3600),
+                    Duration::from_secs(3600),
+                    Duration::from_secs(30),
+                )),
+            )
+            .await
+        }
+
+        /// The candidate the sole confirmed enable owner would hand to preparation.
+        async fn admit(host: &WorkspaceIntelligenceHost, id: &str) -> InitialEnableAdmission {
+            match host.initial_enable_admission(id).await {
+                Ok(candidate) => candidate,
+                Err(refusal) => panic!("expected an admitted candidate, got {refusal:?}"),
+            }
+        }
+
+        async fn refuse(
+            host: &WorkspaceIntelligenceHost,
+            candidate: InitialEnableAdmission,
+            expected: Refusal,
+        ) {
+            match host.prepare_initial_enable_anchor(candidate).await {
+                Ok(()) => panic!("expected a preparation refusal: {expected:?}"),
+                Err(actual) => assert_eq!(actual, expected),
+            }
+        }
+
+        fn anchor_store(fixture: &Fixture) -> HostAnchorStore {
+            HostAnchorStore::new(WorkspaceIntelligenceHost::anchor_root_for_tests(&fixture.paths))
+        }
+
+        fn anchor_path(fixture: &Fixture) -> PathBuf {
+            fixture
+                .paths
+                .workspace_intelligence_dir()
+                .join(HOST_ANCHOR_FILE_NAME)
+        }
+
+        async fn stored_host_id(fixture: &Fixture) -> Option<String> {
+            match anchor_store(fixture).read_strict().await.unwrap() {
+                HostAnchorState::Present(anchor) => Some(anchor.host_id().to_owned()),
+                HostAnchorState::Absent => None,
+            }
+        }
+
+        fn registry_bytes(fixture: &Fixture) -> Vec<u8> {
+            std::fs::read(fixture.registry_path()).unwrap()
+        }
+
+        fn namespace_entries(fixture: &Fixture) -> Vec<String> {
+            let mut names: Vec<String> =
+                match std::fs::read_dir(fixture.paths.workspace_intelligence_dir()) {
+                    Ok(entries) => entries
+                        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+            names.sort();
+            names
+        }
+
+        /// The exact residue a successful preparation may leave: the anchor
+        /// document and its own guard lock, and nothing else in the namespace.
+        fn assert_anchor_only_residue(fixture: &Fixture) {
+            assert_eq!(
+                namespace_entries(fixture),
+                vec![
+                    HOST_ANCHOR_FILE_NAME.to_owned(),
+                    format!("{HOST_ANCHOR_FILE_NAME}.lock"),
+                ],
+                "preparation may publish only the anchor document and its guard lock"
+            );
+            assert!(!fixture.control_dir().exists(), "no control record");
+            assert!(fixture.lock_files().is_empty(), "no owner tenure");
+            assert!(!fixture.lease_root_exists(), "no lease root");
+            assert!(!fixture.cognition_dir().exists(), "no cognition partition");
+            assert!(fixture.sqlite_files().is_empty(), "no cognition database");
+        }
+
+        /// The same anchor document with a different anchor value, so the stored
+        /// identity is replaced while every other byte of the document stays.
+        fn replaced_anchor_bytes(bytes: &[u8]) -> Vec<u8> {
+            let mut document: Value = serde_json::from_slice(bytes).unwrap();
+            let current = document["anchor"].as_str().unwrap();
+            let other = if current.starts_with('0') { "1" } else { "0" }.repeat(32);
+            document["anchor"] = json!(other);
+            serde_json::to_vec(&document).unwrap()
+        }
+
+        async fn wait_until_quiescent(host: &WorkspaceIntelligenceHost) {
+            let deadline = tokio::time::Instant::now() + DEADLINE;
+            while host.in_flight_for_tests().await != 0 {
+                assert!(tokio::time::Instant::now() < deadline, "quiescence deadline");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn preparation_mints_and_adopts_in_memory_without_enabling_anything() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let status = host.status().await;
+            assert!(!status.anchor_present());
+            assert_eq!(status.reason(), Some(Reason::NoRecords));
+            assert!(namespace_entries(&fixture).is_empty());
+            let registry = registry_bytes(&fixture);
+
+            let candidate = admit(&host, ID).await;
+            assert!(matches!(candidate, InitialEnableAdmission::NeedsAnchor { .. }));
+            host.prepare_initial_enable_anchor(candidate).await.unwrap();
+
+            let status = host.status().await;
+            assert!(status.anchor_present(), "the tenancy is attached in memory");
+            assert_eq!(status.state(), WorkspaceIntelligenceHostState::Inactive);
+            assert_eq!(
+                status.reason(),
+                Some(Reason::NoEnabledScope),
+                "only the recoverable startup latch is cleared"
+            );
+            assert_eq!(status.counts().active(), 0);
+            assert_eq!(status.counts().standby(), 0);
+            assert!(!host.has_standby_worker_for_tests().await, "no standby worker");
+            assert_eq!(host.in_flight_for_tests().await, 0);
+            assert_anchor_only_residue(&fixture);
+            assert_eq!(registry_bytes(&fixture), registry, "no control or ON write");
+
+            let host_id = stored_host_id(&fixture).await.unwrap();
+            let marker = status.host_marker().unwrap().to_owned();
+            assert!(marker.contains(HOST_ID_PREFIX));
+            assert!(
+                !marker.contains(anchor_suffix(&host_id)),
+                "the marker must stay redacted"
+            );
+
+            // A restart adopts the same anchor from storage and still enables nothing.
+            let restarted = bootstrap(&fixture).await;
+            let restarted_status = restarted.status().await;
+            assert_eq!(restarted_status.host_marker(), Some(marker.as_str()));
+            assert_eq!(restarted_status.state(), WorkspaceIntelligenceHostState::Inactive);
+            assert_eq!(restarted_status.reason(), Some(Reason::NoEnabledScope));
+            assert_eq!(restarted_status.counts().active(), 0);
+            assert_eq!(restarted_status.counts().standby(), 0);
+            assert_eq!(stored_host_id(&fixture).await.unwrap(), host_id);
+            assert_anchor_only_residue(&fixture);
+            assert_eq!(registry_bytes(&fixture), registry);
+            assert_eq!(
+                std::fs::read(anchor_path(&fixture)).unwrap(),
+                fixture.anchor_bytes()
+            );
+        }
+
+        #[tokio::test]
+        async fn repeated_preparation_keeps_one_identity_and_never_rewrites() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let registry = registry_bytes(&fixture);
+            let first = admit(&host, ID).await;
+            let stale = admit(&host, ID).await;
+            host.prepare_initial_enable_anchor(first).await.unwrap();
+            let anchor = fixture.anchor_bytes();
+            let host_id = stored_host_id(&fixture).await.unwrap();
+            let marker = host.status().await.host_marker().map(str::to_owned);
+
+            // A candidate whose facts no longer hold is revalidated against the live
+            // anchor instead of being trusted for a second mint.
+            host.prepare_initial_enable_anchor(stale).await.unwrap();
+            // A fresh candidate goes through the same commit gate and reuses it.
+            let fresh = admit(&host, ID).await;
+            assert!(matches!(fresh, InitialEnableAdmission::Anchored { .. }));
+            host.prepare_initial_enable_anchor(fresh).await.unwrap();
+
+            assert_eq!(stored_host_id(&fixture).await.unwrap(), host_id);
+            assert_eq!(fixture.anchor_bytes(), anchor, "the anchor is never rewritten");
+            assert_eq!(host.status().await.host_marker().map(str::to_owned), marker);
+            assert!(host.status().await.anchor_present());
+            assert_anchor_only_residue(&fixture);
+            assert_eq!(registry_bytes(&fixture), registry);
+            assert_eq!(host.in_flight_for_tests().await, 0);
+        }
+
+        #[tokio::test]
+        async fn concurrent_preparations_publish_exactly_one_anchor() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let registry = registry_bytes(&fixture);
+            let first = admit(&host, ID).await;
+            let second = admit(&host, ID).await;
+            let left = host.clone();
+            let right = host.clone();
+            let (left_result, right_result) = tokio::join!(
+                async move { left.prepare_initial_enable_anchor(first).await },
+                async move { right.prepare_initial_enable_anchor(second).await },
+            );
+            left_result.unwrap();
+            right_result.unwrap();
+
+            let host_id = stored_host_id(&fixture).await.unwrap();
+            let anchor = fixture.anchor_bytes();
+            let marker = host.status().await.host_marker().map(str::to_owned);
+            // A third preparation still converges on the same identity.
+            let third = admit(&host, ID).await;
+            host.prepare_initial_enable_anchor(third).await.unwrap();
+            assert_eq!(stored_host_id(&fixture).await.unwrap(), host_id);
+            assert_eq!(fixture.anchor_bytes(), anchor, "one anchor, never rewritten");
+            assert_eq!(host.status().await.host_marker().map(str::to_owned), marker);
+            assert_anchor_only_residue(&fixture);
+            assert_eq!(registry_bytes(&fixture), registry);
+        }
+
+        #[tokio::test]
+        async fn a_stopped_host_refuses_preparation_before_reading_anything() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let candidate = admit(&host, ID).await;
+            let shutdown = host.shutdown().await;
+            assert_eq!(shutdown.state(), WorkspaceIntelligenceHostState::Stopped);
+            assert_eq!(shutdown.drain(), WorkspaceIntelligenceHostDrain::Drained);
+
+            // An unreadable catalog would surface as `CatalogUnreadable` if anything
+            // were read; the refusal must be the stop state instead.
+            std::fs::write(fixture.registry_path(), b"invalid catalog").unwrap();
+            let before = fixture.tree_hash();
+            refuse(&host, candidate, Refusal::Stopping).await;
+            assert_eq!(fixture.tree_hash(), before);
+            assert!(namespace_entries(&fixture).is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_unsupported_profile_refuses_preparation_without_io() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let supported = bootstrap(&fixture).await;
+            let candidate = admit(&supported, ID).await;
+            std::fs::write(fixture.registry_path(), b"invalid catalog").unwrap();
+            let shared = WorkspaceIntelligenceHost::bootstrap(
+                Arc::clone(&fixture.paths),
+                None,
+                WorkspaceIntelligenceHostSurface::Desktop,
+                RuntimeDeployment::Shared,
+            )
+            .await;
+            let expected = Refusal::Host(Reason::ProfileUnsupported(Profile::SharedRuntime));
+            assert_eq!(shared.status().await.reason(), Some(Reason::ProfileUnsupported(Profile::SharedRuntime)));
+
+            let before = fixture.tree_hash();
+            refuse(&shared, candidate, expected).await;
+            assert_eq!(fixture.tree_hash(), before);
+            assert_eq!(
+                shared.status().await.reason(),
+                Some(Reason::ProfileUnsupported(Profile::SharedRuntime)),
+                "the unsupported-profile latch is not recoverable by an anchor"
+            );
+            assert!(!shared.status().await.anchor_present());
+            assert!(namespace_entries(&fixture).is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_unsafe_fatal_latch_is_never_cleared_by_a_preparation() {
+            // Control records without an anchor are the unsafe startup shape: the
+            // foreign bytes are never opened, and no preparation may clear that
+            // latch or publish anything next to them.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let supported = bootstrap(&fixture).await;
+            let candidate = admit(&supported, ID).await;
+
+            std::fs::create_dir_all(fixture.control_dir()).unwrap();
+            std::fs::write(fixture.control_dir().join("foreign-record"), b"keep").unwrap();
+            let unsafe_host = bootstrap(&fixture).await;
+            assert_eq!(
+                unsafe_host.status().await.reason(),
+                Some(Reason::AnchorMissingWithRecords)
+            );
+
+            let before = fixture.tree_hash();
+            refuse(
+                &unsafe_host,
+                candidate,
+                Refusal::Host(Reason::AnchorMissingWithRecords),
+            )
+            .await;
+            assert_eq!(fixture.tree_hash(), before);
+            assert_eq!(
+                unsafe_host.status().await.reason(),
+                Some(Reason::AnchorMissingWithRecords),
+                "an unsafe latch is not recoverable by preparing an anchor"
+            );
+            assert!(!unsafe_host.status().await.anchor_present());
+            assert!(!anchor_path(&fixture).exists(), "no anchor is minted");
+            assert_eq!(
+                std::fs::read(fixture.control_dir().join("foreign-record")).unwrap(),
+                b"keep"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_target_that_turned_remote_between_admission_and_preparation_writes_nothing() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let candidate = admit(&host, ID).await;
+            let mut remote = local_record(&fixture, ID, "remote-decoy");
+            remote["workspaceKind"] = json!("remote");
+            remote["rootPath"] = json!("/srv/posix/remote");
+            remote["metadata"] = json!({"connectionId": "offline"});
+            fixture.publish(vec![remote]).await;
+
+            let before = fixture.tree_hash();
+            refuse(&host, candidate, Refusal::UnsupportedScope(Unsupported::RemoteScope)).await;
+            assert_eq!(fixture.tree_hash(), before);
+            assert!(namespace_entries(&fixture).is_empty());
+            assert_eq!(host.in_flight_for_tests().await, 0);
+        }
+
+        #[tokio::test]
+        async fn an_external_anchor_is_adopted_only_when_the_live_facts_bind_it() {
+            // Matching: the anchor that appeared between admission and preparation
+            // binds exactly the admitted workspace, so it is adopted, never minted
+            // over.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let candidate = admit(&host, ID).await;
+            assert!(matches!(candidate, InitialEnableAdmission::NeedsAnchor { .. }));
+            let external = fixture.anchor().await;
+            let bytes = fixture.anchor_bytes();
+            let registry = registry_bytes(&fixture);
+            host.prepare_initial_enable_anchor(candidate).await.unwrap();
+            assert_eq!(stored_host_id(&fixture).await.unwrap(), external);
+            assert_eq!(fixture.anchor_bytes(), bytes, "the external anchor stays as it is");
+            assert!(host.status().await.anchor_present());
+            assert_anchor_only_residue(&fixture);
+            assert_eq!(registry_bytes(&fixture), registry);
+            assert_eq!(host.in_flight_for_tests().await, 0);
+
+            // Mismatching: the anchor that appeared binds a different workspace shape
+            // than the admitted candidate, so the preparation refuses it.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let candidate = admit(&host, ID).await;
+            let external = fixture.anchor().await;
+            fixture.publish(vec![local_record(&fixture, ID, "moved-root")]).await;
+            let bytes = fixture.anchor_bytes();
+            let before = fixture.tree_hash();
+            refuse(&host, candidate, Refusal::AnchorChanged).await;
+            assert_eq!(fixture.tree_hash(), before);
+            assert!(!host.status().await.anchor_present(), "no adoption of a foreign binding");
+            assert_eq!(stored_host_id(&fixture).await.unwrap(), external);
+            assert_eq!(fixture.anchor_bytes(), bytes);
+        }
+
+        #[tokio::test]
+        async fn an_anchor_created_during_the_guarded_step_is_adopted_only_through_a_matching_recheck()
+        {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let candidate = admit(&host, ID).await;
+            let (pause, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::BeforeGuardedMint,
+                pause.clone(),
+            );
+            let registry = registry_bytes(&fixture);
+            let prepare = tokio::spawn({
+                let host = host.clone();
+                async move { host.prepare_initial_enable_anchor(candidate).await }
+            });
+            tokio::time::timeout(DEADLINE, entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            // The exact `ensure` -> `Existing` window: an external writer publishes
+            // the anchor after this preparation's fresh read and before its guarded
+            // step. The live facts still bind the admitted workspace, so the second
+            // revalidation adopts exactly that identity.
+            let external = fixture.anchor().await;
+            let bytes = fixture.anchor_bytes();
+            pause.release();
+            assert_eq!(prepare.await.unwrap(), Ok(()));
+            assert!(host.status().await.anchor_present());
+            assert_eq!(stored_host_id(&fixture).await.unwrap(), external);
+            assert_eq!(fixture.anchor_bytes(), bytes, "the external anchor is never rewritten");
+            assert_anchor_only_residue(&fixture);
+            assert_eq!(registry_bytes(&fixture), registry);
+            assert_eq!(host.status().await.counts().active(), 0);
+            assert!(!host.has_standby_worker_for_tests().await);
+        }
+
+        #[tokio::test]
+        async fn an_anchor_created_during_the_guarded_step_never_adopts_foreign_or_changed_facts() {
+            // (a) A foreign OFF record appears together with the anchor: the second
+            // revalidation refuses it, nothing is modified and nothing is adopted.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let candidate = admit(&host, ID).await;
+            let (pause, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::BeforeGuardedMint,
+                pause.clone(),
+            );
+            let prepare = tokio::spawn({
+                let host = host.clone();
+                async move { host.prepare_initial_enable_anchor(candidate).await }
+            });
+            tokio::time::timeout(DEADLINE, entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let external = fixture.anchor().await;
+            let scope = fixture.scope(&external, ID);
+            let binding = fixture.binding(&external, ID).await;
+            let mut foreign = Fixture::bound_policy(&binding);
+            foreign["execution_binding"]["workspace_root"] = json!("different");
+            fixture.seed_control(&scope, false, Some(foreign)).await;
+            let anchor = fixture.anchor_bytes();
+            let records = fixture.control_records();
+            let before = fixture.tree_hash();
+            pause.release();
+            assert_eq!(
+                prepare.await.unwrap(),
+                Err(Refusal::Host(Reason::BindingChanged))
+            );
+            assert_eq!(fixture.tree_hash(), before, "a refused preparation writes nothing");
+            assert_eq!(fixture.anchor_bytes(), anchor);
+            assert_eq!(fixture.control_records(), records, "the foreign record is untouched");
+            assert!(!host.status().await.anchor_present(), "no late adoption");
+            assert_eq!(host.in_flight_for_tests().await, 0);
+            assert!(fixture.lock_files().is_empty(), "no lease is taken");
+            assert!(!host.has_standby_worker_for_tests().await);
+
+            // (b) The admitted workspace loses its live root in the same window: the
+            // anchor that appeared can no longer be bound to it, so it is refused.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let candidate = admit(&host, ID).await;
+            let (pause, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::BeforeGuardedMint,
+                pause.clone(),
+            );
+            let prepare = tokio::spawn({
+                let host = host.clone();
+                async move { host.prepare_initial_enable_anchor(candidate).await }
+            });
+            tokio::time::timeout(DEADLINE, entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let _external = fixture.anchor().await;
+            fixture.publish(vec![local_record(&fixture, ID, "moved-root")]).await;
+            let anchor = fixture.anchor_bytes();
+            let registry = registry_bytes(&fixture);
+            let before = fixture.tree_hash();
+            pause.release();
+            assert_eq!(prepare.await.unwrap(), Err(Refusal::AnchorChanged));
+            assert_eq!(fixture.tree_hash(), before);
+            assert_eq!(fixture.anchor_bytes(), anchor);
+            assert_eq!(registry_bytes(&fixture), registry);
+            assert!(!host.status().await.anchor_present(), "no late adoption");
+            assert!(!host.has_standby_worker_for_tests().await);
+            assert!(fixture.lock_files().is_empty(), "no lease is taken");
+        }
+
+        #[tokio::test]
+        async fn a_replaced_corrupt_or_missing_anchor_is_refused_and_never_repaired() {
+            // Same-name replacement: an anchor already attached to this host is never
+            // swapped, and the replacement is preserved exactly as it was written.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let _external = fixture.anchor().await;
+            let host = bootstrap(&fixture).await;
+            let marker = host.status().await.host_marker().map(str::to_owned);
+            let original = fixture.anchor_bytes();
+            let path = anchor_path(&fixture);
+
+            let candidate = admit(&host, ID).await;
+            std::fs::write(&path, replaced_anchor_bytes(&original)).unwrap();
+            let replaced = fixture.anchor_bytes();
+            let before = fixture.tree_hash();
+            refuse(&host, candidate, Refusal::AnchorChanged).await;
+            assert_eq!(fixture.tree_hash(), before);
+            assert_eq!(fixture.anchor_bytes(), replaced, "the replacement is preserved");
+            assert_eq!(host.status().await.host_marker().map(str::to_owned), marker);
+            // A candidate for the replaced identity is refused even before a
+            // preparation runs, so no rebind can be committed at all.
+            match host.initial_enable_admission(ID).await {
+                Ok(_) => panic!("a replaced anchor is never observed as the attached host"),
+                Err(actual) => assert_eq!(actual, Refusal::AnchorChanged),
+            }
+            assert_eq!(fixture.tree_hash(), before);
+            assert_eq!(host.status().await.host_marker().map(str::to_owned), marker);
+
+            // Corrupt bytes: refused, never repaired.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host_id = fixture.anchor().await;
+            let host = bootstrap(&fixture).await;
+            let marker = host.status().await.host_marker().map(str::to_owned);
+            let original = fixture.anchor_bytes();
+            let path = anchor_path(&fixture);
+            let candidate = admit(&host, ID).await;
+            std::fs::write(&path, b"invalid anchor").unwrap();
+            let before = fixture.tree_hash();
+            refuse(&host, candidate, Refusal::Host(Reason::AnchorUnreadable)).await;
+            assert_eq!(fixture.tree_hash(), before);
+            assert_eq!(std::fs::read(&path).unwrap(), b"invalid anchor");
+
+            // Missing: refused, never re-minted.
+            std::fs::write(&path, &original).unwrap();
+            let candidate = admit(&host, ID).await;
+            std::fs::remove_file(&path).unwrap();
+            let before = fixture.tree_hash();
+            refuse(&host, candidate, Refusal::AnchorChanged).await;
+            assert_eq!(fixture.tree_hash(), before);
+            assert!(!path.exists(), "a missing anchor is never re-minted");
+            assert_eq!(
+                namespace_entries(&fixture),
+                vec![format!("{HOST_ANCHOR_FILE_NAME}.lock")],
+                "no replacement document is published"
+            );
+
+            // Restored: the same identity is adopted with its bytes untouched.
+            std::fs::write(&path, &original).unwrap();
+            let candidate = admit(&host, ID).await;
+            let before = fixture.tree_hash();
+            host.prepare_initial_enable_anchor(candidate).await.unwrap();
+            assert_eq!(fixture.tree_hash(), before, "adoption writes nothing");
+            assert_eq!(fixture.anchor_bytes(), original);
+            assert_eq!(stored_host_id(&fixture).await.unwrap(), host_id);
+            assert_eq!(host.status().await.host_marker().map(str::to_owned), marker);
+        }
+
+        #[tokio::test]
+        async fn an_off_record_bound_to_another_binding_refuses_without_mutation() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host_id = fixture.anchor().await;
+            let host = bootstrap(&fixture).await;
+            let candidate = admit(&host, ID).await;
+
+            let scope = fixture.scope(&host_id, ID);
+            let binding = fixture.binding(&host_id, ID).await;
+            let mut changed = Fixture::bound_policy(&binding);
+            changed["execution_binding"]["workspace_root"] = json!("different");
+            fixture.seed_control(&scope, false, Some(changed)).await;
+
+            let records = fixture.control_records();
+            let before = fixture.tree_hash();
+            refuse(&host, candidate, Refusal::Host(Reason::BindingChanged)).await;
+            assert_eq!(fixture.tree_hash(), before);
+            assert_eq!(fixture.control_records(), records, "the record is untouched");
+            assert_eq!(host.status().await.counts().active(), 0);
+            assert!(!host.has_standby_worker_for_tests().await);
+        }
+
+        #[tokio::test]
+        async fn a_parked_preparation_keeps_the_drain_waiting_and_never_adopts_after_shutdown() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let (drain_pause, mut drain_entered) = HostPause::new();
+            let _drain_registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::DrainWait,
+                drain_pause.clone(),
+            );
+            let host = bootstrap_with_long_drain(&fixture).await;
+
+            let (prepare_pause, mut prepare_entered) = HostPause::new();
+            let _prepare_registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::BeforeAnchorAdoption,
+                prepare_pause.clone(),
+            );
+            let candidate = admit(&host, ID).await;
+            let prepare = tokio::spawn({
+                let host = host.clone();
+                async move { host.prepare_initial_enable_anchor(candidate).await }
+            });
+            tokio::time::timeout(DEADLINE, prepare_entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            // The guarded write already committed; the adoption has not published.
+            let anchor = fixture.anchor_bytes();
+            assert_eq!(host.in_flight_for_tests().await, 1);
+
+            let shutdown = tokio::spawn({
+                let host = host.clone();
+                async move { host.shutdown().await }
+            });
+            tokio::time::timeout(DEADLINE, drain_entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                host.status().await.state(),
+                WorkspaceIntelligenceHostState::Draining,
+                "the drain observed the preparation in flight"
+            );
+            assert!(
+                !shutdown.is_finished(),
+                "a drain may not complete while the preparation is outstanding"
+            );
+            assert_eq!(host.in_flight_for_tests().await, 1);
+
+            drain_pause.release();
+            prepare_pause.release();
+            assert_eq!(prepare.await.unwrap(), Err(Refusal::Stopping));
+            let shutdown = shutdown.await.unwrap();
+            assert_eq!(shutdown.drain(), WorkspaceIntelligenceHostDrain::Drained);
+            assert_eq!(shutdown.state(), WorkspaceIntelligenceHostState::Stopped);
+            assert!(
+                !host.status().await.anchor_present(),
+                "a durable write that finished before the drain never adopts after shutdown"
+            );
+            assert_eq!(host.in_flight_for_tests().await, 0);
+            assert_eq!(fixture.anchor_bytes(), anchor, "no repair and no rewrite");
+            assert_anchor_only_residue(&fixture);
+        }
+
+        #[tokio::test]
+        async fn a_dropped_caller_keeps_the_host_owned_preparation_in_flight() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let (pause, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::PreparingAnchor,
+                pause.clone(),
+            );
+            let registry = registry_bytes(&fixture);
+            let candidate = admit(&host, ID).await;
+            let prepare = tokio::spawn({
+                let host = host.clone();
+                async move { host.prepare_initial_enable_anchor(candidate).await }
+            });
+            tokio::time::timeout(DEADLINE, entered.recv()).await.unwrap().unwrap();
+            assert_eq!(host.in_flight_for_tests().await, 1);
+            prepare.abort();
+            assert!(prepare.await.unwrap_err().is_cancelled());
+            assert_eq!(
+                host.in_flight_for_tests().await,
+                1,
+                "the owned task keeps the work in flight without its caller"
+            );
+
+            pause.release();
+            wait_until_quiescent(&host).await;
+            assert!(
+                host.status().await.anchor_present(),
+                "the owned task completes the adoption on its own"
+            );
+            assert_eq!(host.status().await.counts().active(), 0);
+            assert!(!host.has_standby_worker_for_tests().await);
+            assert_anchor_only_residue(&fixture);
+            assert_eq!(registry_bytes(&fixture), registry);
         }
     }
 

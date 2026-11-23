@@ -50,10 +50,12 @@
 //! bootstrap over one owner-decoded persisted catalog, per-scope lease tenure, a
 //! typed status snapshot and a bounded shutdown. It is unconditional so
 //! that a build without the feature can answer `NotCompiled` instead of
-//! failing to link or silently reporting success. Its handle, its three entry
-//! points and the plain status data around them are re-exported at the end of
+//! failing to link or silently reporting success. Its handle, its three app-facing
+//! entry points and the plain status data around them are re-exported at the end of
 //! this module as the one app-facing surface of this tree; every other type here
-//! stays crate-internal. The `catalog_readonly` module
+//! stays crate-internal. The handle additionally carries one crate-internal anchor
+//! preparation entry point (`pub(super)`, no app caller, no command and no registry
+//! row): it can mint or adopt this host's storage anchor and never enables a scope. The `catalog_readonly` module
 //! (read-only persisted registry snapshot), the `host_binding` module (execution
 //! binding resolution) and the `host_standby` module (bounded fallback wake-up)
 //! are gated on `workspace-intelligence-host` together with the rest of the host
@@ -70,8 +72,9 @@
 //! together and reached only from a `[dev-dependencies]` edge: it publishes one
 //! real enabled scope through those same owners, for a test that needs that
 //! persisted shape and cannot obtain it from a production entry point. Outside
-//! `#[cfg(test)]` fixtures it is the only mint site of a host anchor in this
-//! crate, and no production caller names it.
+//! `#[cfg(test)]` fixtures, the crate-internal anchor preparation of the `host`
+//! module is the only anchor mint site in this crate: it is `pub(super)`, no app
+//! caller names it, and the test-support writer above stays test-only.
 
 // Crate-internal modules: reachable inside the crate. Only the facade re-exported at
 // the end of this module and the `test-support`-gated `host_fixture` below are public
@@ -121,7 +124,8 @@ pub mod host_fixture;
 // (host feature absent); the rest is plain status data an app renders or logs.
 // Tenure, tickets, tokens, lease paths, control/cognition roots and the raw
 // anchor stay crate-internal, as does every type of `host_binding`,
-// `host_standby` and `catalog_readonly`.
+// `host_standby` and `catalog_readonly`. The crate-internal anchor preparation
+// entry point is deliberately not part of this re-export and has no app caller.
 pub use host::{
     WorkspaceIntelligenceHost, WorkspaceIntelligenceHostBlock, WorkspaceIntelligenceHostCounts,
     WorkspaceIntelligenceHostDrain, WorkspaceIntelligenceHostReason,
