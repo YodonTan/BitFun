@@ -126,7 +126,10 @@ impl GovernedCommitAuthority {
     pub fn model_ref(&self) -> Option<&str> { self.model_ref.as_deref() }
     pub fn policy(&self) -> Option<&serde_json::Value> { self.policy.as_ref() }
 
-    fn project(record: WorkspaceIntelligenceControlRecord) -> Self {
+    /// The one equivalence unit, shared with the initial-enable reservation so a
+    /// second consumer compares this exact projection instead of re-deriving a
+    /// subset of it. Visibility only: the meaning of the five fields is unchanged.
+    pub(crate) fn project(record: WorkspaceIntelligenceControlRecord) -> Self {
         Self {
             control_generation: record.control_generation,
             schema_version: record.schema_version,

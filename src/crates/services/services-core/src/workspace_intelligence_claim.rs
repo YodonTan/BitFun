@@ -1,6 +1,7 @@
-//! Owner-lifecycle evidence for an already-enabled scope, NOT a WP1.4 exit or
-//! P1 exit and NOT the OFF-to-ON enabling path. No PrepareInitialEnabling or
-//! allow_off. No host bootstrap, apps wiring, standby retry loop, background
+//! Owner-lifecycle evidence for an already-enabled scope, plus one single-purpose
+//! pre-held lease for an initial-enable preparation. NOT a WP1.4 exit or P1 exit
+//! and NOT the OFF-to-ON enabling path: no enabling write, no `allow_off`, no
+//! tenure marker, no host bootstrap, apps wiring, standby retry loop, background
 //! task, cursor/gap, revision/epoch, or content mutation.
 //!
 //! The lease is the only tenure object. A token is a tenure marker, not a
@@ -41,14 +42,101 @@
 //!
 //! Roots are host-injected local storage paths. No remote execution or host
 //! lifecycle integration is supplied by this primitive.
+//!
+//! # Initial enable preparation (single purpose, reservation only)
+//!
+//! [`InitialEnableReservation::reserve`] is the one preparation entry point this
+//! module adds. It exists so a caller can pre-hold the scope tenure BEFORE any
+//! enabling decision is taken, instead of turning a scope on and then waiting for
+//! a lease it may never get. It performs no control write, mints no tenure marker,
+//! and takes no cognition root at all, so it structurally cannot create a
+//! partition or a cursor; it is not a generic `allow_off`, not a standby retry
+//! loop, and not a host start-up path.
+//!
+//! The caller states its own belief about the persisted record
+//! ([`InitialEnableExpectation`]): either "no record" or "this generation with
+//! exactly this whole raw policy". `None` inside `Present` is a real expectation
+//! and never a wildcard. A truly absent record and a stored record that does not
+//! read enabled (`false`, or the key absent) are the only states it can reserve
+//! over; an already-enabled record refuses.
+//!
+//! Admission runs in two stages. The lock-free pre-read may only REFUSE what it
+//! proves wrong - an already-enabled record, or a stored generation/policy the
+//! caller did not state - and a pre-read refusal returns before any lease,
+//! control or cognition artifact exists. It never ADMITS: a missing observation
+//! proves nothing, so the scope lease is taken first and the authoritative
+//! decision is made from `lock_and_read_authority`, which re-reads the record
+//! under the control record's own cross-process guard. That locked read must
+//! match the projection this attempt observed (the five-field equivalence unit of
+//! the commit fence, never a re-derived subset), must still not read enabled, and
+//! must match the caller's exact generation and whole raw policy.
+//!
+//! Scope of that comparison, stated plainly so it is not over-read:
+//!
+//! - The caller's expectation is deliberately narrow: a control generation plus
+//!   one whole raw policy value. It is NOT a complete admission projection, and
+//!   `schema_version` and `model_ref` are not caller-stated at all.
+//! - The five-field comparison is an internal window, from this attempt's own
+//!   lock-free observation to its own locked re-read. It detects drift that lands
+//!   inside that window; it is not a host admission decision, not a substitute
+//!   for one, and it proves nothing about the record after the guard is released.
+//! - A host (or later in-crate consumer) that admits an initial enable still has
+//!   to re-observe the record itself and compare its own complete expectation,
+//!   `model_ref` and `schema_version` included, before it writes. This primitive
+//!   supplies a pre-held lease and a verified snapshot, never permission.
+//!
+//! Retained snapshot. The handle stores the authority this attempt itself
+//! verified under the guard - absent, or the complete five-field projection it
+//! observed and re-checked - together with the control root it was decided
+//! against, alongside the scope and the lease. It stays crate-internal and opaque:
+//! there is no accessor for the snapshot, the control root or the lease path in
+//! production builds, so it cannot be read as a grant or used as a path/permission
+//! handle. It exists so a later in-crate step (P2) can compare without re-deriving
+//! a subset, and it is never "ON first": the scope is still off on every path.
+//!
+//! Footprint. A refusal decided before the lease leaves nothing behind. A
+//! successful reservation, and any refusal decided after the lease, may leave the
+//! payload-free scope `.lock` and the payload-free control `.json.lock`; both
+//! stay, because another process may already be flocking that inode. No control
+//! record is written and no cognition file, partition or tenure marker is created
+//! on this path.
+//!
+//! # Fixed order: anchor, then reservation, then one same-lease promotion
+//!
+//! [`InitialEnableReservation::reserve`] is valid only after the namespace's host
+//! anchor already exists: obtain the anchor, reserve the scope, then run the
+//! governed promotion that turns the scope on while carrying this same lease
+//! forward. Calling `reserve` with no anchor is not a supported state and is not
+//! recoverable here. Reaching the authoritative read creates the control root when
+//! it was absent and leaves the payload-free `<digest>.json.lock` inside it. The
+//! protected initial-enable anchor mint proves that same-namespace control root
+//! vacant and counts every entry, `.lock` included, so the later authentic mint
+//! refuses (`host_anchor_initial_enable_control_occupied`) instead of minting.
+//! Nothing here deletes that lock - another process may be flocking its inode - so
+//! a namespace prepared ahead of its anchor is left with a mint that can no longer
+//! succeed. The scope lease itself lives in the lease root and is not part of that
+//! vacancy proof; the ordering hazard is the control guard, not the tenure.
+//!
+//! Tenure. The reservation owns its OS lease until the handle is dropped. It is
+//! not Clone, has no public constructor, no tenure-marker accessor and a fully
+//! redacted Debug. The lease lives in the caller's future, not inside the
+//! control-read blocking task, so cancelling the future releases tenure and the
+//! detached blocking work can only observe or release, never write. There is
+//! deliberately no public way to take the lease out: a later promotion consumes
+//! this handle inside this crate, so the same lease is moved between steps instead
+//! of being dropped and re-acquired, which is what keeps "never enable while
+//! waiting" intact. Promote - the OFF-to-ON write that would reuse this lease - is
+//! deliberately NOT implemented here.
 
 use crate::exclusive_file_lease::{ExclusiveFileLease, ExclusiveFileLeaseError};
 use crate::workspace_intelligence_cognition::scope_digest;
 use crate::workspace_intelligence_commit::{
-    GovernedClaimRefusal, GovernedFenceOperation, GovernedFenceOutcome,
+    GovernedClaimRefusal, GovernedCommitAuthority, GovernedFenceOperation, GovernedFenceOutcome,
     WorkspaceIntelligenceCommitError, WorkspaceIntelligenceCommitGate,
 };
-use crate::workspace_intelligence_store::{WorkspaceIntelligenceStore, WorkspaceIntelligenceStoreError};
+use crate::workspace_intelligence_store::{
+    WorkspaceIntelligenceControlRecord, WorkspaceIntelligenceStore, WorkspaceIntelligenceStoreError,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -368,6 +456,289 @@ impl GovernedClaim {
             GovernedFenceOutcome::Advanced(_) => Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
                 operation: "verify_incarnation",
             }),
+        }
+    }
+}
+
+/// One caller-stated belief about the persisted control record of a scope.
+///
+/// This is a belief, never a permit: no value of it can authorize an enabling
+/// write, and it is not an `allow_off` switch. [`Self::Absent`] states that no
+/// record was observed; [`Self::Present`] states one record at an exact
+/// generation with an exact whole raw policy. There is deliberately no variant
+/// meaning "any record" or "any policy", so a policy value of `None` inside
+/// [`Self::Present`] stays an exact expectation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InitialEnableExpectation {
+    /// The caller observed no control record for the scope.
+    Absent,
+    /// The caller observed exactly this control generation and this whole raw
+    /// policy value.
+    ///
+    /// `policy: None` states "no policy is stored" and is not a wildcard: a
+    /// record that carries any policy refuses. `Some(value)` must equal the
+    /// stored value exactly, including unknown keys, unknown nesting and JSON
+    /// number identity; this layer models no policy schema and never filters
+    /// inside the value.
+    Present {
+        control_generation: u64,
+        policy: Option<serde_json::Value>,
+    },
+}
+
+/// Typed refusal of one reservation attempt.
+///
+/// Codes are stable and echo no scope, path or payload value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialEnableRefusal {
+    /// The stored record already reads enabled; nothing was reserved.
+    AlreadyEnabled,
+    /// The stored record is not the one the caller prepared: it appeared, it
+    /// disappeared, its generation moved, or its whole raw policy differs. A
+    /// change that lands after this attempt observed the record is reported the
+    /// same way, because the observed projection is compared under the guard.
+    AuthorityChanged,
+}
+
+impl InitialEnableRefusal {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::AlreadyEnabled => "already_enabled",
+            Self::AuthorityChanged => "authority_changed",
+        }
+    }
+}
+
+/// Outcome of one reservation attempt. Nothing here is a grant: only
+/// [`Self::Reserved`] carries tenure, and that tenure authorizes no write.
+#[derive(Debug)]
+pub enum InitialEnableAttempt {
+    /// The scope lease is pre-held and the authoritative read still did not see
+    /// an enabled record. No enabling decision has been taken.
+    Reserved(InitialEnableReservation),
+    /// Another owner holds the scope lease. Nothing was written or created.
+    Standby,
+    /// Typed refusal; see [`InitialEnableRefusal`] and the module footprint rule.
+    Refused(InitialEnableRefusal),
+}
+
+/// The authority one reservation attempt itself verified under the control guard.
+///
+/// Crate-internal and opaque on purpose. It exists so a later in-crate consumer
+/// (P2) can compare against the exact snapshot this attempt validated instead of
+/// re-deriving a subset, and so the handle never has to be re-read to know what it
+/// was decided against. It is deliberately not public, carries no path, lease or
+/// permission, and is not a host admission projection: a host still re-observes
+/// the record and compares its own complete expectation before writing.
+///
+/// `Absent` is a verified observation that this attempt's locked read found no
+/// record; it is not a permanent statement that no record exists, and it never
+/// authorizes creating one. `Present` is the complete five-field projection
+/// (generation, schema version, switch, model reference, whole raw policy) this
+/// attempt observed and then re-checked under the guard.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // Read only by the later in-crate consumer; never widened to `pub` for that.
+pub(crate) enum VerifiedInitialAuthority {
+    Absent,
+    Present(GovernedCommitAuthority),
+}
+
+/// Sealed single-purpose pre-held lease for one initial-enable preparation.
+///
+/// Fields are private, there is no public constructor, no Clone and no
+/// serialization, so a handle cannot be forged or rebound to another scope, and
+/// the only way to obtain one is [`Self::reserve`]. It holds exactly the OS lease
+/// the [`GovernedClaim`] lifecycle would take for the same scope digest and lease
+/// root, keeps it alive until the handle is dropped, and exposes no tenure marker:
+/// the incarnation marker is minted only by the governed owner commit of the later
+/// enabling step.
+///
+/// It carries no path or permission accessor, and no public way to take the lease
+/// or the snapshot out. Everything below is filled by the same `reserve` call, so
+/// the scope, the control root identity, the lease and the verified authority can
+/// never describe different attempts.
+pub struct InitialEnableReservation {
+    /// The held OS tenure. A later in-crate promotion step moves this handle and
+    /// reuses this same lease; there is deliberately no public extractor, so a
+    /// caller cannot take tenure out and use it for anything else.
+    ///
+    /// It is held for its `Drop`, which is what releases the OS lock, so it is
+    /// never read in a production build. That is the intended shape, not missing
+    /// code: giving it a reader to silence this would mean handing tenure out.
+    #[allow(dead_code)]
+    lease: ExclusiveFileLease,
+    /// Control store root this decision was taken against, kept so a later
+    /// in-crate consumer can prove the handle is not applied to another control
+    /// root. Never exposed: no path accessor exists.
+    #[allow(dead_code)] // Consumed in-crate by the later promotion; not de-dead-coded by `pub`.
+    control_root: PathBuf,
+    /// Opaque scope; [`Self::scope`] is the only public accessor.
+    scope: String,
+    /// What this attempt itself verified under the guard. Never exposed: no
+    /// accessor exists, public or otherwise, so it cannot be read as authority.
+    #[allow(dead_code)] // Consumed in-crate by the later promotion; not de-dead-coded by `pub`.
+    authority: VerifiedInitialAuthority,
+}
+
+impl std::fmt::Debug for InitialEnableReservation {
+    /// Fully redacted: scope, roots, lease path, the held tenure object and the
+    /// verified snapshot are all withheld, so a log line can never be mistaken
+    /// for tenure or a grant. Use [`InitialEnableReservation::scope`] for
+    /// deliberate diagnostics.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitialEnableReservation")
+            .field("tenure", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl InitialEnableReservation {
+    /// Pre-holds the scope lease for one initial-enable preparation.
+    ///
+    /// The footprint contract, in order: a lock-free observation, the scope
+    /// lease, then the authoritative re-read under the control record's own
+    /// cross-process guard. The observation may only refuse; the lease is taken
+    /// before that guard, never while holding it, so the fixed order
+    /// lease -> control -> SQLite of this module is preserved and no new lock
+    /// order is introduced. No control record, cognition partition, cursor or
+    /// tenure marker is created, and no enabling write happens on any path.
+    ///
+    /// The caller must already hold the namespace's host anchor (see the module
+    /// "Fixed order" section); reaching the authoritative read leaves the
+    /// payload-free control `.json.lock` behind, and the protected initial-enable
+    /// anchor mint refuses a control root holding any entry.
+    ///
+    /// The returned handle carries this attempt's verified authority snapshot, but
+    /// that snapshot is this primitive's own guarded comparison, not a host
+    /// admission decision: the expectation here is a generation plus one whole raw
+    /// policy, and `model_ref`/`schema_version` are only carried, never asserted.
+    ///
+    /// Cancellation: the lease is a local of this future until the handle is
+    /// returned, so dropping the future releases it. The detached blocking
+    /// acquisition may still create and take the payload-free `.lock`, and a
+    /// detached control-guard wait may still take and drop that guard, but
+    /// neither can resume this future, reach the decision or write anything.
+    pub async fn reserve(
+        control: WorkspaceIntelligenceStore,
+        lease_root: PathBuf,
+        scope: &str,
+        expectation: InitialEnableExpectation,
+    ) -> Result<InitialEnableAttempt, WorkspaceIntelligenceClaimError> {
+        let control_root = control.control_root().to_path_buf();
+        let digest = scope_digest(scope).map_err(WorkspaceIntelligenceCommitError::Cognition)?;
+        let lease_path = lease_root.join(format!("{digest}.lock"));
+        // Reject only: this lock-free read can prove the caller wrong, and it can
+        // never admit. A missing observation is not proof of absence, so it is
+        // not a refusal either.
+        let observed_projection = match control.read(scope).await? {
+            Some(record) => {
+                if let Some(refusal) = Self::observed_refusal(&record, &expectation) {
+                    return Ok(InitialEnableAttempt::Refused(refusal));
+                }
+                Some(GovernedCommitAuthority::project(record))
+            }
+            None => None,
+        };
+        let path = lease_path.clone();
+        let lease = match tokio::task::spawn_blocking(move || ExclusiveFileLease::try_acquire(&path))
+            .await.map_err(WorkspaceIntelligenceCommitError::OwnerTask)? {
+            Ok(lease) => lease,
+            Err(ExclusiveFileLeaseError::InUse) => return Ok(InitialEnableAttempt::Standby),
+            Err(error) => return Err(error.into()),
+        };
+        // Held, not decided: only tests pause here, to cancel or to edit the
+        // record between the lease and the authoritative read. No production
+        // await point is added.
+        #[cfg(test)]
+        if let Some(pause) = tests::reservation_pause(control.control_root()) {
+            tests::wait_reservation_pause(&pause).await;
+        }
+        // The authoritative decision, under the control record's own guard. The
+        // guard is dropped before the handle exists, so the reservation never
+        // holds it across the caller's tenure.
+        let authority = {
+            let (guard, fresh) = control.lock_and_read_authority(scope).await?;
+            let fresh_projection = fresh
+                .map(GovernedCommitAuthority::project);
+            let authority = Self::locked_decision(&observed_projection, fresh_projection, &expectation);
+            drop(guard);
+            authority
+        };
+        match authority {
+            Err(refusal) => Ok(InitialEnableAttempt::Refused(refusal)),
+            Ok(authority) => Ok(InitialEnableAttempt::Reserved(Self {
+                lease, control_root, scope: scope.to_owned(), authority,
+            })),
+        }
+    }
+
+    /// The opaque scope this reservation was taken for.
+    pub fn scope(&self) -> &str { &self.scope }
+
+    /// The exact `.lock` this reservation holds, and the path the [`GovernedClaim`]
+    /// lifecycle derives for the same scope and lease root.
+    ///
+    /// Test-only: production callers get no path accessor, so a lease path can
+    /// never be used to re-acquire, re-bind or bypass this handle.
+    #[cfg(test)]
+    fn lease_path(&self) -> &std::path::Path { self.lease.lock_path() }
+
+    /// Refuses only what one lock-free observation proves wrong: a record that
+    /// already reads enabled, or a stored generation/policy the caller did not
+    /// state.
+    fn observed_refusal(
+        record: &WorkspaceIntelligenceControlRecord, expectation: &InitialEnableExpectation,
+    ) -> Option<InitialEnableRefusal> {
+        if record.enabled == Some(true) { return Some(InitialEnableRefusal::AlreadyEnabled); }
+        if Self::stated(record.control_generation, record.policy.as_ref(), expectation) {
+            None
+        } else {
+            Some(InitialEnableRefusal::AuthorityChanged)
+        }
+    }
+
+    /// The authoritative decision, taken under the control record's guard.
+    ///
+    /// An enabled record is reported first, so a scope that is already on answers
+    /// the actionable truth even when the caller's belief is stale as well. Then
+    /// the fresh projection must be the one this attempt observed, which covers a
+    /// record that appeared, a record that disappeared and a same-generation edit
+    /// to any equivalence field. Then the caller's exact generation and whole raw
+    /// policy are re-checked. On success the verified snapshot is returned so the
+    /// handle can carry what this attempt actually validated.
+    ///
+    /// This is a guarded internal comparison, not a host admission decision: the
+    /// caller's expectation never states `model_ref` or `schema_version`, so those
+    /// two fields are carried rather than asserted, and no conclusion about the
+    /// record survives this guard.
+    fn locked_decision(
+        observed: &Option<GovernedCommitAuthority>,
+        fresh: Option<GovernedCommitAuthority>,
+        expectation: &InitialEnableExpectation,
+    ) -> Result<VerifiedInitialAuthority, InitialEnableRefusal> {
+        let Some(fresh) = fresh else {
+            return match expectation {
+                InitialEnableExpectation::Absent => Ok(VerifiedInitialAuthority::Absent),
+                InitialEnableExpectation::Present { .. } => Err(InitialEnableRefusal::AuthorityChanged),
+            };
+        };
+        if fresh.enabled() == Some(true) { return Err(InitialEnableRefusal::AlreadyEnabled); }
+        if observed.as_ref() != Some(&fresh) { return Err(InitialEnableRefusal::AuthorityChanged); }
+        if !Self::stated(fresh.control_generation(), fresh.policy(), expectation) {
+            return Err(InitialEnableRefusal::AuthorityChanged);
+        }
+        Ok(VerifiedInitialAuthority::Present(fresh))
+    }
+
+    fn stated(
+        control_generation: u64, policy: Option<&serde_json::Value>,
+        expectation: &InitialEnableExpectation,
+    ) -> bool {
+        match expectation {
+            InitialEnableExpectation::Absent => false,
+            InitialEnableExpectation::Present { control_generation: expected, policy: expected_policy } => {
+                control_generation == *expected && policy == expected_policy.as_ref()
+            }
         }
     }
 }
@@ -1351,5 +1722,531 @@ mod tests {
         assert_eq!(control_bytes(tmp.path()), before);
         assert_eq!(cognition_bytes(tmp.path()), None);
         assert!(lock_files(&tmp.path().join("leases")).is_empty());
+    }
+
+    // Initial enable preparation: one pre-held lease, no enabling write.
+
+    fn present(control_generation: u64, policy: Option<serde_json::Value>) -> InitialEnableExpectation {
+        InitialEnableExpectation::Present { control_generation, policy }
+    }
+    async fn reserve(base: &Path, scope: &str, expectation: InitialEnableExpectation) -> InitialEnableAttempt {
+        InitialEnableReservation::reserve(control(base), base.join("leases"), scope, expectation).await.unwrap()
+    }
+    fn reserved(outcome: InitialEnableAttempt) -> InitialEnableReservation {
+        match outcome {
+            InitialEnableAttempt::Reserved(reservation) => reservation,
+            other => panic!("expected a reservation: {other:?}"),
+        }
+    }
+    fn refused_reservation(outcome: InitialEnableAttempt, reason: InitialEnableRefusal) {
+        assert!(matches!(outcome, InitialEnableAttempt::Refused(actual) if actual == reason), "{outcome:?}");
+    }
+    async fn seed_disabled(base: &Path, scope: &str, policy: Option<serde_json::Value>) {
+        control(base).update(scope, ControlGenerationExpectation::Absent, WorkspaceIntelligenceControlPatch {
+            enabled: ControlFieldUpdate::Set(false),
+            policy: policy.map(ControlFieldUpdate::Set).unwrap_or_default(),
+            ..Default::default()
+        }).await.unwrap();
+    }
+    fn control_lock_path(base: &Path) -> PathBuf {
+        base.join("control").join(format!("{}.json.lock", scope_digest(SCOPE).unwrap()))
+    }
+    /// No scope lease artifact at all: the refusal happened before the lease.
+    fn assert_no_lease_artifact(base: &Path) {
+        assert!(lock_files(&base.join("leases")).is_empty(),
+            "a refusal decided before the lease must leave no lease artifact");
+    }
+    /// Deterministic wait on the real OS lock: the scope lease is free again.
+    async fn wait_until_free(path: &Path) {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let observed = std::fs::OpenOptions::new().read(true).write(true).open(path).map(|probe| {
+                let outcome = fs2::FileExt::try_lock_exclusive(&probe);
+                drop(probe);
+                outcome
+            });
+            match observed {
+                Ok(Ok(())) => return,
+                Ok(Err(error)) => assert_eq!(error.raw_os_error(), fs2::lock_contended_error().raw_os_error()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("unexpected scope lease IO: {error}"),
+            }
+            assert!(Instant::now() < deadline, "the scope lease was never released: {}", path.display());
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // Test-only pause registry. The reservation signals, through a channel, that
+    // it already holds the scope lease and has not taken the authoritative
+    // decision yet, so a race test never has to probe the lease and can never
+    // steal it. There is no production await point and no alternate entry point.
+    static RESERVATION_PAUSES: std::sync::Mutex<Vec<(PathBuf, crate::workspace_intelligence_commit::TestPause)>> =
+        std::sync::Mutex::new(Vec::new());
+    struct ReservationPauseRegistration(PathBuf);
+    impl Drop for ReservationPauseRegistration {
+        fn drop(&mut self) {
+            RESERVATION_PAUSES.lock().unwrap().retain(|entry| entry.0.as_os_str() != self.0.as_os_str());
+        }
+    }
+    fn register_reservation_pause(base: &Path)
+        -> (ReservationPauseRegistration, tokio::sync::mpsc::UnboundedReceiver<()>, ReleasePause) {
+        let root = base.join("control");
+        let (hook, receiver, release) = pause();
+        RESERVATION_PAUSES.lock().unwrap().push((root.clone(), hook));
+        (ReservationPauseRegistration(root), receiver, release)
+    }
+    pub(super) fn reservation_pause(control_root: &Path) -> Option<crate::workspace_intelligence_commit::TestPause> {
+        RESERVATION_PAUSES.lock().unwrap().iter()
+            .find(|entry| entry.0.as_os_str() == control_root.as_os_str())
+            .map(|entry| entry.1.clone())
+    }
+    pub(super) async fn wait_reservation_pause(pause: &crate::workspace_intelligence_commit::TestPause) {
+        pause.0.send(()).unwrap();
+        loop {
+            // Bind first: the guard must not live across the yield.
+            let released = pause.1.lock().unwrap().try_recv();
+            match released {
+                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                Err(std::sync::mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_truly_absent_scope_is_reserved_without_a_control_record_or_partition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reservation = reserved(reserve(tmp.path(), SCOPE, InitialEnableExpectation::Absent).await);
+        assert_eq!(reservation.scope(), SCOPE);
+        // The tenure is the exact inode the claim lifecycle derives for the scope.
+        assert_eq!(reservation.lease_path(), lease_path(tmp.path()));
+        let lease = lease_path(tmp.path());
+        assert!(lease.is_file());
+        assert_eq!(std::fs::metadata(&lease).unwrap().len(), 0, "the scope lease carries no payload");
+        // No control record and no cognition partition; the authoritative read
+        // leaves only the control record's own payload-free guard.
+        assert!(!control_path(tmp.path()).exists());
+        assert!(control_lock_path(tmp.path()).is_file());
+        assert_eq!(std::fs::metadata(control_lock_path(tmp.path())).unwrap().len(), 0);
+        assert_no_partition(tmp.path());
+        drop(reservation);
+    }
+
+    /// The fixed order is anchor -> reserve -> same-lease promotion. This pins the
+    /// fact the anchor owner depends on: reaching the authoritative read creates
+    /// the control root and leaves exactly one payload-free `.json.lock` in it, and
+    /// the protected initial-enable anchor mint proves that root vacant by counting
+    /// every entry, `.lock` included. A reservation taken before the anchor
+    /// therefore blocks the later authentic mint, and nothing here unlinks the
+    /// lock. The scope lease lives in the lease root, so it is not the cause.
+    #[tokio::test]
+    async fn reserving_before_the_anchor_leaves_a_control_lock_the_mint_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reservation = reserved(reserve(tmp.path(), SCOPE, InitialEnableExpectation::Absent).await);
+        let control_root = tmp.path().join("control");
+        let entries: Vec<String> = std::fs::read_dir(&control_root).unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let lock_name = format!("{}.json.lock", scope_digest(SCOPE).unwrap());
+        assert_eq!(entries, [lock_name.clone()], "the control root must hold exactly the guard");
+        assert_eq!(std::fs::read(control_root.join(&lock_name)).unwrap(), Vec::<u8>::new());
+        assert!(!control_path(tmp.path()).exists(), "no control record may be created");
+        // The tenure is not inside the namespace the mint proves vacant.
+        assert!(reservation.lease_path().starts_with(tmp.path().join("leases")));
+        assert!(!reservation.lease_path().starts_with(&control_root));
+        // Order cannot be repaired from here: release the tenure and the entry stays.
+        drop(reservation);
+        let entries: Vec<String> = std::fs::read_dir(&control_root).unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, [lock_name], "the guard is never unlinked by design");
+        assert!(!control_path(tmp.path()).exists());
+        assert_no_partition(tmp.path());
+    }
+
+    #[tokio::test]
+    async fn stored_records_that_are_not_enabled_are_reserved() {
+        for policy in [None, Some(bound_policy(HOST_ID))] {
+            let tmp = tempfile::tempdir().unwrap();
+            seed_disabled(tmp.path(), SCOPE, policy.clone()).await;
+            let before = control_bytes(tmp.path());
+            let reservation = reserved(reserve(tmp.path(), SCOPE, present(1, policy.clone())).await);
+            // Pre-holding tenure never rewrites the record it observed.
+            assert_eq!(control_bytes(tmp.path()), before);
+            let record = control(tmp.path()).read(SCOPE).await.unwrap().unwrap();
+            assert_eq!(record.enabled, Some(false));
+            assert_eq!(record.control_generation, 1);
+            assert_eq!(record.policy, policy);
+            assert_no_partition(tmp.path());
+            drop(reservation);
+        }
+        // A record whose `enabled` key is absent reads as off and is reserved too.
+        let tmp = tempfile::tempdir().unwrap();
+        let created = control(tmp.path()).update(SCOPE, ControlGenerationExpectation::Absent,
+            WorkspaceIntelligenceControlPatch::default()).await.unwrap();
+        assert_eq!(created.record().enabled, None);
+        let before = control_bytes(tmp.path());
+        let reservation = reserved(reserve(tmp.path(), SCOPE, present(1, None)).await);
+        assert_eq!(control(tmp.path()).read(SCOPE).await.unwrap().unwrap().enabled, None);
+        assert_eq!(control_bytes(tmp.path()), before);
+        assert_no_partition(tmp.path());
+        drop(reservation);
+    }
+
+    #[tokio::test]
+    async fn an_already_enabled_scope_refuses_before_any_lease() {
+        for with_policy in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            if with_policy { seed_policy(tmp.path(), SCOPE, bound_policy(HOST_ID)).await; }
+            else { seed(tmp.path(), SCOPE, true).await; }
+            let before = control_bytes(tmp.path());
+            let expected = present(1, if with_policy { Some(bound_policy(HOST_ID)) } else { None });
+            // Pins the gate order: an on record reports AlreadyEnabled even when
+            // the caller's belief also mismatches, because that is the actionable
+            // truth and the caller must not retry a preparation.
+            for expectation in [expected, InitialEnableExpectation::Absent] {
+                let outcome = reserve(tmp.path(), SCOPE, expectation.clone()).await;
+                refused_reservation(outcome, InitialEnableRefusal::AlreadyEnabled);
+                assert_no_lease_artifact(tmp.path());
+                assert_no_partition(tmp.path());
+                assert_eq!(control_bytes(tmp.path()), before);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_or_unrecognized_records_are_errors_without_footprint() {
+        for case in ["corrupt", "schema", "directory"] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("control")).unwrap();
+            let path = control_path(tmp.path());
+            match case {
+                "corrupt" => std::fs::write(&path, b"not a control record").unwrap(),
+                "schema" => std::fs::write(&path, serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 2, "control_generation": 1, "enabled": false,
+                })).unwrap()).unwrap(),
+                _ => std::fs::create_dir(&path).unwrap(),
+            }
+            let error = InitialEnableReservation::reserve(control(tmp.path()),
+                tmp.path().join("leases"), SCOPE, InitialEnableExpectation::Absent).await.unwrap_err();
+            match case {
+                "corrupt" => assert!(matches!(error,
+                    WorkspaceIntelligenceClaimError::Control(WorkspaceIntelligenceStoreError::CorruptRecord { .. })), "{error:?}"),
+                "schema" => assert!(matches!(error,
+                    WorkspaceIntelligenceClaimError::Control(WorkspaceIntelligenceStoreError::UnsupportedSchemaVersion { version: 2, .. })), "{error:?}"),
+                _ => assert!(matches!(error, WorkspaceIntelligenceClaimError::Control(_)), "{error:?}"),
+            }
+            // An unknown or unsupported record is never reset, adopted or reserved over.
+            assert_no_lease_artifact(tmp.path());
+            assert_no_partition(tmp.path());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_foreign_owner_of_the_scope_lease_yields_standby_without_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let holder = ExclusiveFileLease::try_acquire(&lease_path(tmp.path())).unwrap();
+        let outcome = reserve(tmp.path(), SCOPE, InitialEnableExpectation::Absent).await;
+        assert!(matches!(outcome, InitialEnableAttempt::Standby), "{outcome:?}");
+        // Standby stops before the authoritative read, so nothing is created.
+        assert!(!tmp.path().join("control").exists());
+        assert!(!tmp.path().join("cognition").exists());
+        drop(holder);
+        let reservation = reserved(reserve(tmp.path(), SCOPE, InitialEnableExpectation::Absent).await);
+        drop(reservation);
+        assert!(!control_path(tmp.path()).exists());
+        assert_no_partition(tmp.path());
+    }
+
+    #[tokio::test]
+    async fn stating_a_present_record_against_an_absent_scope_is_changed_after_the_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outcome = reserve(tmp.path(), SCOPE, present(1, None)).await;
+        refused_reservation(outcome, InitialEnableRefusal::AuthorityChanged);
+        // Only an observed record can refuse before the lease: a missing
+        // observation proves nothing, so this refusal legitimately leaves the
+        // payload-free scope lease behind and still writes nothing else.
+        assert!(!control_path(tmp.path()).exists());
+        assert_eq!(std::fs::metadata(lease_path(tmp.path())).unwrap().len(), 0);
+        assert_no_partition(tmp.path());
+        drop(ExclusiveFileLease::try_acquire(&lease_path(tmp.path())).unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_expectation_mismatch_refuses_at_the_pre_read_without_footprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = bound_policy(HOST_ID);
+        seed_disabled(tmp.path(), SCOPE, Some(policy.clone())).await;
+        let before = control_bytes(tmp.path());
+        let mismatches = [
+            InitialEnableExpectation::Absent,
+            present(2, Some(policy.clone())),
+            present(1, Some(bound_policy(OTHER_HOST_ID))),
+            // `None` states "no policy is stored": it never wildcards a policy.
+            present(1, None),
+        ];
+        for expectation in mismatches {
+            let outcome = reserve(tmp.path(), SCOPE, expectation.clone()).await;
+            refused_reservation(outcome, InitialEnableRefusal::AuthorityChanged);
+            assert_no_lease_artifact(tmp.path());
+            assert_no_partition(tmp.path());
+            assert_eq!(control_bytes(tmp.path()), before);
+        }
+        // The other direction of the same exact rule: a stored record with no
+        // policy is not admitted by a caller who states one.
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), SCOPE, false).await;
+        let before = control_bytes(tmp.path());
+        let outcome = reserve(tmp.path(), SCOPE, present(1, Some(bound_policy(HOST_ID)))).await;
+        refused_reservation(outcome, InitialEnableRefusal::AuthorityChanged);
+        assert_no_lease_artifact(tmp.path());
+        assert_no_partition(tmp.path());
+        assert_eq!(control_bytes(tmp.path()), before);
+    }
+
+    #[tokio::test]
+    async fn a_whole_policy_change_at_the_same_generation_before_the_lease_refuses_without_footprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let observed = bound_policy(HOST_ID);
+        seed_disabled(tmp.path(), SCOPE, Some(observed.clone())).await;
+        let expectation = present(1, Some(observed.clone()));
+        let changed = bound_policy(OTHER_HOST_ID);
+        let previous = raw_policy_edit_same_generation(tmp.path(), changed.clone()).await;
+        assert_eq!(previous["policy"], observed);
+        assert_eq!(previous["control_generation"], serde_json::json!(1));
+        let edited = control_bytes(tmp.path());
+        let outcome = reserve(tmp.path(), SCOPE, expectation).await;
+        refused_reservation(outcome, InitialEnableRefusal::AuthorityChanged);
+        // The whole value is compared, so a generation-only check would admit it.
+        let record = control(tmp.path()).read(SCOPE).await.unwrap().unwrap();
+        assert_eq!(record.control_generation, 1);
+        assert_eq!(record.policy, Some(changed));
+        assert_eq!(control_bytes(tmp.path()), edited);
+        assert_no_lease_artifact(tmp.path());
+        assert_no_partition(tmp.path());
+    }
+
+    #[tokio::test]
+    async fn a_whole_policy_change_at_the_same_generation_after_the_lease_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let observed = bound_policy(HOST_ID);
+        seed_disabled(tmp.path(), SCOPE, Some(observed.clone())).await;
+        let (_registration, mut entered_reservation, release) = register_reservation_pause(tmp.path());
+        let base = tmp.path().to_path_buf();
+        let expected = observed.clone();
+        let task = tokio::spawn(async move { reserve(&base, SCOPE, present(1, Some(expected))).await });
+        // Held lease, decision not taken: real-lock evidence, then the change.
+        entered(&mut entered_reservation).await;
+        assert_contended(&lease_path(tmp.path()));
+        let changed = bound_policy(OTHER_HOST_ID);
+        let previous = raw_policy_edit_same_generation(tmp.path(), changed.clone()).await;
+        assert_eq!(previous["policy"], observed);
+        assert_eq!(previous["control_generation"], serde_json::json!(1));
+        release.send(()).unwrap();
+        let outcome = tokio::time::timeout(DEADLINE, task).await.unwrap().unwrap();
+        refused_reservation(outcome, InitialEnableRefusal::AuthorityChanged);
+        // The observed projection is re-compared under the guard, so a
+        // same-generation whole-policy edit cannot be reserved over.
+        let record = control(tmp.path()).read(SCOPE).await.unwrap().unwrap();
+        assert_eq!(record.control_generation, 1);
+        assert_eq!(record.enabled, Some(false));
+        assert_eq!(record.policy, Some(changed));
+        assert_no_partition(tmp.path());
+        assert_eq!(std::fs::metadata(lease_path(tmp.path())).unwrap().len(), 0);
+        drop(ExclusiveFileLease::try_acquire(&lease_path(tmp.path())).unwrap());
+    }
+
+    #[tokio::test]
+    async fn one_scope_lease_is_shared_with_the_normal_claim_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), SCOPE, false).await;
+        let reservation = reserved(reserve(tmp.path(), SCOPE, present(1, None)).await);
+        // The reservation holds the exact `.lock` the claim lifecycle derives.
+        assert_eq!(reservation.lease_path(), lease_path(tmp.path()));
+        assert!(matches!(reserve(tmp.path(), SCOPE, present(1, None)).await, InitialEnableAttempt::Standby));
+        // A foreign scope is a different inode and is not blocked by this tenure.
+        let foreign_scope = reserved(reserve(tmp.path(), "claim:beta", InitialEnableExpectation::Absent).await);
+        assert_ne!(foreign_scope.lease_path(), reservation.lease_path());
+        drop(foreign_scope);
+        // The real claim lifecycle contends on the same inode: an already-enabled
+        // record still answers Standby while the reservation is held.
+        control(tmp.path()).update(SCOPE, ControlGenerationExpectation::Exactly(1), patch(true)).await.unwrap();
+        assert!(matches!(attempt(tmp.path(), SCOPE).await, ClaimAttempt::Standby));
+        // Releasing the reservation makes that same path available again.
+        let path = reservation.lease_path().to_path_buf();
+        drop(reservation);
+        drop(ExclusiveFileLease::try_acquire(&path).unwrap());
+        assert!(matches!(attempt(tmp.path(), SCOPE).await, ClaimAttempt::Claimed(_)));
+    }
+
+    #[tokio::test]
+    async fn cancelled_while_waiting_for_the_control_guard_releases_the_lease_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), SCOPE, false).await;
+        let record = control_path(tmp.path());
+        let before = control_bytes(tmp.path());
+        let guard = JsonFileStore.acquire_cross_process_lock(&record).await.unwrap();
+        let (registration, mut entered_reservation, release) = register_reservation_pause(tmp.path());
+        let base = tmp.path().to_path_buf();
+        let mut task = tokio::spawn(async move { reserve(&base, SCOPE, present(1, None)).await });
+        // The scope lease is already held before the cancellation.
+        entered(&mut entered_reservation).await;
+        release.send(()).unwrap();
+        // Correctness does not depend on how far the detached acquisition got;
+        // the assertions below are about the outcome only. Cooperative yields let
+        // the attempt reach the real control guard this test holds.
+        for _ in 0..64 { tokio::task::yield_now().await; }
+        assert!(!task.is_finished());
+        assert_contended(&lease_path(tmp.path()));
+        task.abort();
+        assert!((&mut task).await.unwrap_err().is_cancelled());
+        assert!(task.is_finished());
+        // A cancelled attempt cannot reach the decision, so it writes nothing.
+        assert_eq!(control_bytes(tmp.path()), before);
+        assert_no_partition(tmp.path());
+        // The pause registry is per control root; this test owns it and retires it
+        // before it starts another attempt on the same root.
+        drop(registration);
+        // Tenure ends with the caller's future rather than with the detached work.
+        drop(guard);
+        wait_until_free(&lease_path(tmp.path())).await;
+        let reservation = reserved(reserve(tmp.path(), SCOPE, present(1, None)).await);
+        drop(reservation);
+        assert_eq!(control_bytes(tmp.path()), before);
+        assert_no_partition(tmp.path());
+    }
+
+    #[tokio::test]
+    async fn a_reservation_never_makes_a_disabled_scope_claimable() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), SCOPE, false).await;
+        let before = control_bytes(tmp.path());
+        let reservation = reserved(reserve(tmp.path(), SCOPE, present(1, None)).await);
+        // Hard gate: the normal lifecycle still refuses OFF while tenure is held...
+        refused_claim(attempt(tmp.path(), SCOPE).await, GovernedClaimRefusal::NotEnabled);
+        refused_claim(expecting(tmp.path(), SCOPE, None).await, GovernedClaimRefusal::NotEnabled);
+        drop(reservation);
+        // ... and after it is released. Pre-holding a lease is not an OFF-to-ON path.
+        refused_claim(attempt(tmp.path(), SCOPE).await, GovernedClaimRefusal::NotEnabled);
+        assert_no_partition(tmp.path());
+        assert_eq!(control_bytes(tmp.path()), before);
+    }
+
+    #[tokio::test]
+    async fn reservation_debug_is_fully_redacted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reservation = reserved(reserve(tmp.path(), SCOPE, InitialEnableExpectation::Absent).await);
+        let digest = scope_digest(SCOPE).unwrap();
+        let debug = format!("{reservation:?}");
+        assert_eq!(debug, "InitialEnableReservation { tenure: \"<redacted>\", .. }");
+        for leaked in [SCOPE, digest.as_str(), "leases", "control", "cognition"] {
+            assert!(!debug.contains(leaked), "the reservation Debug leaked {leaked}");
+        }
+        let wrapped = format!("{:?}", InitialEnableAttempt::Reserved(reservation));
+        assert_eq!(wrapped, "Reserved(InitialEnableReservation { tenure: \"<redacted>\", .. })");
+    }
+
+    #[test]
+    fn reservation_surface_is_sealed_and_cannot_write() {
+        let source = include_str!("workspace_intelligence_claim.rs");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(production.contains("impl std::fmt::Debug for InitialEnableReservation"));
+        for forbidden in [
+            "#[derive(Debug, Clone)]\npub struct InitialEnableReservation",
+            "#[derive(Clone)]\npub struct InitialEnableReservation",
+            "impl Clone for InitialEnableReservation",
+            "pub fn token",
+            "pub fn rebind",
+            // No permissive switch, in parameter position or as a field.
+            "allow_off:",
+            "allow_off =",
+            "allow_off,",
+            // No raw extraction of tenure, and no path/permission accessor: the
+            // held lease, the control root and the verified snapshot stay inside.
+            // The pre-existing `ClaimLeaseBinding` crate-internal accessors are a
+            // different type and are not matched by these `pub fn` spellings.
+            "into_lease",
+            "fn into_",
+            "pub fn lease_path",
+            "pub fn lease(",
+            "pub fn control_root",
+            "pub fn authority",
+            "pub fn snapshot",
+            "pub fn verified",
+            // The later OFF-to-ON step is not this slice's, in any spelling.
+            "fn promote",
+            "fn enable(",
+            "fn activate(",
+        ] {
+            assert!(!production.contains(forbidden), "unexpected reservation surface: {forbidden}");
+        }
+        // Everything from the handle declaration to the end of production is this
+        // reservation's own surface: struct, Debug impl and inherent impl.
+        let section = production.split("pub struct InitialEnableReservation {").nth(1).unwrap();
+        // Private fields and no public constructor: the only mint site is reserve.
+        // The private `lease: ExclusiveFileLease` field is required, not banned.
+        let fields = section.split('}').next().unwrap();
+        assert!(!fields.contains("pub "), "the reservation fields must stay private: {fields}");
+        assert!(fields.contains("lease: ExclusiveFileLease"), "the handle must own the lease: {fields}");
+        // The verified snapshot is carried, and only crate-internally.
+        assert!(fields.contains("authority: VerifiedInitialAuthority"));
+        assert!(fields.contains("control_root: PathBuf"));
+        assert!(production.contains("pub(crate) enum VerifiedInitialAuthority"));
+        assert!(!production.contains("pub enum VerifiedInitialAuthority"));
+        // No return type hands out the raw tenure object.
+        for forbidden in ["-> ExclusiveFileLease", "-> &ExclusiveFileLease", "-> Arc<ExclusiveFileLease>"] {
+            assert!(!section.contains(forbidden), "raw tenure extraction is forbidden: {forbidden}");
+        }
+        // The test-only path accessor exists exactly once and only under cfg(test).
+        // `ClaimLeaseBinding`'s crate-internal accessor is a different type.
+        assert_eq!(production.matches("#[cfg(test)]\n    fn lease_path(&self)").count(), 1);
+        assert!(production.contains("#[cfg(test)]\n    fn lease_path(&self)"));
+        // The reservation path can never write control, cognition or tenure state.
+        for forbidden in [".update(", "commit_governed", "advance_incarnation", "initialize(", "ControlFieldUpdate"] {
+            assert!(!section.contains(forbidden), "the reservation must not write: {forbidden}");
+        }
+        // The hard gate on the normal lifecycle is untouched: both claim entry
+        // points still require an observed enabled-true authority.
+        assert_eq!(production.matches("if snapshot.authority().enabled() != Some(true)").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_handle_carries_the_absent_snapshot_it_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reservation = reserved(reserve(tmp.path(), SCOPE, InitialEnableExpectation::Absent).await);
+        // Same-call provenance: scope, control root, lease and snapshot all come
+        // from this one `reserve` call.
+        assert_eq!(reservation.scope(), SCOPE);
+        assert_eq!(reservation.control_root, tmp.path().join("control"));
+        assert_eq!(reservation.lease_path(), lease_path(tmp.path()));
+        assert_eq!(reservation.authority, VerifiedInitialAuthority::Absent);
+        // The snapshot is an observation of this attempt, not proof of absence:
+        // no control record was created to make it true.
+        assert!(!control_path(tmp.path()).exists());
+        drop(reservation);
+    }
+
+    #[tokio::test]
+    async fn the_handle_carries_the_complete_present_snapshot_it_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = bound_policy(HOST_ID);
+        control(tmp.path()).update(SCOPE, ControlGenerationExpectation::Absent,
+            WorkspaceIntelligenceControlPatch {
+                enabled: ControlFieldUpdate::Set(false),
+                model_ref: ControlFieldUpdate::Set("workspace-model-a".to_owned()),
+                policy: ControlFieldUpdate::Set(policy.clone()),
+                ..Default::default()
+            }).await.unwrap();
+        let reservation = reserved(reserve(tmp.path(), SCOPE, present(1, Some(policy.clone()))).await);
+        let VerifiedInitialAuthority::Present(authority) = &reservation.authority else {
+            panic!("a stored record must be carried as a present snapshot: {:?}", reservation.authority);
+        };
+        // Every projected field is carried, including the two the caller's own
+        // expectation never states.
+        assert_eq!(authority.control_generation(), 1);
+        assert_eq!(authority.schema_version(), Some(1));
+        assert_eq!(authority.enabled(), Some(false));
+        assert_eq!(authority.model_ref(), Some("workspace-model-a"));
+        assert_eq!(authority.policy(), Some(&policy));
+        drop(reservation);
     }
 }
