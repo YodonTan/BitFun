@@ -2601,6 +2601,135 @@ mod tests {
         WorkspaceService::new_for_test_path_manager(path_manager).await
     }
 
+    /// Runs one real `git` command for a worktree fixture through the shared test
+    /// command, which keeps a GUI-less Windows host from flashing a console window.
+    #[cfg(feature = "git")]
+    fn git_fixture_command(root: &Path, args: &[&str]) {
+        let output = crate::util::create_test_command("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .expect("git should be available for the worktree alias fixture");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Creates a real Git repository with one linked worktree beside it and
+    /// returns `(main_root, linked_root)` for the canonical `main-repo` and
+    /// `linked` directories under `directory`.
+    #[cfg(feature = "git")]
+    fn main_repository_with_linked_worktree(directory: &Path) -> (PathBuf, PathBuf) {
+        let main_path = directory.join("main-repo");
+        std::fs::create_dir_all(&main_path).expect("main repository should be created");
+        git_fixture_command(&main_path, &["init"]);
+        git_fixture_command(&main_path, &["config", "user.name", "OpenBitFun Tests"]);
+        git_fixture_command(
+            &main_path,
+            &["config", "user.email", "openbitfun@example.com"],
+        );
+        std::fs::write(main_path.join("tracked.txt"), "initial\n")
+            .expect("fixture file should be written");
+        git_fixture_command(&main_path, &["add", "tracked.txt"]);
+        git_fixture_command(&main_path, &["commit", "-m", "initial"]);
+        let linked_path = directory.join("linked");
+        git_fixture_command(
+            &main_path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-test",
+                linked_path.to_string_lossy().as_ref(),
+            ],
+        );
+        (main_path, linked_path)
+    }
+
+    /// Compares one persisted/git-rendered worktree path against a host path.
+    ///
+    /// Both sides are canonicalized with `dunce`, which strips a verbatim `\\?\`
+    /// prefix and resolves an 8.3 short name, a directory junction, or a macOS
+    /// `/var` alias to the same real directory. A side that cannot be
+    /// canonicalized falls back to normalized separators (and case on Windows).
+    #[cfg(feature = "git")]
+    fn same_worktree_path(left: &str, right: &Path) -> bool {
+        if let (Ok(left), Ok(right)) = (
+            dunce::canonicalize(Path::new(left)),
+            dunce::canonicalize(right),
+        ) {
+            return left == right;
+        }
+        let left = left.replace('\\', "/");
+        let right = right.to_string_lossy().replace('\\', "/");
+        if cfg!(windows) {
+            left.eq_ignore_ascii_case(&right)
+        } else {
+            left == right
+        }
+    }
+
+    /// 8.3 short alias of an existing directory, straight from the Windows API.
+    /// A volume with 8.3 name creation disabled returns the long path unchanged,
+    /// which callers must treat as "the alias cannot be exercised here" instead
+    /// of inventing one.
+    #[cfg(all(windows, feature = "git"))]
+    fn windows_short_path(path: &Path) -> Option<PathBuf> {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetShortPathNameW(
+                long_path: *const u16,
+                short_path: *mut u16,
+                buffer_length: u32,
+            ) -> u32;
+        }
+
+        let mut long_path: Vec<u16> = path.as_os_str().encode_wide().collect();
+        long_path.push(0);
+        let mut buffer = vec![0u16; 260];
+        loop {
+            let written = unsafe {
+                GetShortPathNameW(long_path.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32)
+            };
+            if written == 0 {
+                return None;
+            }
+            if (written as usize) < buffer.len() {
+                return Some(PathBuf::from(OsString::from_wide(
+                    &buffer[..written as usize],
+                )));
+            }
+            buffer.resize(written as usize + 1, 0);
+        }
+    }
+
+    /// Creates a directory junction through `cmd /C mklink /J`. Junctions need no
+    /// elevation, and a host that cannot create one fails this fixture instead of
+    /// silently leaving the alias behavior unverified.
+    #[cfg(all(windows, feature = "git"))]
+    fn create_directory_junction(link: &Path, target: &Path) {
+        let output = crate::util::create_test_command("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("cmd should be available to create a directory junction");
+        assert!(
+            output.status.success(),
+            "mklink /J '{}' '{}' failed: {}{}",
+            link.display(),
+            target.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[tokio::test]
     async fn assistant_default_names_are_stable_and_custom_names_survive_legacy_migration() {
         use super::super::assistant_naming::{default_name_number, NUMBER, SOURCE};
@@ -4064,72 +4193,9 @@ mod tests {
     #[cfg(feature = "git")]
     #[tokio::test]
     async fn rescan_rereads_changed_worktree_facts_from_disk_and_keeps_the_stable_id() {
-        /// Runs real git through the shared test command, which keeps a GUI-less
-        /// Windows host from flashing a console window.
-        fn git(root: &Path, args: &[&str]) {
-            let output = crate::util::create_test_command("git")
-                .current_dir(root)
-                .args(args)
-                .output()
-                .expect("git should be available for the worktree facts test");
-            assert!(
-                output.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        /// Compares one persisted/git-rendered path against a host path.
-        ///
-        /// On Windows the comparison normalizes separators and case, which is what
-        /// git itself reports, and deliberately does not canonicalize: a canonical
-        /// Windows path gains a `\\?\` prefix, which would make two spellings of the
-        /// same directory compare unequal. On every other host both sides exist at
-        /// this point, so they are canonicalized first — a macOS `temp_dir()` under
-        /// `/var` and its `/private/var` resolution are one directory, and only the
-        /// canonical form says so. A side that cannot be canonicalized falls back to
-        /// the plain normalized comparison.
-        fn same_path(left: &str, right: &Path) -> bool {
-            if !cfg!(windows) {
-                if let (Ok(left), Ok(right)) = (
-                    std::fs::canonicalize(Path::new(left)),
-                    std::fs::canonicalize(right),
-                ) {
-                    return left == right;
-                }
-            }
-            let left = left.replace('\\', "/");
-            let right = right.to_string_lossy().replace('\\', "/");
-            if cfg!(windows) {
-                left.eq_ignore_ascii_case(&right)
-            } else {
-                left == right
-            }
-        }
-
         let env = TestEnvironment::new();
         let repositories = tempfile::tempdir().expect("temporary repositories should be created");
-        let main_path = repositories.path().join("main-repo");
-        std::fs::create_dir_all(&main_path).expect("main repository should be created");
-        git(&main_path, &["init"]);
-        git(&main_path, &["config", "user.name", "OpenBitFun Tests"]);
-        git(&main_path, &["config", "user.email", "openbitfun@example.com"]);
-        std::fs::write(main_path.join("tracked.txt"), "initial\n")
-            .expect("fixture file should be written");
-        git(&main_path, &["add", "tracked.txt"]);
-        git(&main_path, &["commit", "-m", "initial"]);
-        let linked_path = repositories.path().join("linked");
-        git(
-            &main_path,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "linked-test",
-                linked_path.to_string_lossy().as_ref(),
-            ],
-        );
+        let (main_path, linked_path) = main_repository_with_linked_worktree(repositories.path());
 
         let service = build_test_workspace_service(env.path_manager.clone()).await;
         let main = service
@@ -4147,14 +4213,30 @@ mod tests {
         assert!(!tree.is_main, "the linked worktree is not the main workspace");
         assert_eq!(tree.main_workspace_id.as_deref(), Some(main.id.as_str()));
         assert!(
-            same_path(&tree.main_repo_path, &main_path),
+            same_worktree_path(&tree.main_repo_path, &main_path),
             "the linked record points at the main repository: {}",
             tree.main_repo_path
         );
         assert!(
-            same_path(&tree.path, &linked_path),
+            same_worktree_path(&tree.path, &linked_path),
             "the linked record points at its own root: {}",
             tree.path
+        );
+        // The worktree facts above are looked up before the record is built, so the
+        // record root and the topology query must agree on the canonical local root.
+        assert_eq!(
+            main.root_path,
+            canonicalize_local_workspace_root(&main_path)
+                .expect("the main root should canonicalize")
+                .0,
+            "the main record root is the canonical local root"
+        );
+        assert_eq!(
+            linked.root_path,
+            canonicalize_local_workspace_root(&linked_path)
+                .expect("the linked root should canonicalize")
+                .0,
+            "the linked record root is the canonical local worktree root"
         );
 
         // The same record is persisted as a worktree child of the main workspace, so
@@ -4188,7 +4270,7 @@ mod tests {
 
         // Change the fact on disk: the directory is no longer a worktree of the main
         // repository but its own repository, so it is now a main workspace.
-        git(
+        git_fixture_command(
             &main_path,
             &[
                 "worktree",
@@ -4198,7 +4280,7 @@ mod tests {
             ],
         );
         std::fs::create_dir_all(&linked_path).expect("the former link should be recreated");
-        git(&linked_path, &["init"]);
+        git_fixture_command(&linked_path, &["init"]);
 
         let rescanned = service
             .rescan_workspace(&linked.id)
@@ -4215,12 +4297,12 @@ mod tests {
         );
         assert_eq!(tree.main_workspace_id, None, "a main workspace has no parent id");
         assert!(
-            same_path(&tree.main_repo_path, &linked_path),
+            same_worktree_path(&tree.main_repo_path, &linked_path),
             "the refreshed record points at itself: {}",
             tree.main_repo_path
         );
         assert!(
-            same_path(&tree.path, &linked_path),
+            same_worktree_path(&tree.path, &linked_path),
             "the refreshed record still points at its own root: {}",
             tree.path
         );
@@ -4261,6 +4343,325 @@ mod tests {
                 "the refreshed record is the main workspace"
             );
         }
+
+        drop(service);
+    }
+
+    /// A Windows 8.3 short name is one alias of the same local directory, so
+    /// opening it must reuse the stable workspace id, the canonical root, and the
+    /// worktree facts discovered through the long path.
+    ///
+    /// This pins the failure mode the record's own root cannot repair: the first
+    /// worktree lookup happens before `WorkspaceInfo` stores its canonical root,
+    /// so the lookup has to canonicalize the alias itself.
+    ///
+    /// The fixture is ignored by default because a volume with 8.3 name creation
+    /// disabled cannot produce the alias, and a skipped assertion must never read
+    /// as coverage. Run it explicitly with `--ignored`; it then refuses to report
+    /// success unless a real short name was exercised.
+    #[cfg(all(windows, feature = "git"))]
+    #[ignore = "needs a volume that generates Windows 8.3 short names; run with --ignored"]
+    #[tokio::test]
+    async fn windows_short_path_alias_resolves_the_same_worktree_topology() {
+        let env = TestEnvironment::new();
+        let repositories = tempfile::tempdir().expect("temporary repositories should be created");
+        let (main_path, linked_path) = main_repository_with_linked_worktree(repositories.path());
+
+        let service = build_test_workspace_service(env.path_manager.clone()).await;
+        let main = service
+            .open_workspace(main_path.clone())
+            .await
+            .expect("the main repository opens");
+        let linked = service
+            .open_workspace(linked_path.clone())
+            .await
+            .expect("the linked worktree opens through its long path");
+        let linked_facts = linked
+            .worktree
+            .as_ref()
+            .expect("the long path resolves the linked worktree");
+        assert!(!linked_facts.is_main);
+        assert_eq!(
+            linked_facts.main_workspace_id.as_deref(),
+            Some(main.id.as_str())
+        );
+        assert!(same_worktree_path(&linked_facts.path, &linked_path));
+        assert!(same_worktree_path(&linked_facts.main_repo_path, &main_path));
+
+        let long_text = linked_path.to_string_lossy().replace('\\', "/");
+        let short_linked = windows_short_path(&linked_path)
+            .filter(|short| {
+                !short
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .eq_ignore_ascii_case(&long_text)
+            })
+            .expect(
+                "this volume generates no 8.3 short name for the fixture root, so the short-name \
+                 alias is NOT covered here; the fixture never reports success without the alias",
+            );
+
+        let aliased = service
+            .open_workspace(short_linked)
+            .await
+            .expect("the short-name alias opens");
+        assert_eq!(
+            aliased.id, linked.id,
+            "a short-name open reuses the stable workspace id"
+        );
+        assert_eq!(
+            aliased.root_path,
+            canonicalize_local_workspace_root(&linked_path)
+                .expect("the long fixture root canonicalizes")
+                .0,
+            "a short-name open resolves to the same canonical local root"
+        );
+        let aliased_facts = aliased
+            .worktree
+            .as_ref()
+            .expect("the short-name alias discovers the linked worktree");
+        assert!(!aliased_facts.is_main);
+        assert_eq!(
+            aliased_facts.main_workspace_id.as_deref(),
+            Some(main.id.as_str()),
+            "the aliased record keeps its worktree parent"
+        );
+        assert_eq!(aliased_facts.branch, linked_facts.branch);
+        assert!(
+            same_worktree_path(&aliased_facts.path, &linked_path),
+            "the alias resolves to its own root: {}",
+            aliased_facts.path
+        );
+        assert!(
+            same_worktree_path(&aliased_facts.main_repo_path, &main_path),
+            "the alias points at the main repository: {}",
+            aliased_facts.main_repo_path
+        );
+        assert_eq!(
+            service.manager.read().await.get_workspace_count(),
+            2,
+            "the short-name alias must not register a second workspace record"
+        );
+
+        drop(service);
+    }
+
+    /// Directory junctions are host aliases of a real root. Opening a junction to
+    /// the main repository or to the linked worktree must resolve the target's
+    /// canonical root, stable id, and worktree rows instead of treating the alias
+    /// as an unrelated directory, including after the records were persisted and
+    /// reloaded by a later run.
+    ///
+    /// What this does NOT assert: junction targets outside this temporary fixture,
+    /// or a host where the alias cannot be created. `mklink /J` needs no elevation;
+    /// a host where it fails fails the fixture loudly, so this alias contract is
+    /// never silently dropped.
+    #[cfg(all(windows, feature = "git"))]
+    #[tokio::test]
+    async fn windows_junction_alias_resolves_the_same_worktree_topology() {
+        let env = TestEnvironment::new();
+        let repositories = tempfile::tempdir().expect("temporary repositories should be created");
+        let (main_path, linked_path) = main_repository_with_linked_worktree(repositories.path());
+        let main_junction = repositories.path().join("main-junction");
+        let linked_junction = repositories.path().join("linked-junction");
+        create_directory_junction(&main_junction, &main_path);
+        create_directory_junction(&linked_junction, &linked_path);
+
+        let service = build_test_workspace_service(env.path_manager.clone()).await;
+        let main = service
+            .open_workspace(main_path.clone())
+            .await
+            .expect("the main repository opens");
+        let linked = service
+            .open_workspace(linked_path.clone())
+            .await
+            .expect("the linked worktree opens");
+
+        let main_via_junction = service
+            .open_workspace(main_junction.clone())
+            .await
+            .expect("the main repository opens through a junction");
+        assert_eq!(
+            main_via_junction.id, main.id,
+            "a junction reuses the target workspace id"
+        );
+        assert_eq!(
+            main_via_junction.root_path,
+            canonicalize_local_workspace_root(&main_path)
+                .expect("the main root canonicalizes")
+                .0,
+            "a junction resolves to the target's canonical root"
+        );
+        let main_facts = main_via_junction
+            .worktree
+            .as_ref()
+            .expect("the junction open discovers the main repository's worktree facts");
+        assert!(main_facts.is_main, "the junction open is the main worktree");
+        assert_eq!(main_facts.main_workspace_id, None);
+        assert!(
+            same_worktree_path(&main_facts.path, &main_path),
+            "the junction resolves to the main root: {}",
+            main_facts.path
+        );
+        assert!(
+            same_worktree_path(&main_facts.main_repo_path, &main_path),
+            "the main worktree points at itself: {}",
+            main_facts.main_repo_path
+        );
+
+        let linked_via_junction = service
+            .open_workspace(linked_junction.clone())
+            .await
+            .expect("the linked worktree opens through a junction");
+        assert_eq!(
+            linked_via_junction.id, linked.id,
+            "a junction reuses the linked workspace id"
+        );
+        assert_eq!(
+            linked_via_junction.root_path,
+            canonicalize_local_workspace_root(&linked_path)
+                .expect("the linked root canonicalizes")
+                .0,
+            "a junction resolves to the linked root's canonical target"
+        );
+        let linked_facts = linked_via_junction
+            .worktree
+            .as_ref()
+            .expect("the junction open discovers the linked worktree");
+        assert!(!linked_facts.is_main);
+        assert_eq!(
+            linked_facts.main_workspace_id.as_deref(),
+            Some(main.id.as_str()),
+            "the junction open keeps the linked worktree's parent"
+        );
+        assert!(
+            same_worktree_path(&linked_facts.path, &linked_path),
+            "the junction resolves to the linked root: {}",
+            linked_facts.path
+        );
+        assert!(
+            same_worktree_path(&linked_facts.main_repo_path, &main_path),
+            "the junction points at the main repository: {}",
+            linked_facts.main_repo_path
+        );
+
+        let saved: WorkspacePersistenceData = service
+            .persistence
+            .load_json("workspace_data")
+            .await
+            .expect("the workspace registry stays readable")
+            .expect("the registry exists after opening");
+        assert_eq!(
+            saved.workspaces.len(),
+            2,
+            "junction aliases must not persist extra workspace records"
+        );
+
+        drop(service);
+
+        // A later run only has the persisted records, so the alias must still
+        // select them instead of registering the target a second time.
+        let restored = build_test_workspace_service(env.path_manager.clone()).await;
+        restored
+            .load_workspace_history_only()
+            .await
+            .expect("the persisted registry reloads");
+        let persisted_linked = restored
+            .open_workspace(linked_junction)
+            .await
+            .expect("the persisted linked record opens through a junction");
+        assert_eq!(
+            persisted_linked.id, linked.id,
+            "a reloaded record is still the one a junction selects"
+        );
+        assert_eq!(persisted_linked.root_path, linked.root_path);
+        assert_eq!(
+            persisted_linked
+                .worktree
+                .as_ref()
+                .and_then(|facts| facts.main_workspace_id.clone()),
+            Some(main.id.clone()),
+            "the reloaded record still resolves its worktree parent through the alias"
+        );
+        assert_eq!(
+            restored.manager.read().await.get_workspace_count(),
+            2,
+            "a persisted root stays one record when reopened through an alias"
+        );
+
+        drop(restored);
+    }
+
+    /// What git records for a worktree can itself be an alias: when the real
+    /// directory moves and its recorded path is re-exposed through a junction,
+    /// git keeps printing the alias spelling. Opening the *real* directory then
+    /// has no row that matches by spelling, so the lookup has to canonicalize
+    /// the row as well as the query root; otherwise that workspace opens
+    /// without worktree facts while the alias path still resolves.
+    #[cfg(all(windows, feature = "git"))]
+    #[tokio::test]
+    async fn windows_junction_on_a_recorded_worktree_path_canonicalizes_the_row() {
+        let env = TestEnvironment::new();
+        let repositories = tempfile::tempdir().expect("temporary repositories should be created");
+        let (main_path, recorded_linked_path) =
+            main_repository_with_linked_worktree(repositories.path());
+        let moved_linked_path = repositories.path().join("linked-worktree-moved");
+        std::fs::rename(&recorded_linked_path, &moved_linked_path)
+            .expect("the linked worktree should move");
+        create_directory_junction(&recorded_linked_path, &moved_linked_path);
+
+        let service = build_test_workspace_service(env.path_manager.clone()).await;
+        let main = service
+            .open_workspace(main_path.clone())
+            .await
+            .expect("the main repository opens");
+        // The real directory is queried, while git's row carries the alias.
+        let moved = service
+            .open_workspace(moved_linked_path.clone())
+            .await
+            .expect("the moved worktree opens at its real directory");
+        let facts = moved
+            .worktree
+            .as_ref()
+            .expect("the real directory still resolves git's alias-spelled row");
+        assert!(!facts.is_main);
+        assert_eq!(
+            facts.main_workspace_id.as_deref(),
+            Some(main.id.as_str()),
+            "the real directory keeps the linked worktree's parent"
+        );
+        assert!(
+            same_worktree_path(&facts.path, &moved_linked_path),
+            "git's recorded row resolves to the real worktree: {}",
+            facts.path
+        );
+        assert!(
+            same_worktree_path(&facts.main_repo_path, &main_path),
+            "git's recorded row points at the main repository: {}",
+            facts.main_repo_path
+        );
+        assert_eq!(
+            moved.root_path,
+            canonicalize_local_workspace_root(&moved_linked_path)
+                .expect("the moved root canonicalizes")
+                .0,
+            "the record root is the real directory"
+        );
+
+        // The alias spelling is the same workspace, not a second one.
+        let recorded = service
+            .open_workspace(recorded_linked_path.clone())
+            .await
+            .expect("the worktree opens at git's recorded alias path");
+        assert_eq!(
+            recorded.id, moved.id,
+            "the recorded alias and the real directory are one workspace"
+        );
+        assert_eq!(
+            service.manager.read().await.get_workspace_count(),
+            2,
+            "the alias never registers a second record"
+        );
 
         drop(service);
     }

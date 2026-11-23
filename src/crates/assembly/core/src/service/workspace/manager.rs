@@ -7,6 +7,8 @@ pub use super::types::{
 #[cfg(feature = "git")]
 use super::worktree_topology::global_worktree_topology_service;
 use super::WorktreeTopologyFreshness;
+#[cfg(feature = "git")]
+use crate::service::git::GitWorktreeInfo;
 use crate::util::{errors::*, FrontMatterMarkdown};
 use log::{info, warn};
 pub use openbitfun_runtime_ports::RelatedPath;
@@ -321,6 +323,38 @@ pub trait WorkspaceInfoRuntimeExt: Sized {
     fn get_summary(&self) -> WorkspaceSummary;
 }
 
+/// Selects the worktree row that describes `canonical_root`.
+///
+/// The exact spelling wins: that row is the one git printed for the queried
+/// root, so it can never be confused with a different worktree. Only when no
+/// row matches by spelling are the rows canonicalized, and then a single match
+/// is required. Two rows that resolve to the same directory cannot be told
+/// apart, and guessing would attribute another worktree's branch and parent to
+/// this root, so the ambiguity resolves to "no worktree facts" instead.
+#[cfg(feature = "git")]
+fn select_worktree_row<'a>(
+    worktrees: &'a [GitWorktreeInfo],
+    canonical_root: &Path,
+    normalized_root: &str,
+) -> Option<&'a GitWorktreeInfo> {
+    let mut exact = worktrees
+        .iter()
+        .filter(|worktree| worktree.path == normalized_root);
+    match (exact.next(), exact.next()) {
+        (Some(worktree), None) => return Some(worktree),
+        (Some(_), Some(_)) => return None,
+        (None, _) => {}
+    }
+
+    let mut matching = worktrees.iter().filter(|worktree| {
+        dunce::canonicalize(&worktree.path).is_ok_and(|row_root| row_root == canonical_root)
+    });
+    match (matching.next(), matching.next()) {
+        (Some(worktree), None) => Some(worktree),
+        _ => None,
+    }
+}
+
 #[async_trait::async_trait]
 impl WorkspaceInfoRuntimeExt for WorkspaceInfo {
     /// Creates a new workspace record.
@@ -522,9 +556,23 @@ impl WorkspaceInfoRuntimeExt for WorkspaceInfo {
 
         #[cfg(feature = "git")]
         {
-            let normalized_workspace_path = workspace_root.to_string_lossy().replace('\\', "/");
+            // Query and compare through the same canonical local root that
+            // `new_inner` records as `root_path`. Git reports the path a
+            // worktree was registered with, so an alias of the same directory -
+            // a Windows 8.3 short name, a directory junction, or another link -
+            // would otherwise neither query nor match its own row and the
+            // workspace would open without worktree facts. An unresolvable root
+            // keeps the existing "no worktree facts" outcome; the caller still
+            // reports its own open error.
+            let canonical_workspace_root =
+                match canonicalize_local_workspace_root(workspace_root) {
+                    Ok((canonical, _stable)) => canonical,
+                    Err(_) => return None,
+                };
+            let normalized_workspace_path =
+                canonical_workspace_root.to_string_lossy().replace('\\', "/");
             let worktrees = match global_worktree_topology_service()
-                .list_worktrees(workspace_root, freshness)
+                .list_worktrees(&canonical_workspace_root, freshness)
                 .await
             {
                 Ok(worktrees) => worktrees,
@@ -536,16 +584,18 @@ impl WorkspaceInfoRuntimeExt for WorkspaceInfo {
                 .find(|worktree| worktree.is_main)
                 .map(|worktree| worktree.path.clone())?;
 
-            worktrees
-                .into_iter()
-                .find(|worktree| worktree.path == normalized_workspace_path)
-                .map(|worktree| WorkspaceWorktreeInfo {
-                    main_workspace_id: None,
-                    path: worktree.path,
-                    branch: worktree.branch,
-                    main_repo_path: main_repo_path.clone(),
-                    is_main: worktree.is_main,
-                })
+            select_worktree_row(
+                &worktrees,
+                &canonical_workspace_root,
+                &normalized_workspace_path,
+            )
+            .map(|worktree| WorkspaceWorktreeInfo {
+                main_workspace_id: None,
+                path: worktree.path.clone(),
+                branch: worktree.branch.clone(),
+                main_repo_path: main_repo_path.clone(),
+                is_main: worktree.is_main,
+            })
         }
     }
 
@@ -1985,6 +2035,85 @@ mod tests {
             assert_eq!(rebound.id, original.id);
             assert_eq!(rebound.remote_ssh_connection_id(), Some(connection_id));
         }
+    }
+
+    /// One git worktree row, as `git worktree list --porcelain` reports it.
+    #[cfg(feature = "git")]
+    fn worktree_row(path: &str) -> crate::service::git::GitWorktreeInfo {
+        crate::service::git::GitWorktreeInfo {
+            path: path.to_string(),
+            branch: None,
+            head: String::new(),
+            is_main: false,
+            is_locked: false,
+            is_prunable: false,
+        }
+    }
+
+    /// Rows that spell one directory differently but resolve to the same real
+    /// root, plus the canonical root and its normalized spelling to select with.
+    #[cfg(feature = "git")]
+    fn alias_rows() -> (tempfile::TempDir, std::path::PathBuf, String, String) {
+        let directory = tempfile::tempdir().expect("temporary root should be created");
+        let canonical = dunce::canonicalize(directory.path()).expect("root should canonicalize");
+        let normalized = canonical.to_string_lossy().replace('\\', "/");
+        let alias = format!("{}/.", canonical.display());
+        (directory, canonical, normalized, alias)
+    }
+
+    /// The spelling git printed for the queried root is authoritative, so an
+    /// earlier row that only resolves to the same directory must not win.
+    #[cfg(feature = "git")]
+    #[test]
+    fn worktree_row_selection_prefers_the_exact_spelling_over_an_alias() {
+        let (_directory, canonical, normalized, alias) = alias_rows();
+        let rows = vec![worktree_row(&alias), worktree_row(&normalized)];
+
+        let selected = super::select_worktree_row(&rows, &canonical, &normalized)
+            .expect("the exact row is selected");
+        assert_eq!(selected.path, normalized);
+    }
+
+    /// Without an exact spelling a single canonical match is enough, and a row
+    /// whose path no longer resolves is never a false positive.
+    #[cfg(feature = "git")]
+    #[test]
+    fn worktree_row_selection_requires_a_single_canonical_match() {
+        let (_directory, canonical, normalized, alias) = alias_rows();
+        let missing = canonical.join("removed-worktree");
+        let rows = vec![
+            worktree_row(&missing.to_string_lossy().replace('\\', "/")),
+            worktree_row(&alias),
+        ];
+
+        let selected = super::select_worktree_row(&rows, &canonical, &normalized)
+            .expect("the single canonical match is selected");
+        assert_eq!(selected.path, alias);
+    }
+
+    /// Two rows that cannot be told apart by path must not be resolved by
+    /// guessing, whether they collide as spellings or as canonical roots.
+    #[cfg(feature = "git")]
+    #[test]
+    fn worktree_row_selection_refuses_ambiguous_rows() {
+        let (_directory, canonical, normalized, alias) = alias_rows();
+        let duplicate_exact = vec![worktree_row(&normalized), worktree_row(&normalized)];
+        assert!(
+            super::select_worktree_row(&duplicate_exact, &canonical, &normalized).is_none(),
+            "duplicate exact rows are ambiguous"
+        );
+
+        let duplicate_alias = vec![worktree_row(&alias), worktree_row(&format!("{alias}/"))];
+        assert!(
+            super::select_worktree_row(&duplicate_alias, &canonical, &normalized).is_none(),
+            "two rows resolving to one root are ambiguous"
+        );
+
+        let unrelated = vec![worktree_row(&format!("{normalized}-other"))];
+        assert!(
+            super::select_worktree_row(&unrelated, &canonical, &normalized).is_none(),
+            "an unrelated row never matches"
+        );
     }
 
     #[test]
