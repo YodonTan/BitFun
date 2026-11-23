@@ -616,6 +616,7 @@ mod compiled {
     use crate::infrastructure::PathManager;
     use crate::service::workspace_intelligence::catalog_readonly::{
         self, PersistedCatalog, PersistedCatalogEntry, PersistedCatalogUnsupported,
+        PersistedWorkspace,
     };
     use crate::service::workspace_intelligence::host_binding::{
         self, BindingState, ExecutionBinding, LOCAL_EXECUTION_DOMAIN,
@@ -623,7 +624,7 @@ mod compiled {
     use crate::service::workspace_intelligence::host_standby::{
         StandbyWorker, STANDBY_BASE_DELAY, STANDBY_MAX_DELAY,
     };
-    use crate::service::workspace_intelligence::policy::CONTROL_SCHEMA_VERSION;
+    use crate::service::workspace_intelligence::policy::{ControlPolicyView, CONTROL_SCHEMA_VERSION};
     use crate::service::workspace_intelligence::scope::{
         HostExecutionDomainKey, WorkspaceControlScope,
     };
@@ -714,6 +715,43 @@ mod compiled {
                 drain_budget: DRAIN_BUDGET,
             }
         }
+    }
+
+    /// One read-only observation for the future confirmed preparation owner.
+    /// No `Debug`: the observations carry private identity, paths and raw policy.
+    #[allow(dead_code, reason = "only the future confirmed enable owner consumes these facts")]
+    pub(super) enum InitialEnableAdmission {
+        NeedsAnchor {
+            workspace: PersistedWorkspace,
+        },
+        Anchored {
+            scope: WorkspaceControlScope,
+            binding: ExecutionBinding,
+            control: InitialEnableControl,
+        },
+    }
+
+    #[allow(dead_code, reason = "only the future confirmed enable owner consumes this snapshot")]
+    pub(super) enum InitialEnableControl {
+        Absent,
+        Disabled {
+            generation: u64,
+            raw_policy: Option<serde_json::Value>,
+        },
+    }
+
+    /// Only typed reasons leave the admission check, never the underlying errors.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum InitialEnableRefusal {
+        Stopping,
+        Host(WorkspaceIntelligenceHostReason),
+        WorkspaceNotFound,
+        UnsupportedScope(WorkspaceIntelligenceHostUnsupportedScope),
+        UnrenderableWorktreeMainPath,
+        AnchorChanged,
+        AlreadyEnabled,
+        ControlSchemaUnsupported,
+        ControlPolicyUnreadable,
     }
 
     /// Validated storage-namespace tenancy of this host.
@@ -991,6 +1029,127 @@ mod compiled {
         /// one the host's own profile owns.
         async fn read_catalog(&self) -> Result<PersistedCatalog, catalog_readonly::CatalogReadError> {
             catalog_readonly::read_persisted_catalog(&self.paths).await
+        }
+
+        async fn check_initial_enable_gate(&self) -> Result<(), InitialEnableRefusal> {
+            let book = self.book.lock().await;
+            if self.shutdown_requested()
+                || matches!(
+                    book.state,
+                    WorkspaceIntelligenceHostState::Draining
+                        | WorkspaceIntelligenceHostState::Stopped
+                )
+            {
+                return Err(InitialEnableRefusal::Stopping);
+            }
+            // Bootstrap records the exhaustive profile gate in `fatal`. The only
+            // exception is a supported host that started with no records: that
+            // is exactly where first-enable preflight must be possible.
+            match (book.state, book.fatal) {
+                // A supported host that started with no records is exactly the
+                // first-enable shape, so it may preflight.
+                (
+                    WorkspaceIntelligenceHostState::Inactive,
+                    Some(WorkspaceIntelligenceHostReason::NoRecords),
+                )
+                | (_, None) => Ok(()),
+                (_, Some(reason)) => Err(InitialEnableRefusal::Host(reason)),
+            }
+        }
+
+        async fn observe_initial_enable(
+            &self,
+            workspace_id: &str,
+        ) -> Result<InitialEnableAdmission, InitialEnableRefusal> {
+            use InitialEnableRefusal as Refusal;
+            use WorkspaceIntelligenceHostReason as Reason;
+
+            let catalog = self
+                .read_catalog()
+                .await
+                .map_err(|_| Refusal::Host(Reason::CatalogUnreadable))?;
+            let workspace = match catalog.entries().iter().find(|(id, _)| id == workspace_id) {
+                Some((_, PersistedCatalogEntry::Eligible(workspace))) => workspace,
+                Some((_, PersistedCatalogEntry::Unsupported(reason))) => {
+                    return Err(Refusal::UnsupportedScope(unscoped_unsupported(*reason)));
+                }
+                None => return Err(Refusal::WorkspaceNotFound),
+            };
+            // The legacy reader projects an unrenderable main path as absent for
+            // startup comparison. Do not use that lossy fact for a new binding.
+            if workspace.worktree_is_main().is_some() && workspace.main_repo_path().is_none() {
+                return Err(Refusal::UnrenderableWorktreeMainPath);
+            }
+
+            let anchor = HostAnchorStore::new(anchor_root(&self.paths))
+                .read_strict()
+                .await
+                .map_err(|_| Refusal::Host(Reason::AnchorUnreadable))?;
+            let host = match anchor {
+                HostAnchorState::Absent => {
+                    if self.tenancy.is_some() {
+                        return Err(Refusal::AnchorChanged);
+                    }
+                    if !control_directory_is_vacant(&self.paths).await {
+                        return Err(Refusal::Host(Reason::AnchorMissingWithRecords));
+                    }
+                    return Ok(InitialEnableAdmission::NeedsAnchor {
+                        workspace: workspace.clone(),
+                    });
+                }
+                HostAnchorState::Present(anchor) => {
+                    HostExecutionDomainKey::new(anchor.host_id(), LOCAL_EXECUTION_DOMAIN)
+                        .expect("a validated anchor id is never blank")
+                }
+            };
+            if self.tenancy.as_ref().is_some_and(|tenancy| tenancy.host != host) {
+                return Err(Refusal::AnchorChanged);
+            }
+            // Observing a valid anchor does not adopt it into the running host.
+            let scope = WorkspaceControlScope::new(&host, workspace.id())
+                .expect("an eligible workspace id is never blank");
+            // `as_str` renders the storage key; it is not a borrow of the scope.
+            let scope_key = scope.as_str();
+            let binding = ExecutionBinding::observed(host.host_id(), workspace);
+            let record = self
+                .control
+                .read(&scope_key)
+                .await
+                .map_err(|error| match error {
+                    WorkspaceIntelligenceStoreError::UnsupportedSchemaVersion { .. } => {
+                        Refusal::ControlSchemaUnsupported
+                    }
+                    _ => Refusal::Host(Reason::ControlUnreadable),
+                })?;
+            let control = match record {
+                None => InitialEnableControl::Absent,
+                Some(record) => {
+                    if record.enabled == Some(true) {
+                        return Err(Refusal::AlreadyEnabled);
+                    }
+                    match host_binding::classify(record.policy.as_ref()) {
+                        BindingState::Absent => {}
+                        BindingState::Present(stored) if stored.matches(&binding) => {}
+                        BindingState::Present(_) => {
+                            return Err(Refusal::Host(Reason::BindingChanged))
+                        }
+                        BindingState::Malformed => {
+                            return Err(Refusal::Host(Reason::BindingMalformed))
+                        }
+                        BindingState::UnsupportedSchema { .. } => {
+                            return Err(Refusal::Host(Reason::BindingSchemaUnsupported));
+                        }
+                    }
+                    if !ControlPolicyView::read(record.policy.as_ref()).diagnostics().is_empty() {
+                        return Err(Refusal::ControlPolicyUnreadable);
+                    }
+                    InitialEnableControl::Disabled {
+                        generation: record.control_generation,
+                        raw_policy: record.policy,
+                    }
+                }
+            };
+            Ok(InitialEnableAdmission::Anchored { scope, binding, control })
         }
 
         /// One full re-evaluation pass over the persisted facts.
@@ -1864,6 +2023,50 @@ mod compiled {
         }
     }
 
+    /// True when the metadata describes a directory entry that is itself a link.
+    ///
+    /// A Windows junction is a reparse point but not a symlink, so the attribute
+    /// is checked too instead of trusting the file type alone.
+    fn directory_entry_is_linked(metadata: &std::fs::Metadata) -> bool {
+        if metadata.file_type().is_symlink() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A missing anchor only permits preflight if the namespace and control
+    /// directories are observed absent or empty. Do not let a linked or
+    /// unreadable directory masquerade as absent. Every entry is probed, so an
+    /// absent namespace never skips the control check. This stricter probe is
+    /// not used by startup.
+    async fn control_directory_is_vacant(paths: &PathManager) -> bool {
+        let control = paths.workspace_intelligence_control_dir();
+        for path in [anchor_root(paths), control.clone()] {
+            let metadata = match tokio::fs::symlink_metadata(&path).await {
+                Ok(metadata) => metadata,
+                // An absent entry is vacant; the remaining entry is still probed.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return false,
+            };
+            if !metadata.is_dir() || directory_entry_is_linked(&metadata) {
+                return false;
+            }
+        }
+        // An absent control directory is vacant; an unreadable one is not.
+        match tokio::fs::read_dir(&control).await {
+            Ok(mut entries) => matches!(entries.next_entry().await, Ok(None)),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+
     /// Redacted marker of the storage-namespace anchor: a prefix marker only.
     fn redacted_marker(host_id: &str) -> String {
         let suffix = host_id.strip_prefix(HOST_ID_PREFIX).unwrap_or(host_id);
@@ -2020,6 +2223,27 @@ mod compiled {
             Self { core }
         }
 
+        /// Preflight for the sole confirmed initial-enable preparation owner.
+        /// This does not mint, adopt, reserve or authorize anything. Preparation
+        /// must revalidate the live facts and stop state at its own commit gate.
+        #[allow(dead_code, reason = "the confirmed enable preparation owner is not wired yet")]
+        pub(super) async fn initial_enable_admission(
+            &self,
+            workspace_id: &str,
+        ) -> Result<InitialEnableAdmission, InitialEnableRefusal> {
+            self.core.check_initial_enable_gate().await?;
+            let observed = self.core.observe_initial_enable(workspace_id).await;
+            #[cfg(test)]
+            if let Some(pause) = super::pauses::for_user_root_of(
+                &self.core.paths,
+                super::pauses::PausePoint::AfterInitialEnableObservation,
+            ) {
+                pause.wait().await;
+            }
+            self.core.check_initial_enable_gate().await?;
+            observed
+        }
+
         /// Current typed status.
         pub async fn status(&self) -> WorkspaceIntelligenceHostStatus {
             self.core.status().await
@@ -2157,6 +2381,8 @@ mod pauses {
         /// flag under the book lock. Placed immediately before that lock, so any
         /// pre-lock snapshot of the flag is older than a drain started here.
         AtBookLock,
+        /// After initial-enable reads, before checking the owner gate again.
+        AfterInitialEnableObservation,
         /// In the drain loop, between the in-flight check and the wait.
         DrainWait,
     }
@@ -2898,6 +3124,305 @@ mod tests {
                 "the pass must reach the owner claim"
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    mod initial_enable_admission {
+        use super::super::compiled::{
+            InitialEnableAdmission, InitialEnableControl, InitialEnableRefusal,
+        };
+        use super::*;
+        use InitialEnableRefusal as Refusal;
+        use WorkspaceIntelligenceHostReason as Reason;
+        use WorkspaceIntelligenceHostUnsupportedScope as Unsupported;
+
+        const ID: &str = "  persisted:workspace/a  ";
+
+        async fn bootstrap(fixture: &Fixture) -> WorkspaceIntelligenceHost {
+            WorkspaceIntelligenceHost::bootstrap_with_options(
+                Arc::clone(&fixture.paths),
+                source(),
+                WorkspaceIntelligenceHostSurface::Desktop,
+                RuntimeDeployment::Embedded,
+                options(sleeping()),
+            )
+            .await
+        }
+
+        async fn refuse(host: &WorkspaceIntelligenceHost, id: &str, expected: Refusal) {
+            match host.initial_enable_admission(id).await {
+                Ok(_) => panic!("expected admission refusal: {expected:?}"),
+                Err(actual) => assert_eq!(actual, expected),
+            }
+        }
+
+        #[tokio::test]
+        async fn vacant_root_needs_anchor_and_uses_the_live_exact_id() {
+            let fixture = Fixture::new().await;
+            let host = bootstrap(&fixture).await;
+            assert_eq!(host.status().await.reason(), Some(Reason::NoRecords));
+            let empty = fixture.tree_hash();
+            refuse(&host, ID, Refusal::WorkspaceNotFound).await;
+            assert_eq!(fixture.tree_hash(), empty);
+
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let before = fixture.tree_hash();
+            refuse(&host, ID.trim(), Refusal::WorkspaceNotFound).await;
+            let Ok(InitialEnableAdmission::NeedsAnchor { workspace }) =
+                host.initial_enable_admission(ID).await
+            else {
+                panic!("supported host with no records needs an anchor");
+            };
+            assert!(workspace.id() == ID);
+            assert_eq!(fixture.tree_hash(), before);
+            assert!(!fixture.paths.workspace_intelligence_dir().exists());
+            assert!(!host.has_standby_worker_for_tests().await);
+
+            std::fs::create_dir_all(fixture.control_dir()).unwrap();
+            let before = fixture.tree_hash();
+            assert!(matches!(host.initial_enable_admission(ID).await,
+                Ok(InitialEnableAdmission::NeedsAnchor { .. })));
+            assert_eq!(fixture.tree_hash(), before);
+        }
+
+        #[tokio::test]
+        async fn shared_and_unsupported_surfaces_refuse_before_reading_catalog() {
+            use WorkspaceIntelligenceHostSurface as Surface;
+            use WorkspaceIntelligenceHostUnsupportedProfile as Profile;
+            let fixture = Fixture::new().await;
+            std::fs::create_dir_all(fixture.paths.user_data_dir()).unwrap();
+            std::fs::write(fixture.registry_path(), b"invalid catalog").unwrap();
+            let before = fixture.tree_hash();
+            for (surface, deployment, profile) in [
+                (Surface::Desktop, RuntimeDeployment::Shared, Profile::SharedRuntime),
+                (Surface::PeerController, RuntimeDeployment::Embedded, Profile::PeerController),
+                (Surface::DetachedDispatch, RuntimeDeployment::Embedded, Profile::DetachedDispatch),
+                (Surface::ServerStdio, RuntimeDeployment::Embedded, Profile::ServerStdio),
+            ] {
+                let host = WorkspaceIntelligenceHost::bootstrap(
+                    Arc::clone(&fixture.paths), None, surface, deployment,
+                ).await;
+                refuse(&host, ID, Refusal::Host(Reason::ProfileUnsupported(profile))).await;
+            }
+            assert_eq!(fixture.tree_hash(), before);
+        }
+
+        #[tokio::test]
+        async fn an_unreadable_catalog_is_refused_instead_of_reading_as_empty() {
+            let fixture = Fixture::new().await;
+            let host = bootstrap(&fixture).await;
+            std::fs::create_dir_all(fixture.paths.user_data_dir()).unwrap();
+            std::fs::write(fixture.registry_path(), b"invalid catalog").unwrap();
+            let before = fixture.tree_hash();
+            // The catalog is read before any anchor or control probe, and an
+            // unreadable one is not "no such workspace": it never falls through
+            // to a mintable `NeedsAnchor` answer.
+            refuse(&host, ID, Refusal::Host(Reason::CatalogUnreadable)).await;
+            assert_eq!(fixture.tree_hash(), before);
+        }
+
+        #[tokio::test]
+        async fn workspace_kind_and_worktree_refusals_leave_the_tree_untouched() {
+            let fixture = Fixture::new().await;
+            let host = bootstrap(&fixture).await;
+            let mut remote = local_record(&fixture, "remote", "remote-decoy");
+            remote["workspaceKind"] = json!("remote");
+            remote["rootPath"] = json!("/srv/posix/remote");
+            remote["metadata"] = json!({"connectionId": "offline"});
+            let mut assistant = local_record(&fixture, "assistant", "assistant");
+            assistant["workspaceKind"] = json!("assistant");
+            assistant["assistantId"] = json!("helper");
+            let mut legacy = child_record(&fixture, "legacy", "main", "legacy");
+            legacy["worktree"].as_object_mut().unwrap().remove("mainWorkspaceId");
+            let unresolved = child_record(&fixture, "unresolved", "missing", "unresolved");
+            let mut main = main_record(&fixture, "main", "main");
+            main["worktree"]["mainRepoPath"] = json!("relative/main");
+            let mut child = child_record(&fixture, "child", "main", "child");
+            child["worktree"]["mainRepoPath"] = json!("");
+            fixture.publish(vec![remote, assistant, legacy, unresolved, main, child]).await;
+            let before = fixture.tree_hash();
+            for (id, reason) in [
+                ("remote", Unsupported::RemoteScope),
+                ("assistant", Unsupported::AssistantWorkspace),
+                ("legacy", Unsupported::LegacyWorktreeReference),
+                ("unresolved", Unsupported::UnresolvedWorktreeParent),
+            ] {
+                refuse(&host, id, Refusal::UnsupportedScope(reason)).await;
+            }
+            for id in ["main", "child"] {
+                refuse(&host, id, Refusal::UnrenderableWorktreeMainPath).await;
+            }
+            assert_eq!(fixture.tree_hash(), before);
+        }
+
+        #[tokio::test]
+        async fn missing_anchor_never_mints_over_unknown_control_storage() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            std::fs::create_dir_all(fixture.control_dir().parent().unwrap()).unwrap();
+            std::fs::write(fixture.control_dir(), b"not a directory").unwrap();
+            let before = fixture.tree_hash();
+            refuse(&host, ID, Refusal::Host(Reason::AnchorMissingWithRecords)).await;
+            assert_eq!(fixture.tree_hash(), before);
+
+            std::fs::rename(fixture.control_dir(), fixture.dir.path().join("moved")).unwrap();
+            std::fs::create_dir(fixture.control_dir()).unwrap();
+            std::fs::write(fixture.control_dir().join("unknown"), b"keep").unwrap();
+            let before = fixture.tree_hash();
+            refuse(&host, ID, Refusal::Host(Reason::AnchorMissingWithRecords)).await;
+            let restarted = bootstrap(&fixture).await;
+            refuse(&restarted, ID, Refusal::Host(Reason::AnchorMissingWithRecords)).await;
+            assert_eq!(fixture.tree_hash(), before);
+        }
+
+        #[tokio::test]
+        async fn strict_anchor_read_refuses_invalid_loss_or_replacement() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let unanchored = bootstrap(&fixture).await;
+            let host_id = fixture.anchor().await;
+            let anchored = bootstrap(&fixture).await;
+            let path = fixture.paths.workspace_intelligence_dir().join(HOST_ANCHOR_FILE_NAME);
+            let mut replacement: Value = serde_json::from_slice(&fixture.anchor_bytes()).unwrap();
+            std::fs::rename(&path, fixture.dir.path().join("original-anchor")).unwrap();
+            let before = fixture.tree_hash();
+            refuse(&anchored, ID, Refusal::AnchorChanged).await;
+            assert_eq!(fixture.tree_hash(), before);
+
+            let other = if anchor_suffix(&host_id).starts_with('0') { '1' } else { '0' };
+            replacement["anchor"] = json!(other.to_string().repeat(32));
+            std::fs::write(&path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+            let before = fixture.tree_hash();
+            refuse(&anchored, ID, Refusal::AnchorChanged).await;
+            assert_eq!(fixture.tree_hash(), before);
+
+            std::fs::write(&path, b"invalid anchor").unwrap();
+            let before = fixture.tree_hash();
+            refuse(&unanchored, ID, Refusal::Host(Reason::AnchorUnreadable)).await;
+            let invalid_at_boot = bootstrap(&fixture).await;
+            refuse(&invalid_at_boot, ID, Refusal::Host(Reason::AnchorUnreadable)).await;
+            assert_eq!(fixture.tree_hash(), before);
+        }
+
+        #[tokio::test]
+        async fn present_anchor_snapshots_control_without_adopting_or_rewriting() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let host_id = fixture.anchor().await;
+            let scope_key = fixture.scope(&host_id, ID);
+            let before = fixture.tree_hash();
+            let Ok(InitialEnableAdmission::Anchored {
+                scope,
+                binding,
+                control: InitialEnableControl::Absent,
+            }) = host.initial_enable_admission(ID).await
+            else {
+                panic!("a newly observed anchor has no control record");
+            };
+            assert!(scope.as_str() == scope_key);
+            assert!(binding.host_id() == host_id && binding.workspace_id() == ID);
+            assert!(!host.status().await.anchor_present(), "preflight must not adopt tenancy");
+            assert_eq!(fixture.tree_hash(), before);
+
+            let mut policy = Fixture::bound_policy(&binding);
+            policy["domains"]["memory"]["enabled"] = json!(false);
+            policy["future"] = json!({"nested": [true, 1, null]});
+            fixture.seed_control(&scope_key, false, Some(policy.clone())).await;
+            let before = fixture.tree_hash();
+            let Ok(InitialEnableAdmission::Anchored {
+                control: InitialEnableControl::Disabled { generation, raw_policy }, ..
+            }) = host.initial_enable_admission(ID).await else {
+                panic!("a matching disabled record is a usable snapshot");
+            };
+            assert_eq!(generation, 1);
+            assert!(raw_policy.as_ref() == Some(&policy), "the whole raw policy must survive");
+            assert_eq!(fixture.tree_hash(), before);
+
+            // Old records without schema, generation, switch or binding still read as OFF.
+            fixture.overwrite_control_record(br#"{"policy":{"future":[1,2]}}"#);
+            let before = fixture.tree_hash();
+            let Ok(InitialEnableAdmission::Anchored {
+                control: InitialEnableControl::Disabled { generation, raw_policy },
+                ..
+            }) = host.initial_enable_admission(ID).await
+            else {
+                panic!("a record without a schema version still reads as an OFF snapshot");
+            };
+            assert_eq!(generation, 0);
+            assert!(raw_policy.as_ref() == Some(&json!({"future": [1, 2]})));
+            assert_eq!(fixture.tree_hash(), before);
+        }
+
+        #[tokio::test]
+        async fn enabled_and_unusable_control_records_are_refused_without_writes() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host_id = fixture.anchor().await;
+            let scope = fixture.scope(&host_id, ID);
+            fixture.seed_control(&scope, false, None).await;
+            let host = bootstrap(&fixture).await;
+            let mut changed = Fixture::bound_policy(&fixture.binding(&host_id, ID).await);
+            changed["execution_binding"]["workspace_root"] = json!("different");
+            for (record, refusal) in [
+                (json!({"enabled": true}), Refusal::AlreadyEnabled),
+                (
+                    json!({"enabled": "false"}),
+                    Refusal::Host(Reason::ControlUnreadable),
+                ),
+                (
+                    json!({"schema_version": 99}),
+                    Refusal::ControlSchemaUnsupported,
+                ),
+                (
+                    json!({"policy": {"execution_binding": null}}),
+                    Refusal::Host(Reason::BindingMalformed),
+                ),
+                (
+                    json!({"policy": {"execution_binding": {"schema_version": 1}}}),
+                    Refusal::Host(Reason::BindingSchemaUnsupported),
+                ),
+                (json!({"policy": changed}), Refusal::Host(Reason::BindingChanged)),
+                (
+                    json!({"policy": {"approval": {"mode": "unknown"}}}),
+                    Refusal::ControlPolicyUnreadable,
+                ),
+            ] {
+                fixture.overwrite_control_record(&serde_json::to_vec(&record).unwrap());
+                let before = fixture.tree_hash();
+                refuse(&host, ID, refusal).await;
+                assert_eq!(fixture.tree_hash(), before);
+            }
+            fixture.overwrite_control_record(b"{");
+            let before = fixture.tree_hash();
+            refuse(&host, ID, Refusal::Host(Reason::ControlUnreadable)).await;
+            assert_eq!(fixture.tree_hash(), before);
+            assert!(!host.has_standby_worker_for_tests().await);
+        }
+
+        #[tokio::test]
+        async fn shutdown_after_reads_rejects_the_observation_and_stays_closed() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let (pause, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::AfterInitialEnableObservation,
+                pause.clone(),
+            );
+            let before = fixture.tree_hash();
+            let preflight = tokio::spawn({
+                let host = host.clone();
+                async move { host.initial_enable_admission(ID).await }
+            });
+            tokio::time::timeout(DEADLINE, entered.recv()).await.unwrap().unwrap();
+            assert_eq!(host.shutdown().await.state(), WorkspaceIntelligenceHostState::Stopped);
+            pause.release();
+            assert!(matches!(preflight.await.unwrap(), Err(Refusal::Stopping)));
+            refuse(&host, ID, Refusal::Stopping).await;
+            assert_eq!(fixture.tree_hash(), before);
         }
     }
 
