@@ -122,6 +122,14 @@ impl CliTestEnvironment {
         &self.workspace
     }
 
+    /// The user-data root this environment isolates for the child.
+    ///
+    /// A test that must point an owner at the same root the CLI composes reads it here
+    /// instead of rebuilding the environment variable chain itself.
+    pub(crate) fn user_root(&self) -> &Path {
+        &self.user_root
+    }
+
     pub(crate) fn session_metadata_path(&self, session_id: &str) -> PathBuf {
         fn find(dir: &Path, session_id: &str) -> Option<PathBuf> {
             for entry in std::fs::read_dir(dir).ok()? {
