@@ -1124,4 +1124,91 @@ mod tests {
             "draining a build without the host feature writes nothing either"
         );
     }
+    /// A `Shared` refusal leaves the slot `Empty` rather than closing it, so the exit
+    /// path's drain is still the call that decides the slot, and an `Embedded` install
+    /// that arrives after that drain is refused instead of taking a lease the exit path
+    /// already passed.
+    ///
+    /// `Empty` and `Closed` are both "no host installed", so the status alone cannot
+    /// tell them apart: this test reads the slot itself, which is why it lives in the
+    /// module's own test module.
+    #[cfg(feature = "workspace-intelligence-host")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shared_refusal_then_an_empty_drain_then_a_late_embedded_install_is_refused() {
+        use openbitfun_core::service::workspace_intelligence::host_fixture::test_path_manager;
+
+        let _serial = SLOT_TESTS.lock().await;
+        reset_slot_for_tests().await;
+
+        let user_root = tempfile::tempdir().expect("isolated user-data root");
+        let paths = test_path_manager(user_root.path());
+        let namespace = [
+            paths.workspace_intelligence_dir(),
+            paths.workspace_intelligence_control_dir(),
+            paths.workspace_intelligence_cognition_dir(),
+            paths.workspace_intelligence_lease_dir(),
+        ];
+
+        // Shared is decided before the slot is touched: it installs nothing, writes no
+        // workspace intelligence entry, and does not decide the slot either.
+        let refused = install_once(paths.clone(), None, RuntimeDeployment::Shared).await;
+        assert_eq!(refused, DesktopHostSkip::SharedRuntime.code());
+        assert_ne!(
+            refused, NOT_INSTALLED_CODE,
+            "a skip answer is not the empty-drain answer"
+        );
+        assert_ne!(
+            refused, DRAINED_CODE,
+            "a skip answer is not the drained answer"
+        );
+        assert!(
+            matches!(&*super::SLOT.lock().await, super::HostSlot::Empty),
+            "a Shared refusal leaves the slot Empty instead of closing it"
+        );
+        assert_eq!(
+            installed_status_for_tests().await,
+            None,
+            "a refused install leaves no host installed"
+        );
+        for root in &namespace {
+            assert!(
+                !root.exists(),
+                "a refused install creates no workspace intelligence entry: {root:?}"
+            );
+        }
+
+        // The slot is still `Empty`, so this drain is what closes it, and it answers the
+        // empty-slot code rather than a drained one.
+        assert_eq!(drain_once().await, NOT_INSTALLED_CODE);
+
+        // The drain owns the terminal state: the later Embedded install is refused and
+        // bootstraps nothing, so no host and no lease outlive the exit path.
+        assert_eq!(
+            install_once(paths.clone(), None, RuntimeDeployment::Embedded).await,
+            CLOSED_CODE
+        );
+        assert_eq!(
+            installed_status_for_tests().await,
+            None,
+            "the late install leaves no host installed"
+        );
+        assert!(
+            matches!(
+                &*super::SLOT.lock().await,
+                super::HostSlot::Closed { .. }
+            ),
+            "the drain closed the slot and the late install left it closed"
+        );
+        for root in &namespace {
+            assert!(
+                !root.exists(),
+                "neither the drain nor the late install writes a workspace intelligence entry: {root:?}"
+            );
+        }
+        assert_eq!(
+            drain_once().await,
+            NOT_INSTALLED_CODE,
+            "the closed answer is the state, not a single-shot reply"
+        );
+    }
 }
