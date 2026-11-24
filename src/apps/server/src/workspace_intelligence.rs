@@ -219,6 +219,42 @@ mod tests {
         locks
     }
 
+    /// Every file under one root as `(relative path, bytes)`, sorted by path.
+    ///
+    /// `None` means the root itself does not exist, so an absent namespace stays
+    /// distinguishable from an empty one. The walk only reads, and the normalized
+    /// names keep the comparison identical on every platform this test runs on.
+    #[cfg(feature = "workspace-intelligence-host")]
+    fn namespace_bytes(root: &std::path::Path) -> Option<Vec<(String, Vec<u8>)>> {
+        fn collect(
+            base: &std::path::Path,
+            directory: &std::path::Path,
+            files: &mut Vec<(String, Vec<u8>)>,
+        ) {
+            for entry in std::fs::read_dir(directory).expect("a namespace directory is readable") {
+                let path = entry.expect("a namespace entry is readable").path();
+                if path.is_dir() {
+                    collect(base, &path, files);
+                    continue;
+                }
+                let name = path
+                    .strip_prefix(base)
+                    .expect("a namespace entry lives under its root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                files.push((name, std::fs::read(&path).expect("a namespace file is readable")));
+            }
+        }
+
+        if !root.exists() {
+            return None;
+        }
+        let mut files = Vec::new();
+        collect(root, root, &mut files);
+        files.sort();
+        Some(files)
+    }
+
     /// An enabled scope on the loopback surface is admitted and reported, and the
     /// drain releases everything the tenure held.
     ///
@@ -282,6 +318,11 @@ mod tests {
 
     /// A shared runtime owns the workspace, so this app refuses before resolving
     /// anything: no anchor, no control record, no lease and no cognition root.
+    ///
+    /// This test observes that fresh-root refusal alone: it does not take the empty
+    /// slot through the release path and so does not claim to have observed a
+    /// drain. The release of that empty slot is observed in
+    /// `a_shared_refusal_releases_the_empty_slot_and_keeps_existing_bytes`.
     #[cfg(feature = "workspace-intelligence-host")]
     #[tokio::test]
     async fn a_shared_deployment_is_refused_without_touching_the_filesystem() {
@@ -297,6 +338,97 @@ mod tests {
             !paths.workspace_intelligence_dir().exists(),
             "a refusal must create no host namespace entry"
         );
+    }
+
+    /// A `Shared` deployment is refused before anything is read, and the real
+    /// release path answers for that refusal: the empty slot a startup would hold
+    /// releases as `not_installed`, not as a drain state.
+    ///
+    /// The seeded, enabled root is the existing-bytes case a fresh root cannot
+    /// produce: the anchor, the control record and one byte no host owner wrote are
+    /// already on disk when the placement runs, and the same byte map is taken
+    /// before and after, so the refusal and the release are shown to leave every
+    /// existing byte untouched. The map observes writes, not reads: the read-free
+    /// part of the refusal rests on it returning before any reader is named.
+    ///
+    /// No scope state is asserted here. A `Shared` placement accepts no handle, so
+    /// there is no host that could report `active` or `standby`; the codes under
+    /// test are this app's placement refusal and the empty-slot release.
+    #[cfg(feature = "workspace-intelligence-host")]
+    #[tokio::test]
+    async fn a_shared_refusal_releases_the_empty_slot_and_keeps_existing_bytes() {
+        let temp = tempfile::tempdir().expect("create an isolated user-data root");
+        let paths = host_fixture::test_path_manager(&temp.path().join("user"));
+        let workspace_root = temp.path().join("workspace");
+        host_fixture::seed_local_workspace(paths.as_ref(), WORKSPACE_ID, &workspace_root)
+            .await
+            .expect("seed the workspace record");
+        let seeded = host_fixture::enable_workspace(paths.as_ref(), WORKSPACE_ID)
+            .await
+            .expect("enable the seeded workspace");
+        assert_eq!(seeded.workspace_id(), WORKSPACE_ID);
+        // A byte no owner wrote joins the owner-written bytes: a refusal cannot pass
+        // this comparison by rewriting only the names it knows.
+        std::fs::write(
+            paths.workspace_intelligence_dir().join("foreign-note.txt"),
+            b"not written by any host owner",
+        )
+        .expect("write the foreign byte");
+
+        let before = namespace_bytes(&paths.workspace_intelligence_dir())
+            .expect("the enabled root holds the anchor and the control record");
+        assert!(
+            before.iter().any(|(name, _)| name == "host-anchor.json"),
+            "the fixture must publish the anchor before the placement runs"
+        );
+        assert!(
+            before.iter().any(|(name, _)| name.starts_with("control/")),
+            "the fixture must publish the control record before the placement runs"
+        );
+        assert!(!paths.workspace_intelligence_lease_dir().exists());
+        assert!(!paths.workspace_intelligence_cognition_dir().exists());
+
+        // The catalog hint is supplied exactly as `bootstrap` supplies it, and the
+        // refusal is still total: it answers before any reader or hint could be used.
+        let (code, handle) = install(
+            paths.clone(),
+            Some(WorkspaceService::subscribe_catalog_changes()),
+            RuntimeDeployment::Shared,
+        )
+        .await;
+        assert_eq!(code, ServerHostSkip::SharedRuntime.code());
+        assert_eq!(code, "host_skip_shared_runtime");
+        assert!(handle.is_none(), "a refused placement admits no handle");
+        // The placement code and the lifecycle codes share a log field; a refusal
+        // must not read as an emptied tenure.
+        assert_ne!(code, DRAINED_CODE);
+        assert_ne!(code, NOT_INSTALLED_CODE);
+
+        // The real release path runs on the slot `main` takes the handle from.
+        let slot = Mutex::new(handle);
+        assert_eq!(
+            release_admitted_host(&slot).await,
+            NOT_INSTALLED_CODE,
+            "an empty slot releases as not_installed"
+        );
+        assert!(
+            slot.lock().await.is_none(),
+            "the release path leaves the slot it released empty"
+        );
+        assert_eq!(
+            release_admitted_host(&slot).await,
+            NOT_INSTALLED_CODE,
+            "releasing the same empty slot again answers the same code"
+        );
+
+        assert_eq!(
+            namespace_bytes(&paths.workspace_intelligence_dir()),
+            Some(before),
+            "the shared refusal and the release must leave every existing byte untouched"
+        );
+        assert!(workspace_intelligence_lease_files(paths.as_ref()).is_empty());
+        assert!(!paths.workspace_intelligence_lease_dir().exists());
+        assert!(!paths.workspace_intelligence_cognition_dir().exists());
     }
 
     /// The admitted surface is a compile-time fact, not a parameter, so the
@@ -357,6 +489,57 @@ mod tests {
             ServerHostSkip::NotCompiled.code(),
             "a build with no host body has nothing to drain and says so"
         );
+    }
+
+    /// A build without the host body still refuses a `Shared` deployment as
+    /// `Shared`, before its own `NotCompiled` answer, and an empty slot still
+    /// drains as `NotCompiled`.
+    ///
+    /// The deployment screen is deployment screening, not host compilation: a
+    /// composition root that hands this app a shared deployment must hear the
+    /// deployment refusal instead of "the host was not built". The isolated owner
+    /// root is fresh, so the same run also shows this build creates no host root
+    /// and takes no lease.
+    #[cfg(not(feature = "workspace-intelligence-host"))]
+    #[tokio::test]
+    async fn the_feature_off_build_refuses_shared_as_shared_and_drains_none_as_not_compiled() {
+        let temp = tempfile::tempdir().expect("create an isolated user-data root");
+        let service = WorkspaceService::new_isolated_for_tests(temp.path().join("user")).await;
+        let paths = service.path_manager().clone();
+
+        let (code, handle) = install(
+            paths.clone(),
+            Some(WorkspaceService::subscribe_catalog_changes()),
+            RuntimeDeployment::Shared,
+        )
+        .await;
+        assert_eq!(code, ServerHostSkip::SharedRuntime.code());
+        assert_eq!(code, "host_skip_shared_runtime");
+        assert_ne!(
+            code,
+            ServerHostSkip::NotCompiled.code(),
+            "the deployment screen must outrank the absent host body"
+        );
+        assert!(handle.is_none(), "a refused placement admits no handle");
+
+        assert_eq!(
+            drain(None).await,
+            ServerHostSkip::NotCompiled.code(),
+            "an empty slot still answers the code of a build without a host body"
+        );
+
+        for host_root in [
+            paths.workspace_intelligence_dir(),
+            paths.workspace_intelligence_control_dir(),
+            paths.workspace_intelligence_cognition_dir(),
+            paths.workspace_intelligence_lease_dir(),
+        ] {
+            assert!(
+                !host_root.exists(),
+                "a shared refusal must create no host root: {host_root:?}"
+            );
+        }
+        assert!(workspace_intelligence_lease_files(paths.as_ref()).is_empty());
     }
 
     /// A workspace the owner opened but never enabled leaves no host state behind.
