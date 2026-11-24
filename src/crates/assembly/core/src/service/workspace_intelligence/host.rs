@@ -9403,4 +9403,449 @@ mod tests {
         // `Committed` needs owner results a fixture must not fabricate; the
         // exhaustive match above already pins both variant names at compile time.
     }
+
+    /// WP1.4 exit evidence for the delivery gate: every bootstrap of the 12 x 2
+    /// profile matrix, the two first-enable entry points and the stop state.
+    ///
+    /// The 20 refused pairs must refuse before reading a persisted fact and keep
+    /// their typed `ProfileUnsupported` reason; the four admitted pairs must be
+    /// `Inactive`/`NoRecords` on a vacant root. Every pair gets its own temporary
+    /// user root, and nothing here adds a production seam or sleeps: the hosts are
+    /// driven by `bootstrap`, by the explicit first-enable entry points and by
+    /// `shutdown`, each of which completes without a fallback tick.
+    mod delivery_gate_exits {
+        use super::super::compiled::{InitialEnableAdmission, InitialEnableRefusal};
+        use super::super::WorkspaceIntelligenceHostCounts;
+        use super::*;
+        use InitialEnableRefusal as Refusal;
+        use WorkspaceIntelligenceHostReason as Reason;
+        use WorkspaceIntelligenceHostSurface as Surface;
+        use WorkspaceIntelligenceHostUnsupportedProfile as Unsupported;
+
+        const ID: &str = "persisted:workspace/gate";
+
+        /// The four pairs the delivery gate admits: an embedded runtime on the
+        /// desktop, interactive CLI, execution CLI or loopback server surface.
+        const ADMITTED: [(Surface, RuntimeDeployment); 4] = [
+            (Surface::Desktop, RuntimeDeployment::Embedded),
+            (Surface::CliInteractive, RuntimeDeployment::Embedded),
+            (Surface::CliExecution, RuntimeDeployment::Embedded),
+            (Surface::ServerLoopback, RuntimeDeployment::Embedded),
+        ];
+
+        /// Every refused pair and the exact typed profile the gate owes it.
+        const REFUSED: [(Surface, RuntimeDeployment, Unsupported); 20] = [
+            (Surface::Desktop, RuntimeDeployment::Shared, Unsupported::SharedRuntime),
+            (Surface::CliInteractive, RuntimeDeployment::Shared, Unsupported::SharedRuntime),
+            (Surface::CliExecution, RuntimeDeployment::Shared, Unsupported::SharedRuntime),
+            (Surface::ServerLoopback, RuntimeDeployment::Shared, Unsupported::SharedRuntime),
+            (Surface::ServerStdio, RuntimeDeployment::Embedded, Unsupported::ServerStdio),
+            (Surface::ServerStdio, RuntimeDeployment::Shared, Unsupported::ServerStdio),
+            (Surface::Daemon, RuntimeDeployment::Embedded, Unsupported::Daemon),
+            (Surface::Daemon, RuntimeDeployment::Shared, Unsupported::Daemon),
+            (
+                Surface::DetachedDispatch,
+                RuntimeDeployment::Embedded,
+                Unsupported::DetachedDispatch,
+            ),
+            (
+                Surface::DetachedDispatch,
+                RuntimeDeployment::Shared,
+                Unsupported::DetachedDispatch,
+            ),
+            (Surface::Management, RuntimeDeployment::Embedded, Unsupported::Management),
+            (Surface::Management, RuntimeDeployment::Shared, Unsupported::Management),
+            (Surface::SharedRuntime, RuntimeDeployment::Embedded, Unsupported::SharedRuntime),
+            (Surface::SharedRuntime, RuntimeDeployment::Shared, Unsupported::SharedRuntime),
+            (Surface::Acp, RuntimeDeployment::Embedded, Unsupported::Acp),
+            (Surface::Acp, RuntimeDeployment::Shared, Unsupported::Acp),
+            (Surface::SdkHostApp, RuntimeDeployment::Embedded, Unsupported::SdkHostApp),
+            (Surface::SdkHostApp, RuntimeDeployment::Shared, Unsupported::SdkHostApp),
+            (Surface::PeerController, RuntimeDeployment::Embedded, Unsupported::PeerController),
+            (Surface::PeerController, RuntimeDeployment::Shared, Unsupported::PeerController),
+        ];
+
+        async fn bootstrap(
+            fixture: &Fixture,
+            surface: Surface,
+            deployment: RuntimeDeployment,
+        ) -> WorkspaceIntelligenceHost {
+            WorkspaceIntelligenceHost::bootstrap_with_options(
+                Arc::clone(&fixture.paths),
+                source(),
+                surface,
+                deployment,
+                options(sleeping()),
+            )
+            .await
+        }
+
+        /// The internal reads that must stay at zero for a host that started
+        /// nothing: no worker, no pass in flight, no queued preparation, no owner
+        /// tenure, no lease root, no cognition partition and no cognition database.
+        async fn assert_started_nothing(host: &WorkspaceIntelligenceHost, fixture: &Fixture) {
+            assert!(!host.has_standby_worker_for_tests().await, "no standby worker");
+            assert_eq!(host.in_flight_for_tests().await, 0, "no pass in flight");
+            assert_eq!(
+                host.live_initial_enable_pendings_for_tests().await,
+                0,
+                "no queued initial-enable preparation"
+            );
+            assert!(fixture.lock_files().is_empty(), "no owner tenure");
+            assert!(!fixture.lease_root_exists(), "no lease root");
+            assert!(!fixture.cognition_dir().exists(), "no cognition root");
+            assert!(fixture.sqlite_files().is_empty(), "no cognition database");
+        }
+
+        /// The anchor document is the host identity: a bootstrap may read it but
+        /// never mints, repairs or replaces it.
+        fn anchor_entries(fixture: &Fixture) -> Vec<String> {
+            let mut names: Vec<String> = match std::fs::read_dir(
+                WorkspaceIntelligenceHost::anchor_root_for_tests(&fixture.paths),
+            ) {
+                Ok(entries) => entries
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            names.sort();
+            names
+        }
+
+        async fn assert_drained_to_stopped(host: &WorkspaceIntelligenceHost, pair: &str) {
+            let first = host.shutdown().await;
+            assert_eq!(first.drain(), WorkspaceIntelligenceHostDrain::Drained, "{pair}");
+            assert_eq!(first.state(), WorkspaceIntelligenceHostState::Stopped, "{pair}");
+            let second = host.shutdown().await;
+            assert_eq!(second.drain(), WorkspaceIntelligenceHostDrain::Drained, "{pair}");
+            assert_eq!(second.state(), WorkspaceIntelligenceHostState::Stopped, "{pair}");
+        }
+
+        async fn assert_stopping_for_both_entries(host: &WorkspaceIntelligenceHost, pair: &str) {
+            assert_eq!(
+                host.initial_enable_admission(ID).await.err(),
+                Some(Refusal::Stopping),
+                "admission after the stop: {pair}"
+            );
+            assert_eq!(
+                host.prepare_initial_enable(ID).await.err(),
+                Some(Refusal::Stopping),
+                "preparation after the stop: {pair}"
+            );
+        }
+
+        /// Every refused pair refuses before any persisted read.
+        ///
+        /// The fixture makes both possible reads fail loudly: the registry bytes are
+        /// undecodable and so is the anchor document, and the control root already
+        /// holds a foreign file. A host that read any of them would answer
+        /// `CatalogUnreadable`, `AnchorUnreadable` or a control reason; the unchanged
+        /// profile refusal proves the gate ran first. Afterwards the typed refusal has
+        /// to survive the first-enable entry points and the stop state.
+        #[tokio::test]
+        async fn refused_pairs_refuse_before_reading_and_stay_typed_through_shutdown() {
+            for (surface, deployment, profile) in REFUSED {
+                let pair = format!("{surface:?}/{deployment:?}");
+                let fixture = Fixture::new().await;
+                std::fs::create_dir_all(fixture.paths.user_data_dir()).unwrap();
+                std::fs::write(fixture.registry_path(), b"not a registry").unwrap();
+                let anchor_root = WorkspaceIntelligenceHost::anchor_root_for_tests(&fixture.paths);
+                std::fs::create_dir_all(&anchor_root).unwrap();
+                let anchor_path = anchor_root.join(HOST_ANCHOR_FILE_NAME);
+                std::fs::write(&anchor_path, b"not an anchor").unwrap();
+                std::fs::create_dir_all(fixture.control_dir()).unwrap();
+                let foreign = fixture.control_dir().join("foreign.keep");
+                std::fs::write(&foreign, b"foreign control residue").unwrap();
+                let before = fixture.tree_hash();
+
+                let host = bootstrap(&fixture, surface, deployment).await;
+                let status = host.status().await;
+                assert_eq!(status.state(), WorkspaceIntelligenceHostState::Unavailable, "{pair}");
+                assert_eq!(status.reason(), Some(Reason::ProfileUnsupported(profile)), "{pair}");
+                assert_eq!(status.reason().unwrap().code(), profile.code(), "{pair}");
+                assert!(!status.anchor_present(), "{pair}");
+                assert_eq!(status.host_marker(), None, "{pair}");
+                assert_eq!(status.counts(), WorkspaceIntelligenceHostCounts::default(), "{pair}");
+                assert!(status.scopes().is_empty(), "{pair}");
+
+                // Both first-enable entry points see the same typed refusal, and an
+                // explicit pass cannot rebuild the book: no anchor is ever attached,
+                // so the profile fatal stays exactly as bootstrap recorded it.
+                let refused = Refusal::Host(Reason::ProfileUnsupported(profile));
+                assert_eq!(host.initial_enable_admission(ID).await.err(), Some(refused), "{pair}");
+                assert_eq!(host.prepare_initial_enable(ID).await.err(), Some(refused), "{pair}");
+                host.evaluate_for_tests().await;
+                let after_pass = host.status().await;
+                assert_eq!(
+                    after_pass.state(),
+                    WorkspaceIntelligenceHostState::Unavailable,
+                    "{pair}"
+                );
+                assert_eq!(
+                    after_pass.reason(),
+                    Some(Reason::ProfileUnsupported(profile)),
+                    "{pair}"
+                );
+
+                assert_started_nothing(&host, &fixture).await;
+                // The anchor root is the shared namespace root, so the fixture's own
+                // control directory is the only expected sibling: the host adds no
+                // entry, and in particular no anchor guard lock and no temporary file.
+                let mut expected: Vec<String> =
+                    vec!["control".to_owned(), HOST_ANCHOR_FILE_NAME.to_owned()];
+                expected.sort();
+                assert_eq!(
+                    anchor_entries(&fixture),
+                    expected,
+                    "the host creates no namespace entry of its own: {pair}"
+                );
+                assert_eq!(std::fs::read(&anchor_path).unwrap(), b"not an anchor", "{pair}");
+                assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign control residue", "{pair}");
+                assert_eq!(
+                    std::fs::read_dir(fixture.control_dir()).unwrap().count(),
+                    1,
+                    "no control entry is added: {pair}"
+                );
+                assert!(fixture.control_records().is_empty(), "no control record: {pair}");
+
+                assert_drained_to_stopped(&host, &pair).await;
+                let stopped = host.status().await;
+                assert_eq!(stopped.state(), WorkspaceIntelligenceHostState::Stopped, "{pair}");
+                assert_eq!(
+                    stopped.reason(),
+                    Some(Reason::ProfileUnsupported(profile)),
+                    "a stop preserves the profile fatal: {pair}"
+                );
+                assert_stopping_for_both_entries(&host, &pair).await;
+                assert_started_nothing(&host, &fixture).await;
+                assert_eq!(fixture.tree_hash(), before, "a refused profile writes nothing: {pair}");
+            }
+        }
+
+        /// Every admitted pair on a vacant root is `Inactive`/`NoRecords` and leaves
+        /// no residue at all: no anchor (identity), no control record, no cognition
+        /// partition, no owner tenure and no worker.
+        #[tokio::test]
+        async fn every_admitted_pair_on_a_vacant_root_is_inactive_no_records_without_residue() {
+            for (surface, deployment) in ADMITTED {
+                let pair = format!("{surface:?}/{deployment:?}");
+                let fixture = Fixture::new().await;
+                let before = fixture.tree_hash();
+
+                let host = bootstrap(&fixture, surface, deployment).await;
+                let status = host.status().await;
+                assert_eq!(status.state(), WorkspaceIntelligenceHostState::Inactive, "{pair}");
+                assert_eq!(status.reason(), Some(Reason::NoRecords), "{pair}");
+                assert!(!status.anchor_present(), "{pair}");
+                assert_eq!(status.host_marker(), None, "{pair}");
+                assert_eq!(status.counts(), WorkspaceIntelligenceHostCounts::default(), "{pair}");
+                assert!(status.scopes().is_empty(), "{pair}");
+                assert!(
+                    !fixture.paths.workspace_intelligence_dir().exists(),
+                    "a bootstrap creates no workspace-intelligence root: {pair}"
+                );
+                assert_started_nothing(&host, &fixture).await;
+                assert_eq!(
+                    fixture.tree_hash(),
+                    before,
+                    "a supported host with no records writes nothing: {pair}"
+                );
+
+                // The vacant root is exactly the recoverable first-enable shape: the
+                // (missing) registry is read and answers from itself.
+                assert_eq!(
+                    host.initial_enable_admission(ID).await.err(),
+                    Some(Refusal::WorkspaceNotFound),
+                    "{pair}"
+                );
+                assert_eq!(
+                    host.prepare_initial_enable(ID).await.err(),
+                    Some(Refusal::WorkspaceNotFound),
+                    "{pair}"
+                );
+                assert_started_nothing(&host, &fixture).await;
+                assert_eq!(fixture.tree_hash(), before, "{pair}");
+
+                assert_drained_to_stopped(&host, &pair).await;
+                let stopped = host.status().await;
+                assert_eq!(stopped.state(), WorkspaceIntelligenceHostState::Stopped, "{pair}");
+                assert_eq!(stopped.reason(), Some(Reason::NoRecords), "{pair}");
+                assert_stopping_for_both_entries(&host, &pair).await;
+                assert_started_nothing(&host, &fixture).await;
+                assert_eq!(
+                    fixture.tree_hash(),
+                    before,
+                    "neither bootstrap, stop nor a first-enable attempt writes here: {pair}"
+                );
+            }
+        }
+
+        /// `Unavailable` is not one shape and not only a profile refusal.
+        ///
+        /// A supported pair reaches it for an absent anchor over foreign control
+        /// records and for an unreadable anchor document; each keeps its own typed
+        /// reason, its own bytes and no residue.
+        #[tokio::test]
+        async fn unavailable_without_a_profile_refusal_keeps_its_own_reason_and_bytes() {
+            // (a) Missing anchor over foreign control records: the control root is
+            // probed for emptiness only, so its undecodable content is neither parsed
+            // nor a reason, and no anchor may be minted to "fix" it.
+            let foreign_control = Fixture::new().await;
+            std::fs::create_dir_all(foreign_control.control_dir()).unwrap();
+            let foreign = foreign_control.control_dir().join("foreign.keep");
+            std::fs::write(&foreign, b"foreign control residue").unwrap();
+            let before = foreign_control.tree_hash();
+            let host =
+                bootstrap(&foreign_control, Surface::Desktop, RuntimeDeployment::Embedded).await;
+            let status = host.status().await;
+            assert_eq!(status.state(), WorkspaceIntelligenceHostState::Unavailable);
+            assert_eq!(status.reason(), Some(Reason::AnchorMissingWithRecords));
+            assert!(!status.anchor_present());
+            assert_eq!(
+                host.initial_enable_admission(ID).await.err(),
+                Some(Refusal::Host(Reason::AnchorMissingWithRecords))
+            );
+            assert_started_nothing(&host, &foreign_control).await;
+            assert!(
+                !foreign_control
+                    .paths
+                    .workspace_intelligence_dir()
+                    .join(HOST_ANCHOR_FILE_NAME)
+                    .exists(),
+                "a missing anchor is never minted"
+            );
+            assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign control residue");
+            assert_drained_to_stopped(&host, "missing anchor").await;
+            assert_stopping_for_both_entries(&host, "missing anchor").await;
+            assert_eq!(
+                foreign_control.tree_hash(),
+                before,
+                "the foreign control bytes are preserved"
+            );
+
+            // (b) Unreadable anchor document: reported as such, every byte preserved,
+            // never repaired or replaced.
+            let unreadable = Fixture::new().await;
+            let anchor_root = WorkspaceIntelligenceHost::anchor_root_for_tests(&unreadable.paths);
+            std::fs::create_dir_all(&anchor_root).unwrap();
+            let anchor_path = anchor_root.join(HOST_ANCHOR_FILE_NAME);
+            std::fs::write(&anchor_path, b"not an anchor").unwrap();
+            let before = unreadable.tree_hash();
+            let host = bootstrap(&unreadable, Surface::Desktop, RuntimeDeployment::Embedded).await;
+            let status = host.status().await;
+            assert_eq!(status.state(), WorkspaceIntelligenceHostState::Unavailable);
+            assert_eq!(status.reason(), Some(Reason::AnchorUnreadable));
+            assert!(!status.anchor_present());
+            assert_eq!(
+                host.initial_enable_admission(ID).await.err(),
+                Some(Refusal::Host(Reason::AnchorUnreadable))
+            );
+            assert_started_nothing(&host, &unreadable).await;
+            assert_eq!(std::fs::read(&anchor_path).unwrap(), b"not an anchor");
+            assert_drained_to_stopped(&host, "unreadable anchor").await;
+            assert_stopping_for_both_entries(&host, "unreadable anchor").await;
+            assert_eq!(unreadable.tree_hash(), before, "an unreadable anchor is never repaired");
+
+            // The three shapes of `Unavailable` are distinct typed reasons: a profile
+            // refusal, a missing anchor over records and an unreadable anchor.
+            let refused = Fixture::new().await;
+            let host = bootstrap(&refused, Surface::Desktop, RuntimeDeployment::Shared).await;
+            let profile_reason = host.status().await.reason().expect("a refused profile states it");
+            assert!(matches!(
+                profile_reason,
+                Reason::ProfileUnsupported(Unsupported::SharedRuntime)
+            ));
+            let mut codes = vec![
+                profile_reason.code().to_owned(),
+                Reason::AnchorMissingWithRecords.code().to_owned(),
+                Reason::AnchorUnreadable.code().to_owned(),
+            ];
+            codes.sort();
+            codes.dedup();
+            assert_eq!(
+                codes.len(),
+                3,
+                "every `Unavailable` shape keeps its own machine code: {codes:?}"
+            );
+        }
+
+        /// A stopped host is closed for good on every admitted pair.
+        ///
+        /// The preparation candidate is admitted while the host is alive; after the
+        /// stop, that very candidate is refused `Stopping`, and a later anchor plus a
+        /// complete ON record are never adopted, prepared or published. The
+        /// recoverable `NoRecords` latch never reopens the host either.
+        #[tokio::test]
+        async fn a_stopped_host_refuses_late_admission_and_preparation_on_every_admitted_pair() {
+            for (surface, deployment) in ADMITTED {
+                let pair = format!("{surface:?}/{deployment:?}");
+                let fixture = Fixture::new().await;
+                fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+                let host = bootstrap(&fixture, surface, deployment).await;
+                let status = host.status().await;
+                assert_eq!(status.state(), WorkspaceIntelligenceHostState::Inactive, "{pair}");
+                assert_eq!(status.reason(), Some(Reason::NoRecords), "{pair}");
+
+                let Ok(candidate) = host.initial_enable_admission(ID).await else {
+                    panic!("a vacant root admits the first-enable candidate: {pair}");
+                };
+                assert!(
+                    matches!(&candidate, InitialEnableAdmission::NeedsAnchor { .. }),
+                    "{pair}"
+                );
+
+                assert_drained_to_stopped(&host, &pair).await;
+
+                // The facts get better only after the stop: a valid anchor and a
+                // complete ON record appear and the registry grows.
+                let host_id = fixture.anchor().await;
+                let scope = fixture.scope(&host_id, ID);
+                let binding = fixture.binding(&host_id, ID).await;
+                fixture
+                    .seed_control(&scope, true, Some(Fixture::bound_policy(&binding)))
+                    .await;
+                fixture
+                    .publish(vec![
+                        local_record(&fixture, ID, "local"),
+                        local_record(&fixture, "late:workspace", "late"),
+                    ])
+                    .await;
+                let late = fixture.tree_hash();
+                let records = fixture.control_records();
+                let anchor_bytes = fixture.anchor_bytes();
+
+                host.evaluate_for_tests().await;
+
+                let stopped = host.status().await;
+                assert_eq!(
+                    stopped.state(),
+                    WorkspaceIntelligenceHostState::Stopped,
+                    "a stopped host never re-settles: {pair}"
+                );
+                assert_eq!(stopped.counts().active(), 0, "{pair}");
+                assert!(!stopped.anchor_present(), "the late anchor is never adopted: {pair}");
+                assert!(stopped.scopes().is_empty(), "{pair}");
+                assert_started_nothing(&host, &fixture).await;
+
+                assert_eq!(
+                    host.prepare_initial_enable_anchor(candidate).await.err(),
+                    Some(Refusal::Stopping),
+                    "the candidate admitted before the stop is refused after it: {pair}"
+                );
+                assert_stopping_for_both_entries(&host, &pair).await;
+
+                assert_eq!(
+                    fixture.control_records(),
+                    records,
+                    "the late ON record is untouched: {pair}"
+                );
+                assert_eq!(
+                    fixture.anchor_bytes(),
+                    anchor_bytes,
+                    "the late anchor is neither repaired nor replaced: {pair}"
+                );
+                assert_eq!(fixture.tree_hash(), late, "a stopped host writes nothing: {pair}");
+            }
+        }
+    }
 }
