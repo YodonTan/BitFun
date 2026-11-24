@@ -2370,6 +2370,82 @@ export function findCapabilityContractConsumerViolations(
   return violations;
 }
 
+// Desktop and Server keep the full `product-full` Core capability closure; the
+// workspace intelligence host owner is the one capability they add on top of it,
+// through an app feature their compatibility default names. That forward is the
+// only reviewed way an app build reaches the host owner, so both declarations
+// stay pinned to the single named Core owner feature: a forward that drifts to
+// another owner, an extra capability smuggled in beside it (`test-support`, the
+// internal control/cognition/commit/claim owners, a second `product-full`) or a
+// default that stops naming it would make an app build claim a host capability
+// nobody reviewed. Every other app feature (Tauri glue, `devtools`, ...) keeps
+// its own semantics; this contract only covers the host forward and the default
+// that selects it.
+const appWorkspaceIntelligenceHostFeature = 'workspace-intelligence-host';
+const appWorkspaceIntelligenceHostCoreForward =
+  `openbitfun-core/${appWorkspaceIntelligenceHostFeature}`;
+const reviewedAppWorkspaceIntelligenceHostFeatures = new Map([
+  ['openbitfun-desktop', {
+    label: 'Desktop',
+    manifestPath: 'src/apps/desktop/Cargo.toml',
+  }],
+  ['openbitfun-server', {
+    label: 'Server',
+    manifestPath: 'src/apps/server/Cargo.toml',
+  }],
+]);
+
+export function findAppWorkspaceIntelligenceHostFeatureViolations(packages, { root = '' } = {}) {
+  const violations = [];
+
+  for (const [packageName, reviewed] of reviewedAppWorkspaceIntelligenceHostFeatures) {
+    const appPackage = packages.find((pkg) => pkg.name === packageName);
+    if (!appPackage) {
+      violations.push({
+        path: join(root, reviewed.manifestPath),
+        line: 1,
+        message: `${reviewed.label} app must stay in Cargo metadata so its ${appWorkspaceIntelligenceHostFeature} forward stays reviewable`,
+      });
+      continue;
+    }
+
+    const features = appPackage.features ?? {};
+    if (!Object.hasOwn(features, appWorkspaceIntelligenceHostFeature)) {
+      violations.push({
+        path: appPackage.manifest_path,
+        line: 1,
+        message: `${reviewed.label} app must declare the ${appWorkspaceIntelligenceHostFeature} feature that forwards ${appWorkspaceIntelligenceHostCoreForward}`,
+      });
+    } else if (!sameStringSet(
+      features[appWorkspaceIntelligenceHostFeature],
+      [appWorkspaceIntelligenceHostCoreForward],
+    )) {
+      violations.push({
+        path: appPackage.manifest_path,
+        line: 1,
+        message: `${reviewed.label} app ${appWorkspaceIntelligenceHostFeature} feature must forward exactly ${appWorkspaceIntelligenceHostCoreForward}, not [${(features[appWorkspaceIntelligenceHostFeature] ?? []).join(', ')}]`,
+      });
+    }
+
+    const defaultFeatures = features.default ?? [];
+    if (!Object.hasOwn(features, 'default')) {
+      violations.push({
+        path: appPackage.manifest_path,
+        line: 1,
+        message: `${reviewed.label} app default feature must keep ${appWorkspaceIntelligenceHostFeature}`,
+      });
+    } else if (!sameStringSet(defaultFeatures, [appWorkspaceIntelligenceHostFeature])) {
+      violations.push({
+        path: appPackage.manifest_path,
+        line: 1,
+        message: `${reviewed.label} app default feature must stay exactly [${appWorkspaceIntelligenceHostFeature}], not [${defaultFeatures.join(', ')}]`,
+      });
+    }
+  }
+
+  return violations;
+}
+
 function matchingClosingDelimiter(
   source,
   openingIndex,
@@ -2788,6 +2864,7 @@ export function checkCargoDependencyBoundaries({ root, crateLayoutRules }) {
       packages,
       { root, crateLayoutRules },
     ),
+    ...findAppWorkspaceIntelligenceHostFeatureViolations(packages, { root }),
     ...findGuardedInternalDefaultFeatureViolations(packages, { root }),
     ...findRedundantInternalDefaultFeatureDisables(packages, { root }),
     ...findCapabilityContractConsumerViolations(packages, undefined, { root }),

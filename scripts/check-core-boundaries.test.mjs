@@ -10,6 +10,7 @@ import {
   collectCargoMetadataGraph,
   collectCargoMetadataPackages,
   discoverCargoManifestPaths,
+  findAppWorkspaceIntelligenceHostFeatureViolations,
   findCargoLayerViolations,
   findFeatureGatedTestTargetViolations,
   findProductEntrypointCoreFeatureViolations,
@@ -4811,6 +4812,195 @@ test('workspace intelligence host selects only the narrow host owner set', async
       `${file} must not name the workspace runtime owner`,
     );
   }
+});
+
+const WORKSPACE_INTELLIGENCE_HOST_APP_FORWARD = 'openbitfun-core/workspace-intelligence-host';
+
+// Both apps are read from Cargo's own metadata for the two manifests that declare
+// the host forward. `--no-deps` still reports every workspace member, so this is
+// the real feature graph without paying for a full dependency resolution.
+function workspaceIntelligenceHostAppPackages() {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  return {
+    root,
+    packages: collectCargoMetadataPackages({
+      root,
+      manifestPaths: [
+        join(root, 'src', 'apps', 'desktop', 'Cargo.toml'),
+        join(root, 'src', 'apps', 'server', 'Cargo.toml'),
+      ],
+    }),
+  };
+}
+
+test('Desktop and Server forward only the reviewed workspace intelligence host owner', () => {
+  const { root, packages } = workspaceIntelligenceHostAppPackages();
+
+  // The reviewed declaration is asserted as data first: a metadata set that lost
+  // an app, its forward or its default must fail here instead of passing on an
+  // empty package list.
+  for (const [name, manifestPath, expectedFeatures] of [
+    [
+      'openbitfun-desktop',
+      'src/apps/desktop/Cargo.toml',
+      ['default', 'devtools', 'workspace-intelligence-host'],
+    ],
+    [
+      'openbitfun-server',
+      'src/apps/server/Cargo.toml',
+      ['default', 'workspace-intelligence-host'],
+    ],
+  ]) {
+    const appPackage = packages.find((pkg) => pkg.name === name);
+    assert.ok(appPackage, `${name} must be a Cargo metadata package`);
+    assert.equal(appPackage.manifest_path, join(root, ...manifestPath.split('/')));
+    assert.deepEqual(
+      Object.keys(appPackage.features).sort(),
+      expectedFeatures,
+      `${name} feature surface`,
+    );
+    assert.deepEqual(
+      appPackage.features['workspace-intelligence-host'],
+      [WORKSPACE_INTELLIGENCE_HOST_APP_FORWARD],
+    );
+    assert.deepEqual(appPackage.features.default, ['workspace-intelligence-host']);
+    // The host forward is one extra owner on top of the full product closure; the
+    // normal Core edge itself keeps exactly `product-full`.
+    const coreEdges = appPackage.dependencies.filter(
+      (dependency) => dependency.name === 'openbitfun-core' && (dependency.kind ?? null) === null,
+    );
+    assert.equal(coreEdges.length, 1, `${name} must keep one normal openbitfun-core edge`);
+    assert.deepEqual(coreEdges[0].features, ['product-full']);
+  }
+
+  assert.deepEqual(
+    findAppWorkspaceIntelligenceHostFeatureViolations(packages, { root }),
+    [],
+  );
+
+  // The guarded apps are not narrow product entrypoints: the full transitive Core
+  // closure must keep treating their `product-full` edge as correct instead of
+  // re-reviewing the whole product closure as if it were a CLI-like entrypoint.
+  assert.deepEqual(
+    findProductEntrypointCoreFeatureViolations(packages, { root, crateLayoutRules })
+      .filter((violation) => violation.message.includes('openbitfun-desktop')
+        || violation.message.includes('openbitfun-server')),
+    [],
+  );
+
+  // A metadata set without the apps cannot pass: the guard reports the missing
+  // review surface rather than skipping it.
+  assert.deepEqual(
+    findAppWorkspaceIntelligenceHostFeatureViolations([], { root })
+      .map((violation) => violation.message),
+    [
+      'Desktop app must stay in Cargo metadata so its workspace-intelligence-host forward stays reviewable',
+      'Server app must stay in Cargo metadata so its workspace-intelligence-host forward stays reviewable',
+    ],
+  );
+});
+
+test('workspace intelligence host app forwards reject drift the entrypoint closure cannot see', () => {
+  const { root, packages } = workspaceIntelligenceHostAppPackages();
+  const desktop = packages.find((pkg) => pkg.name === 'openbitfun-desktop');
+  const server = packages.find((pkg) => pkg.name === 'openbitfun-server');
+  assert.ok(desktop && server, 'both guarded apps must come from Cargo metadata');
+
+  const withoutFeature = (pkg, featureName) => {
+    const features = { ...pkg.features };
+    delete features[featureName];
+    return features;
+  };
+  const replaceAppFeatures = (pkg, features) => packages.map((candidate) =>
+    (candidate === pkg ? { ...candidate, features } : candidate));
+
+  const cases = [
+    [
+      'Desktop',
+      desktop,
+      withoutFeature(desktop, 'workspace-intelligence-host'),
+      /^Desktop app must declare the workspace-intelligence-host feature that forwards openbitfun-core\/workspace-intelligence-host$/,
+    ],
+    [
+      'Desktop',
+      desktop,
+      withoutFeature(desktop, 'default'),
+      /^Desktop app default feature must keep workspace-intelligence-host$/,
+    ],
+    [
+      'Server',
+      server,
+      { ...server.features, default: [] },
+      /^Server app default feature must stay exactly \[workspace-intelligence-host\], not \[\]$/,
+    ],
+    [
+      'Desktop',
+      desktop,
+      { ...desktop.features, default: ['workspace-intelligence-host', 'devtools'] },
+      /^Desktop app default feature must stay exactly \[workspace-intelligence-host\], not \[workspace-intelligence-host, devtools\]$/,
+    ],
+    [
+      'Desktop',
+      desktop,
+      { ...desktop.features, 'workspace-intelligence-host': ['openbitfun-services-core/workspace-intelligence-host'] },
+      /^Desktop app workspace-intelligence-host feature must forward exactly openbitfun-core\/workspace-intelligence-host, not \[openbitfun-services-core\/workspace-intelligence-host\]$/,
+    ],
+    [
+      'Server',
+      server,
+      { ...server.features, 'workspace-intelligence-host': ['openbitfun-core/workspace-intelligence-claim'] },
+      /^Server app workspace-intelligence-host feature must forward exactly openbitfun-core\/workspace-intelligence-host, not \[openbitfun-core\/workspace-intelligence-claim\]$/,
+    ],
+    [
+      'Desktop',
+      desktop,
+      {
+        ...desktop.features,
+        'workspace-intelligence-host': [
+          WORKSPACE_INTELLIGENCE_HOST_APP_FORWARD,
+          'openbitfun-core/test-support',
+        ],
+      },
+      /feature must forward exactly openbitfun-core\/workspace-intelligence-host, not \[openbitfun-core\/workspace-intelligence-host, openbitfun-core\/test-support\]$/,
+    ],
+    [
+      'Server',
+      server,
+      {
+        ...server.features,
+        'workspace-intelligence-host': [
+          WORKSPACE_INTELLIGENCE_HOST_APP_FORWARD,
+          'openbitfun-core/workspace-intelligence-control',
+        ],
+      },
+      /feature must forward exactly openbitfun-core\/workspace-intelligence-host, not \[openbitfun-core\/workspace-intelligence-host, openbitfun-core\/workspace-intelligence-control\]$/,
+    ],
+  ];
+
+  for (const [label, appPackage, features, expected] of cases) {
+    const mutated = replaceAppFeatures(appPackage, features);
+    const messages = findAppWorkspaceIntelligenceHostFeatureViolations(mutated, { root })
+      .map((violation) => violation.message);
+    assert.equal(messages.length, 1, `${label} case ${expected} must report once: ${messages.join(' | ')}`);
+    assert.match(messages[0], expected);
+
+    // The reviewed entrypoint contract only pins the direct Core capability edge,
+    // so it reports nothing about an app-level forward: this is the gap the app
+    // guard closes, proven on the same metadata the positive case accepts.
+    assert.deepEqual(
+      findProductEntrypointCoreFeatureViolations(mutated, { root, crateLayoutRules })
+        .map((violation) => violation.message)
+        .filter((message) => message.includes('workspace-intelligence-host')),
+      [],
+    );
+  }
+
+  // The same metadata without a mutation stays clean, so every report above comes
+  // from the injected drift rather than from the real declaration.
+  assert.deepEqual(
+    findAppWorkspaceIntelligenceHostFeatureViolations(packages, { root }),
+    [],
+  );
 });
 
 test('workspace intelligence cognition cannot acquire Tokio capabilities', () => {
