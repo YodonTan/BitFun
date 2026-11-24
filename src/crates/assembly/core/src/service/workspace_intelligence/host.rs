@@ -3,20 +3,23 @@
 //!
 //! This module is the narrow app-facing surface of the internal host slice. It
 //! answers three questions and nothing else: start (bootstrap), `status()`, and
-//! `shutdown()`. One crate-internal preparation entry point additionally serves
-//! the future sole confirmed enable owner: it turns an admission observation into
-//! the host's own storage anchor and never starts by itself. The returned handle
-//! never exposes a claim, an origin ticket, a token, a lease path, a control root,
-//! or the raw anchor value.
+//! `shutdown()`. Two crate-internal preparation entry points additionally serve the
+//! future sole confirmed enable owner: the anchor step turns an admission
+//! observation into the host's own storage anchor, and the complete preparation
+//! composes it with a reserved scope lease and a queued permit. Neither has an app
+//! caller, neither ever enables anything, and neither starts by itself. The returned
+//! handle never exposes a claim, an origin ticket, a token, a lease path, a control
+//! root, or the raw anchor value.
 //!
 //! ## Visibility
 //!
 //! `bootstrap`, `status`, `shutdown` and the plain-data result types are `pub`, and
 //! an opaque handle is the only way to reach this slice. Tenure, tickets, tokens,
 //! lease paths, control and cognition roots, the raw anchor and the full host id
-//! are deliberately not part of that surface. The preparation entry point is
-//! `pub(super)`: it has no app-facing caller, no command and no registry row in
-//! this tree, and no caller can hand it a namespace, a host id or an anchor value.
+//! are deliberately not part of that surface. The preparation entry points and the
+//! queued permit they hand back are `pub(super)`: they have no app-facing caller, no
+//! command and no registry row in this tree, and no caller can hand them a
+//! namespace, a host id or an anchor value.
 //!
 //! ## Authority
 //!
@@ -51,9 +54,12 @@
 //! cognition partition, no control write and no anchor mint. A missing anchor next
 //! to a non-empty control directory is a bounded existence probe only: the foreign
 //! files are never opened, parsed or guessed from, and every byte is preserved.
-//! The one explicit exception is the crate-internal anchor preparation described
-//! below: for one admitted eligible OFF scope it may publish the guarded anchor
-//! document and its own anchor guard lock, and it writes nothing else.
+//! The one explicit exception is the crate-internal preparation described below:
+//! for one admitted eligible OFF scope the anchor step may publish the guarded
+//! anchor document and its own anchor guard lock, and a complete preparation
+//! additionally leaves the payload-free control guard lock behind and holds the
+//! scope lease it reserved. Neither ever writes a control record, opens a cognition
+//! partition or mints a tenure marker.
 //!
 //! ## Naming
 //!
@@ -122,15 +128,69 @@
 //! that host id and that workspace id; that path is never looser than the adoption
 //! of an anchor observed before the step.
 //!
+//! ## Initial-enable preparation
+//!
+//! One crate-internal entry point composes the anchor step above into a complete
+//! preparation of a single workspace for the future sole confirmed first enable, and
+//! it is the only caller of the anchor step. It takes a workspace id of this host's
+//! own persisted catalog — never a path, a scope key, a host id or an anchor value —
+//! and runs, in this fixed order: (1) one admission observation of the target, (2) the
+//! anchor step (mint or adopt, exactly as above), (3) a fresh complete observation
+//! that must still bind exactly the admitted target, (4) the scope lease, pre-held
+//! through the owner's own reservation primitive, whose guarded read re-checks the
+//! belief step 3 produced, (5) a second fresh complete observation that must still
+//! describe exactly the same record, compared whole, and (6) publication of a queued
+//! permit under the same book lock that carries the drain transition.
+//!
+//! Step 5 is deliberately a whole-record comparison and not the generation-plus-policy
+//! belief the reservation itself re-checks: the schema version, the model reference,
+//! the switch, the policy and every unknown key of the document are part of the
+//! equivalence, so a same-generation edit anywhere in the record refuses exactly like
+//! a generation or policy change, and an absent record is never equal to a present
+//! one. The anchor step in step 2 may await for a long time, so step 3 re-reads the
+//! catalog and the path facts as well: a record that moved, a root that changed or an
+//! anchor this host did not observe refuses without writing a control record. The
+//! refusal may leave the anchor root, an inert lock inside it or a complete and valid
+//! anchor of step 2 behind, exactly as `InitialEnableRefusal` documents. A true
+//! absence is a supported outcome; a record that already reads enabled is refused
+//! instead, and a legacy enabled record without a binding is never taken over.
+//!
+//! The permit a successful preparation returns is a queued tenure, not a grant and
+//! not an `OriginTicket`: it is non-`Clone`, non-serializable, not `Debug` and the
+//! only thing it can do is release the lease synchronously when it is dropped. It
+//! carries no switch, no claim, no ticket, no partition and no wake-up; holding it
+//! changes no status and starts nothing. A preparation proves only that one scope is
+//! prepared: a later consume must re-admit the workspace, re-check its authority under
+//! the lease and compare its own complete observation against the one the queued slot
+//! kept before any write. The permit holds a weak reference to the queued
+//! slot, so it can never extend the host or the lease lifetime, and `shutdown`
+//! invalidates it: the drain transition, the closing of new preparations and the
+//! take of every queued reservation happen in the same critical section, so no
+//! preparation can publish after a drain started and a held permit neither delays
+//! `Drained` nor stays usable afterwards. Taking a queued reservation is not releasing
+//! it: every physical release is registered in the same in-flight account as the work
+//! itself, entered before the reservation leaves its slot and left only after the
+//! lease is gone, so no drain can report `Drained` while an OS lease of this host is
+//! still being freed. Releasing a lease is blocking IO, so it always happens outside
+//! every lock.
+//!
+//! One complete preparation is one host-owned task registered in the in-flight
+//! account under the same book lock as the drain transition, so a dropped caller
+//! cannot leave a drain with unaccounted work: the task keeps running, releases its
+//! reservation instead of publishing, and only then stops counting. A preparation
+//! refused because another owner already holds the scope lease is a typed busy
+//! refusal, never a queued retry, and no path of this module starts a standby worker,
+//! a timer or a background wake-up for it.
+//!
 //! ## Enable ordering
 //!
 //! The order around the future first enable is fixed and may not be inverted:
 //! anchor first (mint or adopt, as above), then the per-scope owner lease and
 //! claim, then the governed enable write, which must run under the same guard as
-//! the claim that legitimizes it. An ON-first sequence, or any write that precedes
-//! its claim, is forbidden: a control record written for a namespace whose anchor
-//! was never obtained cannot be attributed to a host, and an enabled scope without
-//! tenure cannot be reconciled.
+//! the claim that legitimizes it. A control record written for a namespace whose
+//! anchor was never obtained cannot be attributed to a host, and an enabled scope
+//! without tenure cannot be reconciled, so the enable write always follows the lease
+//! that legitimizes it and never precedes it.
 //!
 //! ## Configuration
 //!
@@ -161,9 +221,10 @@
 //! can outlive it, so in-flight blocking owner work keeps its locks until its
 //! transaction ends. On timeout the result is
 //! `DrainTimedOut { outstanding }` and the state remains `Draining` (incomplete),
-//! never `Stopped`. The honest statements are "stopped waiting" and "no new
-//! hand-off"; a drain never claims that a lease was released (only process exit
-//! releases it) and never claims a rollback.
+//! never `Stopped`. On timeout the honest statements are "stopped waiting" and
+//! "no new hand-off"; the drain does not claim that outstanding owner work has
+//! released its leases and never claims a rollback. A lease is released when
+//! its owning guard is dropped.
 
 use std::time::Duration;
 
@@ -641,7 +702,9 @@ mod compiled {
     use log::{info, warn};
     use openbitfun_services_core::runtime_ownership::RuntimeDeployment;
     use openbitfun_services_core::workspace_intelligence_claim::{
-        ClaimAttempt, ClaimVerification, GovernedClaim, WorkspaceIntelligenceClaimError,
+        ClaimAttempt, ClaimVerification, GovernedClaim, InitialEnableAttempt,
+        InitialEnableExpectation, InitialEnableRefusal as ReservationRefusal,
+        InitialEnableReservation, WorkspaceIntelligenceClaimError,
     };
     use openbitfun_services_core::workspace_intelligence_commit::{
         GovernedClaimRefusal, WorkspaceIntelligenceCommitError,
@@ -772,12 +835,44 @@ mod compiled {
         },
     }
 
+    /// One complete `Disabled` observation of a scope's persisted control record.
+    ///
+    /// Every modelled field plus the complete decoded document, so two observations
+    /// are equivalent only when the whole record is. `PartialEq` is what the complete
+    /// preparation compares: the generation and the raw policy alone would let a
+    /// same-generation edit to the schema version, the model reference or any unknown
+    /// key pass as "the same record". No `Debug`: this carries private storage
+    /// content verbatim.
+    #[derive(PartialEq)]
     #[allow(dead_code, reason = "only the future confirmed enable owner consumes this snapshot")]
+    pub(super) struct InitialEnableRecordSnapshot {
+        schema_version: Option<u32>,
+        control_generation: u64,
+        enabled: Option<bool>,
+        model_ref: Option<String>,
+        policy: Option<serde_json::Value>,
+        raw: serde_json::Value,
+    }
+
+    #[cfg(test)]
+    impl InitialEnableRecordSnapshot {
+        /// Generation and whole raw policy of one observed snapshot, for fixtures
+        /// that assert what a preflight observation read.
+        pub(super) fn generation_and_policy_for_tests(
+            &self,
+        ) -> (u64, Option<&serde_json::Value>) {
+            (self.control_generation, self.policy.as_ref())
+        }
+    }
+
+    #[allow(dead_code, reason = "only the future confirmed enable owner consumes this snapshot")]
+    #[derive(PartialEq)]
     pub(super) enum InitialEnableControl {
+        /// No record was observed for this scope.
         Absent,
+        /// One record was observed and it does not read as enabled.
         Disabled {
-            generation: u64,
-            raw_policy: Option<serde_json::Value>,
+            record: InitialEnableRecordSnapshot,
         },
     }
 
@@ -798,6 +893,13 @@ mod compiled {
 
     /// Only typed reasons leave the admission check or the preparation of one
     /// admitted candidate, never the underlying errors.
+    ///
+    /// What every variant refuses is the write this module must not take: none of them
+    /// writes a control record, an ON record or a cognition partition. None of them
+    /// promises a byte-identical anchor root either. The guarded mint of the anchor
+    /// step may have created that root, an inert lock inside it, or a complete and
+    /// valid anchor before a later step refused, and those are the documented residue
+    /// a refusal is allowed to leave.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum InitialEnableRefusal {
         Stopping,
@@ -813,6 +915,266 @@ mod compiled {
         /// complete. The underlying error never leaves this module: only its
         /// stable code is logged.
         AnchorPreparationFailed,
+        /// The guarded anchor mint found this namespace's control root already
+        /// occupied, which is exactly the forbidden order: a reservation reached the
+        /// namespace before the anchor that must precede it. No control record was
+        /// written; the anchor root of the refused mint is what remains.
+        AnchorNamespaceBusy,
+        /// Another owner (or another preparation of this host) already holds the
+        /// scope's owner lease. A typed busy refusal, not a queue: no control record
+        /// was written, no worker was started and no retry is scheduled. An anchor the
+        /// anchor step adopted or minted is unaffected by this refusal.
+        ReserveBusy,
+        /// The reservation's own guarded comparison refused; only the services-side
+        /// typed refusal crosses this boundary, never a path or a payload.
+        ReserveRefused(ReservationRefusal),
+        /// The reservation attempt failed before any decision was taken (lease or
+        /// control IO). Only its stable code is logged.
+        ReserveFailed,
+        /// The record, or the binding for the admitted target, is no longer the one
+        /// this preparation observed and reserved against. Refused without writing a
+        /// control record; the anchor of the admitted target is not touched either.
+        ControlChanged,
+        /// The caller stopped waiting for this preparation before it published. The
+        /// reservation was released and nothing was published.
+        Abandoned,
+    }
+
+    /// The admitted facts one complete preparation must still bind after every await
+    /// it takes.
+    ///
+    /// The admission value itself is deliberately not `Clone` and is moved into the
+    /// anchor step, so the target it was admitted for is captured here before that
+    /// step: the re-verification after a possibly long anchor wait must compare
+    /// against the facts this preparation started from, not against a second read of
+    /// whatever is live afterwards. No `Debug`: it holds private identity and paths.
+    #[derive(Clone, PartialEq)]
+    enum AdmittedTarget {
+        /// Admitted before any anchor existed: the fresh observation must carry an
+        /// anchor whose binding describes exactly these workspace facts.
+        NeedsAnchor(PersistedWorkspace),
+        /// Admitted against this anchor: the fresh observation must describe the same
+        /// scope and the same binding.
+        Anchored {
+            scope: String,
+            binding: ExecutionBinding,
+        },
+    }
+
+    impl AdmittedTarget {
+        /// Captures the admitted facts before the candidate is moved into the anchor
+        /// step.
+        fn capture(admitted: &InitialEnableAdmission) -> Self {
+            match admitted {
+                InitialEnableAdmission::NeedsAnchor { workspace } => {
+                    Self::NeedsAnchor(workspace.clone())
+                }
+                InitialEnableAdmission::Anchored { scope, binding, .. } => Self::Anchored {
+                    scope: scope.as_str(),
+                    binding: binding.clone(),
+                },
+            }
+        }
+
+        /// True when one fresh observation still binds exactly this target.
+        ///
+        /// Never looser than the `(NeedsAnchor, Anchored)` rule of the anchor step: an
+        /// observation without a binding anchor refuses, a different scope refuses,
+        /// and the binding must equal the admitted facts field by field.
+        fn holds(&self, observed: &InitialEnableAdmission) -> bool {
+            match (self, observed) {
+                (Self::NeedsAnchor(workspace), InitialEnableAdmission::Anchored { binding, .. }) => {
+                    binding_describes(binding, workspace)
+                }
+                (
+                    Self::Anchored { scope, binding },
+                    InitialEnableAdmission::Anchored {
+                        scope: fresh_scope,
+                        binding: fresh_binding,
+                        ..
+                    },
+                ) => fresh_scope.as_str() == scope.as_str() && fresh_binding.matches(binding),
+                // A target admitted with an anchor cannot lose it, and a target
+                // admitted without one must have gained exactly one by now: an
+                // observation without a binding anchor is never this target.
+                _ => false,
+            }
+        }
+    }
+
+    /// Queued tenure of one prepared initial enable.
+    ///
+    /// The permit is a queued slot handle, not a grant: it is non-`Clone`,
+    /// non-serializable, not `Debug` and not an `OriginTicket`, it exposes nothing and
+    /// it authorizes nothing. Dropping it revokes the queued reservation
+    /// synchronously; holding it changes no status and starts no work. The weak
+    /// reference is deliberate: a permit can never keep the host or the lease alive
+    /// past the host's own publication decision.
+    pub(super) struct InitialEnablePending {
+        slot: std::sync::Weak<InitialEnablePendingSlot>,
+    }
+
+    impl InitialEnablePending {
+        /// True while the queued reservation of this permit is still held.
+        #[cfg(test)]
+        pub(super) fn is_live_for_tests(&self) -> bool {
+            self.slot.upgrade().is_some_and(|slot| slot.is_live())
+        }
+    }
+
+    impl Drop for InitialEnablePending {
+        /// Releases the queued tenure immediately, so a dropped permit cannot leave
+        /// an owner lease behind until some later sweep.
+        fn drop(&mut self) {
+            if let Some(slot) = self.slot.upgrade() {
+                slot.revoke();
+            }
+        }
+    }
+
+    /// One queued reservation under the book lock.
+    ///
+    /// The reservation is taken with a plain `std` mutex, so revoking it from a drop
+    /// or from the drain path is synchronous and never needs an await. A poisoned
+    /// mutex is not a reason to leak a lease: the state is read with the poison
+    /// ignored and the reservation is still released.
+    struct InitialEnablePendingSlot {
+        /// The host whose in-flight account covers the physical release of this slot.
+        ///
+        /// Weak on purpose: the slot lives in that host's own book, so a strong handle
+        /// here would be a reference cycle, and a slot whose host is gone has nothing
+        /// left to account for.
+        core: std::sync::Weak<HostCore>,
+        state: std::sync::Mutex<InitialEnablePendingState>,
+    }
+
+    struct InitialEnablePendingState {
+        reservation: Option<InitialEnableReservation>,
+        /// What this preparation observed and reserved against.
+        ///
+        /// Kept for the future confirmed-enable owner, which must compare a fresh
+        /// complete observation against exactly this one and never only against the
+        /// generation-plus-policy projection the reservation itself carries. It has no
+        /// accessor, crosses no boundary, authorizes nothing and is dropped with the
+        /// slot.
+        #[allow(
+            dead_code,
+            reason = "only the future confirmed enable owner consumes this observation"
+        )]
+        observed: Option<InitialEnableObservation>,
+    }
+
+    /// The facts one queued preparation closed against.
+    ///
+    /// Deliberately not `Debug`: the target holds private identity and paths, and the
+    /// control value holds the raw persisted document.
+    #[allow(
+        dead_code,
+        reason = "only the future confirmed enable owner consumes this observation"
+    )]
+    struct InitialEnableObservation {
+        target: AdmittedTarget,
+        control: InitialEnableControl,
+    }
+
+    impl InitialEnablePendingSlot {
+        fn new(
+            reservation: InitialEnableReservation,
+            core: &Arc<HostCore>,
+            observation: InitialEnableObservation,
+        ) -> Self {
+            Self {
+                core: Arc::downgrade(core),
+                state: std::sync::Mutex::new(InitialEnablePendingState {
+                    reservation: Some(reservation),
+                    observed: Some(observation),
+                }),
+            }
+        }
+
+        fn state(&self) -> std::sync::MutexGuard<'_, InitialEnablePendingState> {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        /// Takes the reservation, if any, out of this slot.
+        ///
+        /// The caller drops it outside the slot mutex, because releasing a lease is
+        /// blocking IO. A revoked slot never holds one again. The drain registers
+        /// the physical release in the same Book critical section as this take;
+        /// `revoke` instead registers it before the take under the slot mutex.
+        fn take_reservation(&self) -> Option<InitialEnableReservation> {
+            self.state().reservation.take()
+        }
+
+        /// Enters this host's in-flight account for one physical release.
+        ///
+        /// Called while this slot's mutex is held and strictly before the reservation
+        /// leaves it, so a drain can never observe "the queue is empty" without also
+        /// observing the release it still owes: it either reads the account before the
+        /// take, when nothing has been released yet, or after it, when the count stays
+        /// up until the lease itself is gone. A slot whose host is already gone
+        /// accounts for nothing.
+        fn release_guard(&self) -> Option<InFlight> {
+            Some(InFlight::enter(self.core.upgrade()?))
+        }
+
+        /// Releases the queued reservation, if this slot still holds one.
+        ///
+        /// The account is entered under the slot mutex and before the take, and it is
+        /// left only after the lease was physically dropped. Dropping a lease is
+        /// blocking IO, so it happens outside the mutex.
+        fn revoke(&self) {
+            let (guard, reservation) = {
+                let mut state = self.state();
+                let guard = state
+                    .reservation
+                    .is_some()
+                    .then(|| self.release_guard())
+                    .flatten();
+                (guard, state.reservation.take())
+            };
+            let Some(reservation) = reservation else {
+                return;
+            };
+            #[cfg(test)]
+            if let Some(pause) = self.release_pause() {
+                // Test-only: the lease is out of its slot and not yet dropped.
+                pause.wait_blocking();
+            }
+            drop(reservation);
+            drop(guard);
+        }
+
+        /// True while this slot still holds a reservation.
+        fn is_live(&self) -> bool {
+            self.state().reservation.is_some()
+        }
+
+        /// Test-only release window of this slot, keyed by the host's own user root.
+        #[cfg(test)]
+        fn release_pause(&self) -> Option<HostPause> {
+            let core = self.core.upgrade()?;
+            super::pauses::for_user_root_of(
+                core.paths.as_ref(),
+                super::pauses::PausePoint::InitialEnableRelease,
+            )
+        }
+    }
+
+    /// Marks one preparation abandoned when its caller stops awaiting it.
+    ///
+    /// The flag is what keeps a dropped caller from leaving a published preparation
+    /// behind: the work itself is host-owned and keeps running, and its publication
+    /// gate refuses once this is set. Nothing is cancelled by it, so the reservation
+    /// is released by the task itself, outside the book lock.
+    struct AbandonOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for AbandonOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
     }
 
     /// Validated storage-namespace tenancy of this host.
@@ -897,6 +1259,11 @@ mod compiled {
         /// Volatile per-scope admission latch. Deliberately not persisted: it holds
         /// one host's own observation, and a restart starts from fresh facts.
         blocked_generation: BTreeMap<String, BlockedScope>,
+        /// Queued initial-enable reservations, keyed by scope key. The book owns the
+        /// slot so a held permit cannot extend the lease lifetime past this host's own
+        /// decision, and the drain transition is written under the same lock that owns
+        /// this map.
+        initial_enable: BTreeMap<String, Arc<InitialEnablePendingSlot>>,
         worker: Option<StandbyWorker>,
     }
 
@@ -909,6 +1276,7 @@ mod compiled {
                 scopes: Vec::new(),
                 claims: BTreeMap::new(),
                 blocked_generation: BTreeMap::new(),
+                initial_enable: BTreeMap::new(),
                 worker: None,
             }
         }
@@ -1212,15 +1580,23 @@ mod compiled {
                         return Err(Refusal::ControlPolicyUnreadable);
                     }
                     InitialEnableControl::Disabled {
-                        generation: record.control_generation,
-                        raw_policy: record.policy,
+                        // The complete record, so a later observation can be compared
+                        // whole instead of against the generation and policy alone.
+                        record: InitialEnableRecordSnapshot {
+                            schema_version: record.schema_version,
+                            control_generation: record.control_generation,
+                            enabled: record.enabled,
+                            model_ref: record.model_ref,
+                            policy: record.policy,
+                            raw: record.raw,
+                        },
                     }
                 }
             };
             Ok(InitialEnableAdmission::Anchored { scope, binding, control })
         }
 
-        /// Registers one explicit anchor preparation in the in-flight account.
+        /// Registers one explicit preparation in the in-flight account.
         ///
         /// The registration happens under the same Book lock the drain transition
         /// is written under, so the two can never be observed in an order that lets
@@ -1231,7 +1607,7 @@ mod compiled {
         async fn begin_anchor_preparation(
             self: &Arc<Self>,
         ) -> Result<InFlight, InitialEnableRefusal> {
-            let book = self.book.lock().await;
+            let mut book = self.book.lock().await;
             if self.shutdown_requested()
                 || matches!(
                     book.state,
@@ -1241,6 +1617,9 @@ mod compiled {
             {
                 return Err(InitialEnableRefusal::Stopping);
             }
+            // The map is swept where the next preparation starts, so a released
+            // entry of an earlier attempt cannot accumulate across preparations.
+            book.clear_released_initial_enable();
             Ok(InFlight::enter(Arc::clone(self)))
         }
 
@@ -1816,9 +2195,14 @@ mod compiled {
             }
         }
 
-        async fn shutdown(&self) -> WorkspaceIntelligenceHostShutdown {
+        async fn shutdown(self: &Arc<Self>) -> WorkspaceIntelligenceHostShutdown {
             let deadline = tokio::time::Instant::now() + self.timing.drain_budget;
-            {
+            // ONE critical section for the whole transition: the stop flag, the state
+            // and the queued preparations are closed together. A preparation can
+            // therefore never publish between them, and a second drain that acquires
+            // this lock afterwards observes both the closed state and the release
+            // account entered below — never an empty queue with nothing in flight.
+            let (pending, released, release_guard) = {
                 let mut book = self.book.lock().await;
                 if matches!(book.state, WorkspaceIntelligenceHostState::Stopped) {
                     return WorkspaceIntelligenceHostShutdown::new(
@@ -1832,7 +2216,37 @@ mod compiled {
                     "Workspace intelligence host is draining: budget_ms={}",
                     self.timing.drain_budget.as_millis()
                 );
+                let pending = book.take_initial_enable_pending();
+                // Taking a queued reservation is a mutex and an option: no IO, so it
+                // happens here, while the transition lock is still held, together with
+                // the in-flight registration of the release it starts. Every permit a
+                // caller still holds is inert from this point on. Dropping a lease is
+                // blocking IO and stays outside the lock.
+                let released: Vec<InitialEnableReservation> = pending
+                    .iter()
+                    .filter_map(|slot| slot.take_reservation())
+                    .collect();
+                let release_guard =
+                    (!released.is_empty()).then(|| InFlight::enter(Arc::clone(self)));
+                (pending, released, release_guard)
+            };
+
+            #[cfg(test)]
+            if !released.is_empty() {
+                if let Some(pause) = super::pauses::for_user_root_of(
+                    &self.paths,
+                    super::pauses::PausePoint::InitialEnableRelease,
+                ) {
+                    // Test-only: the leases are out of their slots and not yet dropped.
+                    pause.wait().await;
+                }
             }
+            // The account stays live until the last lease of this batch is physically
+            // gone, so a drain can never call this host drained while an OS lock of its
+            // own is still being released. A held permit contributes nothing here.
+            drop(released);
+            drop(pending);
+            drop(release_guard);
 
             // Stop the wake-up source first: no new pass may start.
             let worker = {
@@ -1843,7 +2257,11 @@ mod compiled {
                 let _ = tokio::time::timeout_at(deadline, worker.join()).await;
             }
 
-            let drained = tokio::time::timeout_at(deadline, async {
+            // The loop only waits; the verdict below is taken from the account itself.
+            // A release that is still in flight therefore cannot be waited away: when
+            // the budget expires with an OS lease still outstanding, the drain reports
+            // that instead of claiming completion.
+            let _ = tokio::time::timeout_at(deadline, async {
                 loop {
                     // The wake-up interest is created — and enabled — BEFORE the
                     // counter is read. A `Notified` future captures the
@@ -1867,12 +2285,16 @@ mod compiled {
                     notified.await;
                 }
             })
-            .await
-            .is_ok();
-            let outstanding = self.in_flight.load(Ordering::SeqCst);
+            .await;
 
             let mut book = self.book.lock().await;
-            if drained || outstanding == 0 {
+            // Authoritative in the same critical section that decides the verdict: a
+            // release registered under this lock in between — the batch above, or a
+            // permit drop that took its own reservation — is always accounted for, so
+            // `Drained` is only ever reported with the account at zero and everything
+            // it covers physically released.
+            let outstanding = self.in_flight.load(Ordering::SeqCst);
+            if outstanding == 0 {
                 // Tenure handles are dropped here. This is not a rollback and is
                 // not reported as one: the persisted control record, the cognition
                 // partition and the owner's own writes are untouched.
@@ -1922,6 +2344,27 @@ mod compiled {
                 self.fatal = None;
                 self.settle();
             }
+        }
+
+        /// Drops the queued entries whose reservation was already released.
+        ///
+        /// The map is a registry of live preparations, so an entry without a lease
+        /// carries no state at all and keeping it would only grow the map. It is swept
+        /// on the next preparation and on shutdown, which are the only two places a
+        /// released entry can be observed; a live entry is always kept.
+        fn clear_released_initial_enable(&mut self) {
+            self.initial_enable.retain(|_, slot| slot.is_live());
+        }
+
+        /// Takes every queued reservation out of the map, leaving it empty.
+        ///
+        /// Called under the drain book lock, so a preparation that wants to publish in
+        /// the same critical section can never be taken: it sees the closed state first
+        /// and refuses. The caller releases the leases outside the lock.
+        fn take_initial_enable_pending(&mut self) -> Vec<Arc<InitialEnablePendingSlot>> {
+            std::mem::take(&mut self.initial_enable)
+                .into_values()
+                .collect()
         }
     }
 
@@ -2046,6 +2489,21 @@ mod compiled {
             WorkspaceIntelligenceClaimError::Fence(inner) => commit_error_code(inner),
             WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome { .. } => {
                 "claim_unexpected_fence_outcome"
+            }
+        }
+    }
+
+    /// Stable machine-readable code of one reservation failure.
+    ///
+    /// The `Display` form of the claim error carries the lease path and the control
+    /// root, so no log may print it: only a code crosses this boundary.
+    fn reserve_error_code(error: &WorkspaceIntelligenceClaimError) -> &'static str {
+        match error {
+            WorkspaceIntelligenceClaimError::Lease(_) => "reserve_lease",
+            WorkspaceIntelligenceClaimError::Control(_) => "reserve_control",
+            WorkspaceIntelligenceClaimError::Fence(_) => "reserve_fence",
+            WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome { .. } => {
+                "reserve_unexpected_fence_outcome"
             }
         }
     }
@@ -2479,7 +2937,15 @@ mod compiled {
                                 "Workspace intelligence host could not prepare its storage anchor: code={}",
                                 anchor_error_code(&error)
                             );
-                            Refusal::AnchorPreparationFailed
+                            if matches!(error, HostAnchorError::InitialEnableControlOccupied) {
+                                // A writer — typically an initial-enable reservation —
+                                // reached this namespace's control root between the
+                                // observation and the guarded mint. The order is anchor
+                                // first, always: this refuses without creating anything.
+                                Refusal::AnchorNamespaceBusy
+                            } else {
+                                Refusal::AnchorPreparationFailed
+                            }
                         })?;
                     match outcome {
                         // The guarded step minted this document under its own guard
@@ -2624,6 +3090,246 @@ mod compiled {
             Ok(())
         }
 
+        /// One complete preparation of one workspace for the future sole confirmed
+        /// first enable.
+        ///
+        /// This is the crate-internal entry point of that future owner; it has no
+        /// app-facing caller, no command and no registry row, and the public surface
+        /// stays `bootstrap`, `status()` and `shutdown()`. The only thing a caller
+        /// supplies is the id of a workspace in THIS host's own persisted catalog: no
+        /// path, no scope key, no host id and no anchor value can be handed in, and
+        /// nothing in the identity, the scope or the anchor is ever taken from the
+        /// caller. The fixed order is anchor, then reservation, then publication; see
+        /// the module documentation for each step and what it re-reads.
+        ///
+        /// The returned permit is a queued tenure, not a grant: it proves only that
+        /// this one scope is prepared, it authorizes no write, and a later consume
+        /// must re-admit the workspace and re-check its authority under the lease.
+        #[allow(dead_code, reason = "the confirmed enable preparation owner is not wired yet")]
+        pub(super) async fn prepare_initial_enable(
+            &self,
+            workspace_id: &str,
+        ) -> Result<InitialEnablePending, InitialEnableRefusal> {
+            // Host-owned, exactly like the anchor step: dropping this future marks the
+            // preparation abandoned and loses only the result, while the guarded work
+            // keeps running and stays counted until its reservation is released or
+            // published. A drain therefore cannot declare itself complete while this
+            // is still outstanding.
+            let host = self.clone();
+            let workspace = workspace_id.to_owned();
+            let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = Arc::clone(&abandoned);
+            let job = tokio::spawn(async move {
+                host.run_initial_enable_preparation(workspace, flag).await
+            });
+            let _abandon_on_drop = AbandonOnDrop(abandoned);
+            match job.await {
+                Ok(result) => result,
+                Err(_) => Err(InitialEnableRefusal::AnchorPreparationFailed),
+            }
+        }
+
+        /// The host-owned body of one complete initial-enable preparation.
+        ///
+        /// Every await in here can be long (a guarded mint, a lease acquisition, a
+        /// control guard), so each step re-reads what the previous one could have
+        /// invalidated, and the only decision that is taken on stale facts would be a
+        /// refusal.
+        async fn run_initial_enable_preparation(
+            &self,
+            workspace_id: String,
+            abandoned: Arc<std::sync::atomic::AtomicBool>,
+        ) -> Result<InitialEnablePending, InitialEnableRefusal> {
+            use InitialEnableAdmission as Admission;
+            use InitialEnableRefusal as Refusal;
+
+            // In flight from the same Book lock the drain transition is written
+            // under: either this registration happens first and the drain observes it,
+            // or the drain happened first and this refuses before any IO. The
+            // registration is dropped when this body returns, which includes the case
+            // where the caller stopped waiting.
+            let _in_flight = self.core.begin_anchor_preparation().await?;
+
+            #[cfg(test)]
+            if let Some(pause) = super::pauses::for_user_root_of(
+                &self.core.paths,
+                super::pauses::PausePoint::PreparingAnchor,
+            ) {
+                pause.wait().await;
+            }
+
+            // Step 1: the candidate. One read-only observation of the target the
+            // caller selected by id from this host's own catalog.
+            let admitted = self.initial_enable_admission(&workspace_id).await?;
+            // The admitted facts are captured before the candidate is moved: the
+            // re-verification below must compare against what this preparation was
+            // admitted for, never against a second, later read of the live facts.
+            let target = AdmittedTarget::capture(&admitted);
+
+            // Step 2: the anchor step (mint or adopt), which re-admits the candidate
+            // and adopts only a matching live anchor.
+            self.prepare_initial_enable_anchor(admitted).await?;
+
+            // Step 3: the anchor step may have awaited for a long time, so the whole
+            // target is observed again and compared: the catalog record, its root, the
+            // anchor identity and the whole binding must be the admitted ones.
+            let observed = self.initial_enable_admission(&workspace_id).await?;
+            if !target.holds(&observed) {
+                return Err(Refusal::AnchorChanged);
+            }
+            let Admission::Anchored { scope, control, .. } = observed else {
+                // Unreachable: `holds` refuses an observation without a binding anchor.
+                return Err(Refusal::AnchorChanged);
+            };
+            let scope_key = scope.as_str();
+
+            // Step 4: the reservation. The expectation states exactly what the
+            // observation above read; it is the belief the reservation's own guarded
+            // read re-checks, and it is deliberately not the closing comparison below,
+            // which also covers the fields it does not name.
+            let expectation = match &control {
+                InitialEnableControl::Absent => InitialEnableExpectation::Absent,
+                InitialEnableControl::Disabled { record } => InitialEnableExpectation::Present {
+                    control_generation: record.control_generation,
+                    policy: record.policy.clone(),
+                },
+            };
+            // Cheap non-authoritative stop checks; the authoritative one is the Book
+            // critical section at publication.
+            if self.core.shutdown_requested() {
+                return Err(Refusal::Stopping);
+            }
+            if abandoned.load(Ordering::SeqCst) {
+                return Err(Refusal::Abandoned);
+            }
+
+            #[cfg(test)]
+            if let Some(pause) = super::pauses::for_user_root_of(
+                &self.core.paths,
+                super::pauses::PausePoint::BeforeInitialEnableReserve,
+            ) {
+                pause.wait().await;
+            }
+
+            let reservation = match InitialEnableReservation::reserve(
+                self.core.control.clone(),
+                self.core.lease_root.clone(),
+                &scope_key,
+                expectation,
+            )
+            .await
+            {
+                Ok(InitialEnableAttempt::Reserved(reservation)) => reservation,
+                // Another owner holds this scope's lease. A busy refusal, not a queue:
+                // no control record is written and no worker, timer or retry is created.
+                Ok(InitialEnableAttempt::Standby) => return Err(Refusal::ReserveBusy),
+                Ok(InitialEnableAttempt::Refused(refusal)) => {
+                    return Err(Refusal::ReserveRefused(refusal))
+                }
+                Err(error) => {
+                    warn!(
+                        "Workspace intelligence host could not reserve its initial enable lease: code={}",
+                        reserve_error_code(&error)
+                    );
+                    return Err(Refusal::ReserveFailed);
+                }
+            };
+
+            #[cfg(test)]
+            if let Some(pause) = super::pauses::for_user_root_of(
+                &self.core.paths,
+                super::pauses::PausePoint::AfterInitialEnableReserve,
+            ) {
+                pause.wait().await;
+            }
+
+            // Step 5: the record must still be the one this preparation reserved
+            // against. The whole observed record is compared, so a same-generation edit
+            // to a field the expectation does not name — the schema version, the model
+            // reference, the switch or any unknown key — refuses exactly like a
+            // generation or policy change, and an absent record is not equal to a
+            // present one.
+            let after = self.initial_enable_admission(&workspace_id).await?;
+            if !target.holds(&after) {
+                return Err(Refusal::AnchorChanged);
+            }
+            let Admission::Anchored {
+                control: after_control,
+                ..
+            } = after
+            else {
+                return Err(Refusal::AnchorChanged);
+            };
+            if after_control != control {
+                return Err(Refusal::ControlChanged);
+            }
+
+            // Step 6: publication, in the same critical section that closes new
+            // preparations. A drain that started first always wins here, a caller that
+            // stopped waiting never publishes, and the queued tenure is released
+            // outside the lock.
+            //
+            // What is queued is the whole observation this preparation closed against,
+            // not only the projection the reservation carries: the future confirmed
+            // enable owner must be able to compare a fresh complete observation against
+            // it. The slot also remembers this host weakly, so the physical release of
+            // its lease stays inside this host's in-flight account without keeping the
+            // host or the lease alive by itself.
+            let observation = InitialEnableObservation {
+                target,
+                control: after_control,
+            };
+            let slot = Arc::new(InitialEnablePendingSlot::new(
+                reservation,
+                &self.core,
+                observation,
+            ));
+            let refusal = {
+                let mut book = self.core.book.lock().await;
+                if self.core.shutdown_requested()
+                    || matches!(
+                        book.state,
+                        WorkspaceIntelligenceHostState::Draining
+                            | WorkspaceIntelligenceHostState::Stopped
+                    )
+                {
+                    Some(Refusal::Stopping)
+                } else if abandoned.load(Ordering::SeqCst) {
+                    Some(Refusal::Abandoned)
+                } else if book
+                    .initial_enable
+                    .get(&scope_key)
+                    .is_some_and(|queued| queued.is_live())
+                {
+                    // One live preparation per scope on this host. The lease above
+                    // already refused every other owner, so this is local bookkeeping
+                    // and never a second tenure.
+                    Some(Refusal::ReserveBusy)
+                } else {
+                    book.clear_released_initial_enable();
+                    book.initial_enable
+                        .insert(scope_key.clone(), Arc::clone(&slot));
+                    None
+                }
+            };
+            if let Some(refusal) = refusal {
+                // Released outside the lock: dropping a lease is blocking IO.
+                slot.revoke();
+                return Err(refusal);
+            }
+            info!(
+                "Workspace intelligence host prepared one initial enable: marker={}",
+                self.core
+                    .tenancy
+                    .get()
+                    .map(|tenancy| tenancy.marker.as_str())
+                    .unwrap_or("<unattached>")
+            );
+            Ok(InitialEnablePending {
+                slot: Arc::downgrade(&slot),
+            })
+        }
+
         /// Current typed status.
         pub async fn status(&self) -> WorkspaceIntelligenceHostStatus {
             self.core.status().await
@@ -2645,6 +3351,11 @@ mod compiled {
         entered: tokio::sync::mpsc::UnboundedSender<()>,
         gate: Arc<tokio::sync::Semaphore>,
         armed: Arc<std::sync::atomic::AtomicBool>,
+        /// Blocking side of the same gate.
+        ///
+        /// A release that runs from a synchronous drop cannot await, so a fixture that
+        /// must park exactly that window releases the drop thread through this pair.
+        blocking: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     }
 
     #[cfg(test)]
@@ -2656,6 +3367,7 @@ mod compiled {
                     entered,
                     gate: Arc::new(tokio::sync::Semaphore::new(0)),
                     armed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                    blocking: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
                 },
                 receiver,
             )
@@ -2663,17 +3375,50 @@ mod compiled {
 
         pub(crate) fn release(&self) {
             self.gate.add_permits(1);
+            let (released, condvar) = &*self.blocking;
+            let mut released = released
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *released = true;
+            condvar.notify_all();
         }
 
         async fn wait(&self) {
+            if !self.entered_once() {
+                return;
+            }
+            let _ = self.gate.acquire().await;
+        }
+
+        /// Parks a synchronous caller until this pause is released.
+        ///
+        /// The entered signal is sent before blocking, so a fixture can wait for this
+        /// thread deterministically and then release it.
+        fn wait_blocking(&self) {
+            if !self.entered_once() {
+                return;
+            }
+            let (released, condvar) = &*self.blocking;
+            let mut released = released
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*released {
+                released = condvar
+                    .wait(released)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+
+        /// Announces this pause once and reports whether this call owns the wait.
+        fn entered_once(&self) -> bool {
             if !self
                 .armed
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
-                return;
+                return false;
             }
             let _ = self.entered.send(());
-            let _ = self.gate.acquire().await;
+            true
         }
     }
 
@@ -2693,6 +3438,20 @@ mod compiled {
         /// True while the bounded standby worker exists.
         pub(crate) async fn has_standby_worker_for_tests(&self) -> bool {
             self.core.book.lock().await.worker.is_some()
+        }
+
+        /// Live queued initial-enable preparations of this host, so a fixture can
+        /// prove that a permit was published, released or invalidated without reading
+        /// any private identity.
+        pub(crate) async fn live_initial_enable_pendings_for_tests(&self) -> usize {
+            self.core
+                .book
+                .lock()
+                .await
+                .initial_enable
+                .values()
+                .filter(|slot| slot.is_live())
+                .count()
         }
 
         /// One explicit evaluation pass, for fixtures that must not wait for the
@@ -2773,8 +3532,22 @@ mod pauses {
         /// After the guarded anchor step committed, before the adoption publishes
         /// under the book lock.
         BeforeAnchorAdoption,
+        /// After a complete preparation re-observed its target and strictly before its
+        /// reservation, so a fixture can start a drain or change the record in exactly
+        /// the window between the belief and the guarded read.
+        BeforeInitialEnableReserve,
+        /// While a complete preparation holds the scope lease and strictly before its
+        /// closing observation, so a fixture can cancel the caller or edit the record
+        /// or the catalog after the reservation decided.
+        AfterInitialEnableReserve,
         /// In the drain loop, between the in-flight check and the wait.
         DrainWait,
+        /// After a queued initial-enable reservation was taken out of its slot and
+        /// strictly before its OS lease is released, so a fixture can hold a physical
+        /// release in flight while a drain decides. Used by the drain batch, which
+        /// awaits the window, and by a permit drop, which cannot await and therefore
+        /// parks its own thread.
+        InitialEnableRelease,
     }
 
     static PAUSES: Mutex<Vec<(PathBuf, PausePoint, HostPause)>> = Mutex::new(Vec::new());
@@ -3722,26 +4495,29 @@ mod tests {
             fixture.seed_control(&scope_key, false, Some(policy.clone())).await;
             let before = fixture.tree_hash();
             let Ok(InitialEnableAdmission::Anchored {
-                control: InitialEnableControl::Disabled { generation, raw_policy }, ..
+                control: InitialEnableControl::Disabled { record },
+                ..
             }) = host.initial_enable_admission(ID).await else {
                 panic!("a matching disabled record is a usable snapshot");
             };
+            let (generation, raw_policy) = record.generation_and_policy_for_tests();
             assert_eq!(generation, 1);
-            assert!(raw_policy.as_ref() == Some(&policy), "the whole raw policy must survive");
+            assert!(raw_policy == Some(&policy), "the whole raw policy must survive");
             assert_eq!(fixture.tree_hash(), before);
 
             // Old records without schema, generation, switch or binding still read as OFF.
             fixture.overwrite_control_record(br#"{"policy":{"future":[1,2]}}"#);
             let before = fixture.tree_hash();
             let Ok(InitialEnableAdmission::Anchored {
-                control: InitialEnableControl::Disabled { generation, raw_policy },
+                control: InitialEnableControl::Disabled { record },
                 ..
             }) = host.initial_enable_admission(ID).await
             else {
                 panic!("a record without a schema version still reads as an OFF snapshot");
             };
+            let (generation, raw_policy) = record.generation_and_policy_for_tests();
             assert_eq!(generation, 0);
-            assert!(raw_policy.as_ref() == Some(&json!({"future": [1, 2]})));
+            assert!(raw_policy == Some(&json!({"future": [1, 2]})));
             assert_eq!(fixture.tree_hash(), before);
         }
 
@@ -4516,6 +5292,1099 @@ mod tests {
             assert!(!host.has_standby_worker_for_tests().await);
             assert_anchor_only_residue(&fixture);
             assert_eq!(registry_bytes(&fixture), registry);
+        }
+    }
+
+    mod initial_enable_preparation {
+        use super::super::compiled::{InitialEnableRefusal, WorkspaceIntelligenceHost};
+        use super::*;
+        use openbitfun_services_core::workspace_intelligence_host_anchor::HostAnchorState;
+        use InitialEnableRefusal as Refusal;
+        use WorkspaceIntelligenceHostReason as Reason;
+        use WorkspaceIntelligenceHostUnsupportedProfile as Profile;
+
+        /// The id of the workspace a caller may select from this host's own catalog.
+        /// It is the only input of a preparation: never a path, a scope key, a host id
+        /// or an anchor value.
+        const ID: &str = "  persisted:workspace/a  ";
+        /// A second workspace of the same catalog, so scope independence is visible.
+        const OTHER: &str = "persisted:workspace/b";
+
+        async fn bootstrap(fixture: &Fixture) -> WorkspaceIntelligenceHost {
+            WorkspaceIntelligenceHost::bootstrap_with_options(
+                Arc::clone(&fixture.paths),
+                source(),
+                WorkspaceIntelligenceHostSurface::Desktop,
+                RuntimeDeployment::Embedded,
+                options(sleeping()),
+            )
+            .await
+        }
+
+        /// One host whose drain budget is short enough to expire on purpose.
+        async fn bootstrap_with_budget(
+            fixture: &Fixture,
+            drain_budget: Duration,
+        ) -> WorkspaceIntelligenceHost {
+            WorkspaceIntelligenceHost::bootstrap_with_options(
+                Arc::clone(&fixture.paths),
+                source(),
+                WorkspaceIntelligenceHostSurface::Desktop,
+                RuntimeDeployment::Embedded,
+                options(HostTiming::new(
+                    Duration::from_secs(3600),
+                    Duration::from_secs(3600),
+                    drain_budget,
+                )),
+            )
+            .await
+        }
+
+        fn anchor_path(fixture: &Fixture) -> PathBuf {
+            fixture
+                .paths
+                .workspace_intelligence_dir()
+                .join(HOST_ANCHOR_FILE_NAME)
+        }
+
+        async fn stored_host_id(fixture: &Fixture) -> Option<String> {
+            let store = HostAnchorStore::new(WorkspaceIntelligenceHost::anchor_root_for_tests(
+                &fixture.paths,
+            ));
+            match store.read_strict().await.unwrap() {
+                HostAnchorState::Present(anchor) => Some(anchor.host_id().to_owned()),
+                HostAnchorState::Absent => None,
+            }
+        }
+
+        fn registry_bytes(fixture: &Fixture) -> Vec<u8> {
+            std::fs::read(fixture.registry_path()).unwrap()
+        }
+
+        fn namespace_entries(fixture: &Fixture) -> Vec<String> {
+            let mut names: Vec<String> =
+                match std::fs::read_dir(fixture.paths.workspace_intelligence_dir()) {
+                    Ok(entries) => entries
+                        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+            names.sort();
+            names
+        }
+
+        /// File names under the control root, sorted.
+        fn control_entries(fixture: &Fixture) -> Vec<String> {
+            let mut names: Vec<String> = match std::fs::read_dir(fixture.control_dir()) {
+                Ok(entries) => entries
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            names.sort();
+            names
+        }
+
+        /// The digest the lease and control owners derive from one scope key.
+        fn scope_digest(scope: &str) -> String {
+            let mut hasher = Sha256::new();
+            hasher.update(scope.as_bytes());
+            format!("{:x}", hasher.finalize())
+        }
+
+        /// A readable OFF policy bound to this host's observed binding.
+        ///
+        /// The binding fence the admission checks plus a closed memory domain, which
+        /// the policy reader accepts without a diagnostic. An `enabled: true` domain
+        /// without its autonomy block is deliberately unreadable there, so a fixture
+        /// that needs a usable OFF record must close the domain.
+        fn bound_off_policy(binding: &ExecutionBinding) -> Value {
+            let mut policy = Fixture::bound_policy(binding);
+            policy["domains"]["memory"]["enabled"] = json!(false);
+            policy
+        }
+
+        /// The files a published preparation may leave: the payload-free control guard
+        /// lock and the scope lease, plus the control record when the scope already had
+        /// one. Nothing else, and never a new record.
+        fn assert_prepared_residue(fixture: &Fixture, scope: &str, with_record: bool) {
+            let digest = scope_digest(scope);
+            let mut expected = vec![format!("{digest}.json.lock")];
+            if with_record {
+                expected.insert(0, format!("{digest}.json"));
+            }
+            assert_eq!(
+                control_entries(fixture),
+                expected,
+                "the payload-free control guard lock is the only added control-root entry"
+            );
+            assert_eq!(
+                fixture.control_records().len(),
+                usize::from(with_record),
+                "a preparation never writes a control record"
+            );
+            assert_eq!(
+                fixture.lock_files(),
+                vec![fixture.lease_dir().join(format!("{digest}.lock"))],
+                "exactly the scope lease, never more"
+            );
+            assert!(!fixture.cognition_dir().exists(), "no cognition partition");
+            assert!(fixture.sqlite_files().is_empty(), "no cognition database");
+        }
+
+        async fn assert_started_nothing(host: &WorkspaceIntelligenceHost) {
+            assert!(!host.has_standby_worker_for_tests().await, "no standby worker");
+            assert_eq!(host.in_flight_for_tests().await, 0, "no work is left in flight");
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+        }
+
+        async fn wait_until_quiescent(host: &WorkspaceIntelligenceHost) {
+            let deadline = tokio::time::Instant::now() + DEADLINE;
+            while host.in_flight_for_tests().await != 0 {
+                assert!(tokio::time::Instant::now() < deadline, "quiescence deadline");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// Runs one complete preparation parked with its reservation already held,
+        /// edits the fixture in exactly that window, and returns the refusal.
+        ///
+        /// The edit lands after the reservation decided and before the closing
+        /// observation, which is the window only a whole-record comparison can catch.
+        async fn refusal_after_edit(
+            seed_record: bool,
+            edit: impl FnOnce(&Fixture),
+        ) -> (Refusal, Fixture) {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            if seed_record {
+                let host_id = fixture.anchor().await;
+                let scope = fixture.scope(&host_id, ID);
+                let binding = fixture.binding(&host_id, ID).await;
+                fixture
+                    .seed_control(&scope, false, Some(bound_off_policy(&binding)))
+                    .await;
+            }
+            let host = bootstrap(&fixture).await;
+            let (pause, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::AfterInitialEnableReserve,
+                pause.clone(),
+            );
+            let caller = tokio::spawn({
+                let host = host.clone();
+                async move { host.prepare_initial_enable(ID).await.map(|permit| drop(permit)) }
+            });
+            tokio::time::timeout(DEADLINE, entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(host.in_flight_for_tests().await, 1);
+            edit(&fixture);
+            let edited = fixture.tree_hash();
+            pause.release();
+            let Err(refusal) = caller.await.unwrap() else {
+                panic!("a change after the reservation must refuse");
+            };
+            assert_eq!(fixture.tree_hash(), edited, "a refusal mutates nothing");
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+            if let Some(host_id) = stored_host_id(&fixture).await {
+                assert!(
+                    !fixture.lease_is_held(&fixture.scope(&host_id, ID)),
+                    "a refused preparation releases the lease"
+                );
+            }
+            assert!(host.status().await.counts().active() == 0, "never active");
+            assert!(!host.has_standby_worker_for_tests().await, "no worker");
+            assert!(!fixture.cognition_dir().exists(), "no cognition partition");
+            assert!(fixture.sqlite_files().is_empty(), "no cognition database");
+            (refusal, fixture)
+        }
+
+        #[tokio::test]
+        async fn a_prepared_scope_holds_one_reservation_without_enabling_anything() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let registry = registry_bytes(&fixture);
+            assert!(namespace_entries(&fixture).is_empty(), "bootstrap writes nothing");
+            assert!(!host.status().await.anchor_present());
+
+            let permit = host.prepare_initial_enable(ID).await.unwrap();
+            assert!(permit.is_live_for_tests());
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 1);
+
+            let status = host.status().await;
+            assert!(status.anchor_present(), "the anchor is adopted in memory");
+            assert_eq!(status.state(), WorkspaceIntelligenceHostState::Inactive);
+            assert_eq!(
+                status.reason(),
+                Some(Reason::NoEnabledScope),
+                "a preparation is not an execution and enables nothing"
+            );
+            assert_eq!(status.counts().active(), 0);
+            assert_eq!(status.counts().standby(), 0);
+            assert!(status.scopes().is_empty());
+            assert!(status.host_marker().is_some());
+
+            let host_id = stored_host_id(&fixture).await.unwrap();
+            let scope = fixture.scope(&host_id, ID);
+            assert!(fixture.lease_is_held(&scope), "the reservation holds the lease");
+            assert_prepared_residue(&fixture, &scope, false);
+            assert_eq!(registry_bytes(&fixture), registry, "the catalog is never written");
+            assert_eq!(host.in_flight_for_tests().await, 0);
+
+            let mut expected = vec![
+                HOST_ANCHOR_FILE_NAME.to_owned(),
+                format!("{HOST_ANCHOR_FILE_NAME}.lock"),
+                fixture
+                    .control_dir()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+                fixture
+                    .lease_dir()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            ];
+            expected.sort();
+            assert_eq!(namespace_entries(&fixture), expected);
+
+            // Repeated preparation of the same scope is one live preparation: the held
+            // lease answers with a typed busy refusal instead of a second queue entry.
+            assert_eq!(
+                host.prepare_initial_enable(ID).await.err(),
+                Some(Refusal::ReserveBusy)
+            );
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 1);
+            assert!(!host.has_standby_worker_for_tests().await, "a busy refusal queues nothing");
+
+            // Releasing the permit releases the lease and the queued entry, and the same
+            // host epoch can prepare the same target again with a stable identity.
+            let anchor = fixture.anchor_bytes();
+            drop(permit);
+            assert!(!fixture.lease_is_held(&scope));
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+            let again = host.prepare_initial_enable(ID).await.unwrap();
+            assert_eq!(stored_host_id(&fixture).await.unwrap(), host_id);
+            assert_eq!(fixture.anchor_bytes(), anchor, "the anchor is never rewritten");
+            assert!(fixture.lease_is_held(&scope));
+            drop(again);
+            assert!(!fixture.lease_is_held(&scope));
+
+            let shutdown = host.shutdown().await;
+            assert_eq!(shutdown.drain(), WorkspaceIntelligenceHostDrain::Drained);
+            assert_eq!(shutdown.state(), WorkspaceIntelligenceHostState::Stopped);
+            assert_started_nothing(&host).await;
+        }
+
+        #[tokio::test]
+        async fn a_disabled_and_a_legacy_record_without_the_switch_both_prepare() {
+            // (a) A supported OFF record at generation 1 with the observed binding.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host_id = fixture.anchor().await;
+            let scope = fixture.scope(&host_id, ID);
+            let binding = fixture.binding(&host_id, ID).await;
+            fixture
+                .seed_control(&scope, false, Some(bound_off_policy(&binding)))
+                .await;
+            let records = fixture.control_records();
+            let host = bootstrap(&fixture).await;
+            let permit = host.prepare_initial_enable(ID).await.unwrap();
+            assert!(permit.is_live_for_tests());
+            assert_eq!(fixture.control_records(), records, "the record is never rewritten");
+            assert!(fixture.lease_is_held(&scope));
+            assert_prepared_residue(&fixture, &scope, true);
+            assert!(!host.has_standby_worker_for_tests().await);
+            drop(permit);
+            assert!(!fixture.lease_is_held(&scope));
+            assert_eq!(host.status().await.counts().active(), 0);
+
+            // (b) A legacy record without schema version, generation or switch still
+            // reads as OFF and is prepared without a rewrite.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host_id = fixture.anchor().await;
+            let scope = fixture.scope(&host_id, ID);
+            let binding = fixture.binding(&host_id, ID).await;
+            fixture
+                .seed_control(&scope, false, Some(bound_off_policy(&binding)))
+                .await;
+            let legacy = fixture.overwrite_control_record(br#"{"policy":{"future":[1,2]}}"#);
+            let host = bootstrap(&fixture).await;
+            let permit = host.prepare_initial_enable(ID).await.unwrap();
+            assert!(permit.is_live_for_tests());
+            assert_eq!(
+                fixture.control_records(),
+                vec![(fixture.control_records()[0].0.clone(), legacy)],
+                "the legacy record is preserved byte for byte"
+            );
+            assert!(fixture.lease_is_held(&scope));
+            drop(permit);
+            assert!(!fixture.lease_is_held(&scope));
+            assert!(!host.has_standby_worker_for_tests().await);
+        }
+
+        #[tokio::test]
+        async fn an_enabled_scope_refuses_and_is_never_taken_over() {
+            // (a) An enabled record with the observed binding: refused before any
+            // reservation, so no lease is taken at all. The fixture defers the
+            // bootstrap pass on purpose, so the only thing that could take a lease is
+            // the preparation itself.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host_id = fixture.anchor().await;
+            let scope = fixture.scope(&host_id, ID);
+            let binding = fixture.binding(&host_id, ID).await;
+            fixture
+                .seed_control(&scope, true, Some(Fixture::bound_policy(&binding)))
+                .await;
+            let records = fixture.control_records();
+            let entries = control_entries(&fixture);
+            let _deferral = super::super::pauses::defer_first_pass(fixture.paths.user_root_dir());
+            let host = bootstrap(&fixture).await;
+            assert_eq!(
+                host.prepare_initial_enable(ID).await.err(),
+                Some(Refusal::AlreadyEnabled)
+            );
+            assert_eq!(fixture.control_records(), records, "the ON record is untouched");
+            assert_eq!(control_entries(&fixture), entries, "no control-root entry is added");
+            assert!(fixture.lock_files().is_empty(), "no lease is taken");
+            assert_eq!(host.status().await.counts().active(), 0, "nothing is activated");
+            assert_started_nothing(&host).await;
+
+            // (b) A legacy enabled record without any binding is not taken over either.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host_id = fixture.anchor().await;
+            let scope = fixture.scope(&host_id, ID);
+            let binding = fixture.binding(&host_id, ID).await;
+            fixture
+                .seed_control(&scope, false, Some(bound_off_policy(&binding)))
+                .await;
+            let legacy = fixture.overwrite_control_record(br#"{"enabled":true}"#);
+            let _deferral = super::super::pauses::defer_first_pass(fixture.paths.user_root_dir());
+            let host = bootstrap(&fixture).await;
+            assert_eq!(
+                host.prepare_initial_enable(ID).await.err(),
+                Some(Refusal::AlreadyEnabled)
+            );
+            assert_eq!(fixture.control_records()[0].1, legacy);
+            assert!(fixture.lock_files().is_empty());
+            assert_started_nothing(&host).await;
+        }
+
+        #[tokio::test]
+        async fn a_reservation_that_reached_the_control_root_first_refuses_the_mint() {
+            // The forbidden order: a reservation touches the namespace's control root
+            // before the anchor exists. The guarded mint refuses it and creates nothing.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let (pause, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::BeforeGuardedMint,
+                pause.clone(),
+            );
+            let registry = registry_bytes(&fixture);
+            let caller = tokio::spawn({
+                let host = host.clone();
+                async move { host.prepare_initial_enable(ID).await.map(|permit| drop(permit)) }
+            });
+            tokio::time::timeout(DEADLINE, entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            std::fs::create_dir_all(fixture.control_dir()).unwrap();
+            let foreign = fixture.control_dir().join("foreign.json.lock");
+            std::fs::write(&foreign, b"occupied").unwrap();
+            let occupied = fixture.tree_hash();
+
+            pause.release();
+            assert_eq!(caller.await.unwrap().err(), Some(Refusal::AnchorNamespaceBusy));
+            assert_eq!(fixture.tree_hash(), occupied, "nothing is created and nothing is repaired");
+            assert!(!anchor_path(&fixture).exists(), "no late mint");
+            assert_eq!(stored_host_id(&fixture).await, None);
+            assert_eq!(std::fs::read(&foreign).unwrap(), b"occupied");
+            assert!(fixture.lock_files().is_empty(), "no lease is taken");
+            assert_eq!(registry_bytes(&fixture), registry);
+            assert!(!host.status().await.anchor_present());
+            assert_started_nothing(&host).await;
+        }
+
+        #[tokio::test]
+        async fn a_held_permit_neither_delays_the_drain_nor_stays_valid() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let permit = host.prepare_initial_enable(ID).await.unwrap();
+            let host_id = stored_host_id(&fixture).await.unwrap();
+            let scope = fixture.scope(&host_id, ID);
+            let anchor = fixture.anchor_bytes();
+
+            // The permit is a queued tenure, not in-flight work: the drain completes
+            // while it is still held, and that is what invalidates it.
+            let shutdown = host.shutdown().await;
+            assert_eq!(shutdown.drain(), WorkspaceIntelligenceHostDrain::Drained);
+            assert_eq!(shutdown.state(), WorkspaceIntelligenceHostState::Stopped);
+            assert!(!permit.is_live_for_tests(), "a stopped host invalidates the permit");
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+            assert!(!fixture.lease_is_held(&scope), "the lease is released");
+            assert_eq!(fixture.anchor_bytes(), anchor, "no repair and no rewrite");
+
+            drop(permit);
+            let before = fixture.tree_hash();
+            assert_eq!(
+                host.prepare_initial_enable(ID).await.err(),
+                Some(Refusal::Stopping)
+            );
+            assert_eq!(fixture.tree_hash(), before, "a stopped host writes nothing");
+            assert_started_nothing(&host).await;
+        }
+
+        #[tokio::test]
+        async fn dropping_the_permit_or_the_host_releases_the_reservation() {
+            // (a) The permit releases the queued tenure synchronously.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let permit = host.prepare_initial_enable(ID).await.unwrap();
+            let scope = fixture.scope(&stored_host_id(&fixture).await.unwrap(), ID);
+            assert!(fixture.lease_is_held(&scope));
+            drop(permit);
+            assert!(!fixture.lease_is_held(&scope), "dropping the permit releases the lease");
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+            assert!(host.status().await.anchor_present(), "the host stays usable");
+            assert_eq!(host.shutdown().await.drain(), WorkspaceIntelligenceHostDrain::Drained);
+
+            // (b) The permit holds only a weak reference, so dropping the host releases
+            // the lease even while the permit itself is still alive.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let permit = host.prepare_initial_enable(ID).await.unwrap();
+            let scope = fixture.scope(&stored_host_id(&fixture).await.unwrap(), ID);
+            assert!(fixture.lease_is_held(&scope));
+            drop(host);
+            assert!(
+                !fixture.lease_is_held(&scope),
+                "a permit cannot keep the host or its lease alive"
+            );
+            assert!(!permit.is_live_for_tests(), "the permit is dead with its host");
+            drop(permit);
+        }
+
+        #[tokio::test]
+        async fn a_caller_that_stops_waiting_releases_instead_of_publishing() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let (pause, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::AfterInitialEnableReserve,
+                pause.clone(),
+            );
+            let caller = tokio::spawn({
+                let host = host.clone();
+                async move { host.prepare_initial_enable(ID).await.map(|permit| drop(permit)) }
+            });
+            tokio::time::timeout(DEADLINE, entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let host_id = stored_host_id(&fixture).await.unwrap();
+            let scope = fixture.scope(&host_id, ID);
+            assert!(fixture.lease_is_held(&scope), "the reservation is really held");
+            assert_eq!(host.in_flight_for_tests().await, 1);
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            pause.release();
+            wait_until_quiescent(&host).await;
+            assert!(
+                !fixture.lease_is_held(&scope),
+                "the owned task releases the reservation instead of publishing it"
+            );
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+            assert!(fixture.control_records().is_empty(), "no control record appears");
+            assert!(!host.has_standby_worker_for_tests().await);
+            assert!(!fixture.cognition_dir().exists());
+            assert_eq!(host.status().await.counts().active(), 0);
+        }
+
+        #[tokio::test]
+        async fn a_drain_that_times_out_stays_draining_and_never_publishes_after_stop() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap_with_budget(&fixture, Duration::from_millis(200)).await;
+            let (pause, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::AfterInitialEnableReserve,
+                pause.clone(),
+            );
+            let caller = tokio::spawn({
+                let host = host.clone();
+                async move { host.prepare_initial_enable(ID).await.map(|permit| drop(permit)) }
+            });
+            tokio::time::timeout(DEADLINE, entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let host_id = stored_host_id(&fixture).await.unwrap();
+            let scope = fixture.scope(&host_id, ID);
+            assert!(fixture.lease_is_held(&scope));
+
+            let shutdown = host.shutdown().await;
+            assert_eq!(
+                shutdown.drain(),
+                WorkspaceIntelligenceHostDrain::DrainTimedOut { outstanding: 1 },
+                "the parked preparation is real outstanding work"
+            );
+            assert_eq!(shutdown.state(), WorkspaceIntelligenceHostState::Draining);
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+            assert!(!caller.is_finished(), "nothing is published while the drain waits");
+
+            pause.release();
+            assert_eq!(caller.await.unwrap().err(), Some(Refusal::Stopping));
+            wait_until_quiescent(&host).await;
+            assert!(!fixture.lease_is_held(&scope), "the lease is released, never published");
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+            assert_eq!(
+                host.status().await.state(),
+                WorkspaceIntelligenceHostState::Draining,
+                "a timed-out drain is never promoted to stopped"
+            );
+            assert!(fixture.control_records().is_empty(), "no ON write on any path");
+            assert!(!host.has_standby_worker_for_tests().await);
+        }
+
+        #[tokio::test]
+        async fn a_stop_before_the_first_read_leaves_the_tree_untouched() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let (drain_pause, mut drain_entered) = HostPause::new();
+            let _drain_registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::DrainWait,
+                drain_pause.clone(),
+            );
+            // A budget far above the runtime of this fixture: the drain must leave
+            // through the notification of the zero drop, not through its deadline, and
+            // a slow machine must not turn that into a timeout.
+            let host = bootstrap_with_budget(&fixture, Duration::from_secs(30)).await;
+            let (pause, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::PreparingAnchor,
+                pause.clone(),
+            );
+            let caller = tokio::spawn({
+                let host = host.clone();
+                async move { host.prepare_initial_enable(ID).await.map(|permit| drop(permit)) }
+            });
+            tokio::time::timeout(DEADLINE, entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(host.in_flight_for_tests().await, 1);
+            assert!(namespace_entries(&fixture).is_empty(), "nothing was written yet");
+
+            // An unreadable catalog would surface as `CatalogUnreadable` if any read
+            // happened; the registration gate is what must refuse instead.
+            std::fs::write(fixture.registry_path(), b"invalid catalog").unwrap();
+            let before = fixture.tree_hash();
+            let shutdown = tokio::spawn({
+                let host = host.clone();
+                async move { host.shutdown().await }
+            });
+            tokio::time::timeout(DEADLINE, drain_entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(host.status().await.state(), WorkspaceIntelligenceHostState::Draining);
+            assert!(!shutdown.is_finished(), "the drain observes the preparation");
+
+            // Release the drain's own pause first: the drain is then past its test
+            // window and waits on the notification of the in-flight account, which is
+            // the zero-drop path under test here. Only then is the preparation
+            // released, so the wake-up it owes the drain is the one that ends the wait.
+            drain_pause.release();
+            assert!(
+                !shutdown.is_finished(),
+                "the drain waits for the in-flight preparation, not for the fixture"
+            );
+            pause.release();
+            assert_eq!(caller.await.unwrap().err(), Some(Refusal::Stopping));
+            assert_eq!(host.in_flight_for_tests().await, 0, "the preparation stopped counting");
+            let shutdown = shutdown.await.unwrap();
+            assert_eq!(shutdown.drain(), WorkspaceIntelligenceHostDrain::Drained);
+            assert_eq!(shutdown.state(), WorkspaceIntelligenceHostState::Stopped);
+            assert_eq!(fixture.tree_hash(), before, "a stop before the first read writes nothing");
+            assert!(namespace_entries(&fixture).is_empty());
+            assert!(!fixture.control_dir().exists(), "no control root is created");
+            assert!(!fixture.lease_root_exists(), "no lease root is created");
+            assert_started_nothing(&host).await;
+        }
+
+        #[tokio::test]
+        async fn a_lease_release_of_the_drain_batch_is_never_reported_as_drained() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap_with_budget(&fixture, Duration::from_millis(300)).await;
+            let permit = host.prepare_initial_enable(ID).await.unwrap();
+            let host_id = stored_host_id(&fixture).await.unwrap();
+            let scope = fixture.scope(&host_id, ID);
+            assert!(fixture.lease_is_held(&scope), "the queued tenure holds the lease");
+            let (release, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::InitialEnableRelease,
+                release.clone(),
+            );
+
+            // The drain takes the whole batch out of the book and only then leaves the
+            // lock, so this window is exactly "the queue is empty and the OS lease is
+            // not": a second drain that reads the empty map must not call it drained.
+            let owner = tokio::spawn({
+                let host = host.clone();
+                async move { host.shutdown().await }
+            });
+            tokio::time::timeout(DEADLINE, entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(host.status().await.state(), WorkspaceIntelligenceHostState::Draining);
+            assert!(fixture.lease_is_held(&scope), "the physical release is still outstanding");
+
+            let second = host.shutdown().await;
+            assert!(
+                matches!(
+                    second.drain(),
+                    WorkspaceIntelligenceHostDrain::DrainTimedOut { outstanding: 1 }
+                ),
+                "an outstanding release is real work, not a drained host: {:?}",
+                second.drain()
+            );
+            assert_eq!(second.state(), WorkspaceIntelligenceHostState::Draining);
+            assert!(!owner.is_finished(), "the first drain still owes its release");
+
+            release.release();
+            let owner = owner.await.unwrap();
+            assert_eq!(owner.drain(), WorkspaceIntelligenceHostDrain::Drained);
+            assert_eq!(owner.state(), WorkspaceIntelligenceHostState::Stopped);
+            assert!(!fixture.lease_is_held(&scope), "the lease is physically released");
+
+            // Released is reacquirable: a fresh host of the same user root takes the
+            // same scope again, and its own permit releases it in turn.
+            let witness = bootstrap_with_budget(&fixture, Duration::from_millis(300)).await;
+            let reacquired = witness.prepare_initial_enable(ID).await.unwrap();
+            assert!(fixture.lease_is_held(&scope), "the released lease can be taken again");
+            drop(reacquired);
+            assert!(!fixture.lease_is_held(&scope));
+
+            // A permit that outlived its queued reservation is inert: it neither holds
+            // the lease nor keeps the account of the stopped host busy.
+            drop(permit);
+            assert_eq!(host.in_flight_for_tests().await, 0);
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+            assert_eq!(host.shutdown().await.drain(), WorkspaceIntelligenceHostDrain::Drained);
+        }
+
+        #[tokio::test]
+        async fn a_release_of_a_dropped_permit_is_never_reported_as_drained() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap_with_budget(&fixture, Duration::from_millis(300)).await;
+            let permit = host.prepare_initial_enable(ID).await.unwrap();
+            let host_id = stored_host_id(&fixture).await.unwrap();
+            let scope = fixture.scope(&host_id, ID);
+            assert!(fixture.lease_is_held(&scope));
+            let (release, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::InitialEnableRelease,
+                release.clone(),
+            );
+
+            // A permit drop is synchronous, so the release window it owns is parked on
+            // that thread: the lease is out of its slot and not yet dropped, which is
+            // the exact window a drain may not mistake for a released lease.
+            let dropped = std::thread::spawn(move || drop(permit));
+            tokio::time::timeout(DEADLINE, entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(fixture.lease_is_held(&scope), "the physical release is still outstanding");
+
+            let drain = host.shutdown().await;
+            assert!(
+                matches!(
+                    drain.drain(),
+                    WorkspaceIntelligenceHostDrain::DrainTimedOut { outstanding: 1 }
+                ),
+                "a release in flight is not a drained host: {:?}",
+                drain.drain()
+            );
+            assert_eq!(drain.state(), WorkspaceIntelligenceHostState::Draining);
+            assert!(fixture.lease_is_held(&scope));
+
+            release.release();
+            dropped.join().unwrap();
+            assert!(!fixture.lease_is_held(&scope), "the lease is physically released");
+            let drain = host.shutdown().await;
+            assert_eq!(drain.drain(), WorkspaceIntelligenceHostDrain::Drained);
+            assert_eq!(drain.state(), WorkspaceIntelligenceHostState::Stopped);
+            assert_eq!(host.in_flight_for_tests().await, 0);
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+            assert_started_nothing(&host).await;
+        }
+
+        #[tokio::test]
+        async fn concurrent_and_cross_host_preparations_allow_exactly_one_per_scope() {
+            // (a) Two concurrent preparations of one scope on one host. Both results are
+            // held, so neither permit can release the shared lease before the other one
+            // asked for it: the interleaving decides which one wins, never how many.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let left = host.clone();
+            let right = host.clone();
+            let (left, right) = tokio::join!(
+                async move { left.prepare_initial_enable(ID).await },
+                async move { right.prepare_initial_enable(ID).await },
+            );
+            assert_eq!(
+                [left.is_ok(), right.is_ok()].iter().filter(|ok| **ok).count(),
+                1,
+                "exactly one preparation wins"
+            );
+            let refusal = [left.as_ref().err(), right.as_ref().err()]
+                .into_iter()
+                .flatten()
+                .next()
+                .copied();
+            assert_eq!(
+                refusal,
+                Some(Refusal::ReserveBusy),
+                "the loser is refused as busy, never queued"
+            );
+            let host_id = stored_host_id(&fixture).await.unwrap();
+            let scope = fixture.scope(&host_id, ID);
+            assert!(fixture.lease_is_held(&scope), "the winner holds the one lease");
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 1);
+            assert!(!host.has_standby_worker_for_tests().await);
+            drop(left);
+            drop(right);
+            assert!(!fixture.lease_is_held(&scope), "dropping the winner releases the lease");
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+
+            // (b) Two hosts of the same user root, same scope: one wins, and the other
+            // adopts the same anchor identity without ever becoming active.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let first = bootstrap(&fixture).await;
+            let second = bootstrap(&fixture).await;
+            let winning = first.prepare_initial_enable(ID).await.unwrap();
+            let host_id = stored_host_id(&fixture).await.unwrap();
+            let scope = fixture.scope(&host_id, ID);
+            assert!(fixture.lease_is_held(&scope));
+            assert_eq!(
+                second.prepare_initial_enable(ID).await.err(),
+                Some(Refusal::ReserveBusy)
+            );
+            assert_eq!(first.live_initial_enable_pendings_for_tests().await, 1);
+            assert_eq!(second.live_initial_enable_pendings_for_tests().await, 0);
+            assert_eq!(second.status().await.counts().active(), 0);
+            assert!(!second.has_standby_worker_for_tests().await);
+            assert_eq!(
+                first.status().await.host_marker(),
+                second.status().await.host_marker(),
+                "both hosts describe one anchor identity"
+            );
+            drop(winning);
+            assert!(!fixture.lease_is_held(&scope));
+
+            // (c) Different scopes are independent: both may be prepared at once.
+            let fixture = Fixture::new().await;
+            fixture
+                .publish(vec![
+                    local_record(&fixture, ID, "local"),
+                    local_record(&fixture, OTHER, "other"),
+                ])
+                .await;
+            let host = bootstrap(&fixture).await;
+            let first = host.prepare_initial_enable(ID).await.unwrap();
+            let second = host.prepare_initial_enable(OTHER).await.unwrap();
+            let host_id = stored_host_id(&fixture).await.unwrap();
+            let one = fixture.scope(&host_id, ID);
+            let two = fixture.scope(&host_id, OTHER);
+            assert!(one != two);
+            assert!(fixture.lease_is_held(&one) && fixture.lease_is_held(&two));
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 2);
+            drop(first);
+            assert!(!fixture.lease_is_held(&one), "one release does not touch the other");
+            assert!(fixture.lease_is_held(&two));
+            drop(second);
+            assert!(!fixture.lease_is_held(&two));
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+        }
+
+        #[tokio::test]
+        async fn a_record_change_after_the_reservation_refuses_and_never_mutates() {
+            // (a) A same-generation model reference edit.
+            let (refusal, fixture) = refusal_after_edit(true, |fixture| {
+                let mut document: Value =
+                    serde_json::from_slice(&fixture.control_bytes()).unwrap();
+                document["model_ref"] = json!("other-model");
+                std::fs::write(
+                    fixture.control_records()[0].0.clone(),
+                    serde_json::to_vec(&document).unwrap(),
+                )
+                .unwrap();
+            })
+            .await;
+            assert_eq!(refusal, Refusal::ControlChanged);
+            let document: Value = serde_json::from_slice(&fixture.control_bytes()).unwrap();
+            assert_eq!(document["model_ref"], json!("other-model"), "the edit is not reverted");
+
+            // (b) A same-generation edit to a field this module does not model.
+            let (refusal, fixture) =
+                refusal_after_edit(true, |fixture| {
+                    let mut document: Value =
+                        serde_json::from_slice(&fixture.control_bytes()).unwrap();
+                    document["future"] = json!({"nested": [1, null]});
+                    assert!(
+                        document["control_generation"] == json!(1),
+                        "the hand patch must not touch the generation"
+                    );
+                    std::fs::write(
+                        fixture.control_records()[0].0.clone(),
+                        serde_json::to_vec(&document).unwrap(),
+                    )
+                    .unwrap();
+                })
+                .await;
+            assert_eq!(refusal, Refusal::ControlChanged);
+            let document: Value = serde_json::from_slice(&fixture.control_bytes()).unwrap();
+            assert!(document.get("future").is_some(), "the unknown key is preserved");
+
+            // (c) A record that disappears after the reservation.
+            let (refusal, fixture) = refusal_after_edit(true, |fixture| {
+                let path = fixture.control_records()[0].0.clone();
+                std::fs::remove_file(path).unwrap();
+            })
+            .await;
+            assert_eq!(refusal, Refusal::ControlChanged);
+            assert!(fixture.control_records().is_empty(), "the record is not re-created");
+
+            // (d) A schema version this build does not implement.
+            let (refusal, _fixture) = refusal_after_edit(true, |fixture| {
+                fixture.overwrite_control_record(br#"{"schema_version":99,"enabled":false}"#);
+            })
+            .await;
+            assert_eq!(refusal, Refusal::ControlSchemaUnsupported);
+        }
+
+        #[tokio::test]
+        async fn a_record_that_appears_after_the_reservation_is_refused_before_publish() {
+            // The absent case of the closing comparison, stated separately because it
+            // needs the live host id to seed the very record that must not be adopted.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let (pause, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::AfterInitialEnableReserve,
+                pause.clone(),
+            );
+            let caller = tokio::spawn({
+                let host = host.clone();
+                async move { host.prepare_initial_enable(ID).await.map(|permit| drop(permit)) }
+            });
+            tokio::time::timeout(DEADLINE, entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let host_id = stored_host_id(&fixture).await.unwrap();
+            let scope = fixture.scope(&host_id, ID);
+            let binding = fixture.binding(&host_id, ID).await;
+            fixture
+                .seed_control(&scope, false, Some(bound_off_policy(&binding)))
+                .await;
+            let records = fixture.control_records();
+            let before = fixture.tree_hash();
+
+            pause.release();
+            assert_eq!(
+                caller.await.unwrap().err(),
+                Some(Refusal::ControlChanged),
+                "an absent record is not equal to a present one"
+            );
+            assert_eq!(fixture.tree_hash(), before, "the foreign record is untouched");
+            assert_eq!(fixture.control_records(), records);
+            assert!(!fixture.lease_is_held(&scope), "the lease is released");
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+            assert!(!host.has_standby_worker_for_tests().await);
+        }
+
+        #[tokio::test]
+        async fn a_catalog_or_anchor_change_after_the_reservation_refuses_without_mutation() {
+            // (a) The bound workspace moved to another root while the lease was held.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let (pause, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::AfterInitialEnableReserve,
+                pause.clone(),
+            );
+            let caller = tokio::spawn({
+                let host = host.clone();
+                async move { host.prepare_initial_enable(ID).await.map(|permit| drop(permit)) }
+            });
+            tokio::time::timeout(DEADLINE, entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let host_id = stored_host_id(&fixture).await.unwrap();
+            let scope = fixture.scope(&host_id, ID);
+            let anchor = fixture.anchor_bytes();
+            fixture.publish(vec![local_record(&fixture, ID, "moved")]).await;
+            let moved = fixture.tree_hash();
+            pause.release();
+            assert_eq!(
+                caller.await.unwrap().err(),
+                Some(Refusal::AnchorChanged),
+                "a catalog change after the reservation is not adopted"
+            );
+            assert_eq!(fixture.tree_hash(), moved, "the catalog is not reverted");
+            assert_eq!(fixture.anchor_bytes(), anchor);
+            assert!(!fixture.lease_is_held(&scope));
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+            assert_started_nothing(&host).await;
+
+            // (b) The anchor document was replaced with another identity.
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host = bootstrap(&fixture).await;
+            let (pause, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::AfterInitialEnableReserve,
+                pause.clone(),
+            );
+            let caller = tokio::spawn({
+                let host = host.clone();
+                async move { host.prepare_initial_enable(ID).await.map(|permit| drop(permit)) }
+            });
+            tokio::time::timeout(DEADLINE, entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let before_id = stored_host_id(&fixture).await.unwrap();
+            let replacement = {
+                let mut document: Value =
+                    serde_json::from_slice(&fixture.anchor_bytes()).unwrap();
+                let current = document["anchor"].as_str().unwrap();
+                let other = if current.starts_with('0') { "1" } else { "0" }.repeat(32);
+                document["anchor"] = json!(other);
+                serde_json::to_vec(&document).unwrap()
+            };
+            std::fs::write(anchor_path(&fixture), &replacement).unwrap();
+            let replaced = fixture.tree_hash();
+            let scope = fixture.scope(&before_id, ID);
+            pause.release();
+            assert_eq!(caller.await.unwrap().err(), Some(Refusal::AnchorChanged));
+            assert_eq!(fixture.tree_hash(), replaced, "a replaced anchor is never repaired");
+            assert_eq!(std::fs::read(anchor_path(&fixture)).unwrap(), replacement);
+            assert!(!fixture.lease_is_held(&scope));
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+            assert_started_nothing(&host).await;
+        }
+
+        #[tokio::test]
+        async fn a_record_change_before_the_reservation_refuses_at_the_guarded_read() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let host_id = fixture.anchor().await;
+            let scope = fixture.scope(&host_id, ID);
+            let binding = fixture.binding(&host_id, ID).await;
+            fixture
+                .seed_control(&scope, false, Some(bound_off_policy(&binding)))
+                .await;
+            let host = bootstrap(&fixture).await;
+            let (pause, mut entered) = HostPause::new();
+            let _registration = super::super::pauses::register(
+                fixture.paths.user_root_dir(),
+                super::super::pauses::PausePoint::BeforeInitialEnableReserve,
+                pause.clone(),
+            );
+            let caller = tokio::spawn({
+                let host = host.clone();
+                async move { host.prepare_initial_enable(ID).await.map(|permit| drop(permit)) }
+            });
+            tokio::time::timeout(DEADLINE, entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            fixture.patch_policy_same_generation(json!({"domains": {"memory": {"enabled": false}}}));
+            let patched = fixture.control_records();
+            let entries = control_entries(&fixture);
+            let before = fixture.tree_hash();
+
+            pause.release();
+            let refusal = caller.await.unwrap().err();
+            assert!(
+                matches!(refusal, Some(Refusal::ReserveRefused(_))),
+                "the reservation's own guarded read must refuse: {refusal:?}"
+            );
+            // The lock-free observation refuses before the lease is taken, so no
+            // reservation residue exists at all.
+            assert!(fixture.lock_files().is_empty(), "no lease is taken");
+            assert_eq!(
+                control_entries(&fixture),
+                entries,
+                "the refusal adds no control-root entry"
+            );
+            assert_eq!(fixture.tree_hash(), before, "the patched record is not repaired");
+            assert_eq!(fixture.control_records(), patched);
+            assert_eq!(host.live_initial_enable_pendings_for_tests().await, 0);
+            assert_started_nothing(&host).await;
+        }
+
+        #[tokio::test]
+        async fn an_unsupported_profile_refuses_a_preparation_without_io() {
+            let fixture = Fixture::new().await;
+            fixture.publish(vec![local_record(&fixture, ID, "local")]).await;
+            let shared = WorkspaceIntelligenceHost::bootstrap(
+                Arc::clone(&fixture.paths),
+                None,
+                WorkspaceIntelligenceHostSurface::Desktop,
+                RuntimeDeployment::Shared,
+            )
+            .await;
+            let expected = Refusal::Host(Reason::ProfileUnsupported(Profile::SharedRuntime));
+            assert_eq!(
+                shared.status().await.reason(),
+                Some(Reason::ProfileUnsupported(Profile::SharedRuntime))
+            );
+            let before = fixture.tree_hash();
+            assert_eq!(shared.prepare_initial_enable(ID).await.err(), Some(expected));
+            assert_eq!(fixture.tree_hash(), before, "an unsupported profile writes nothing");
+            assert!(namespace_entries(&fixture).is_empty());
+            assert!(!shared.status().await.anchor_present(), "the latch is not recovered");
+            assert_started_nothing(&shared).await;
         }
     }
 
