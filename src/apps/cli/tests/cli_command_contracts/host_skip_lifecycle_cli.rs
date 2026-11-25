@@ -108,7 +108,7 @@ use support::{command_output_with_timeout, CliTestEnvironment};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Persisted workspace id of the scope every scenario enables.
-const WORKSPACE_ID: &str = "cli-skip-e2e-workspace";
+pub(crate) const WORKSPACE_ID: &str = "cli-skip-e2e-workspace";
 
 /// A session id that passes the owner's own id validation and exists nowhere.
 const MISSING_SESSION_ID: &str = "cli-skip-e2e-missing-session";
@@ -121,7 +121,7 @@ const DRAIN_FIELD: &str = "host_drain=";
 const LEASE_ROOT: &str = "lease";
 
 /// Value code of a drain that found no admitted host.
-const NOT_INSTALLED_CODE: &str = "not_installed";
+pub(crate) const NOT_INSTALLED_CODE: &str = "not_installed";
 
 /// Value code of a drain that stopped a live host with nothing outstanding.
 const DRAINED_CODE: &str = "drained";
@@ -137,7 +137,7 @@ const ACP_SKIP_CODE: &str = "host_skip_acp";
 /// development and testing source (`OPENBITFUN_MODELS_DEV_PATH`) selects this copy instead, so
 /// the child reads a catalog from disk and the models.dev fetch is not attempted; the child
 /// keeps its own default models either way.
-const REPOSITORY_MODEL_CATALOG: &str = concat!(
+pub(crate) const REPOSITORY_MODEL_CATALOG: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../crates/services/services-integrations/assets/models-dev.json"
 );
@@ -171,14 +171,14 @@ const STDIO_DEADLINE: Duration = Duration::from_secs(120);
 const OWNER_QUIESCENCE_WINDOW: Duration = Duration::from_millis(900);
 
 /// One invocation's own isolated CLI root with one seeded workspace.
-struct OnRoot {
-    environment: CliTestEnvironment,
-    paths: Arc<PathManager>,
+pub(crate) struct OnRoot {
+    pub(crate) environment: CliTestEnvironment,
+    pub(crate) paths: Arc<PathManager>,
 }
 
 impl OnRoot {
     /// Creates the isolated root the CLI composes its own user-data root from.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let environment = CliTestEnvironment::new();
         let paths = host_fixture::test_path_manager(environment.user_root());
         Self { environment, paths }
@@ -190,7 +190,7 @@ impl OnRoot {
     /// `usage`, `doctor`, `health`, the session reports and both protocol hosts do, so
     /// nothing here moves the scope into an unrelated directory. Seeding writes the
     /// catalog record only: no anchor, no control record and no host namespace.
-    async fn seed_workspace_record(&self) {
+    pub(crate) async fn seed_workspace_record(&self) {
         host_fixture::seed_local_workspace(
             self.paths.as_ref(),
             WORKSPACE_ID,
@@ -226,7 +226,7 @@ impl OnRoot {
     }
 
     /// Runs one shipped command to completion inside this root.
-    fn run(&self, args: &[&str]) -> Output {
+    pub(crate) fn run(&self, args: &[&str]) -> Output {
         let mut command = self.environment.std_command();
         command.args(args);
         command.env("OPENBITFUN_MODELS_DEV_PATH", REPOSITORY_MODEL_CATALOG);
@@ -248,7 +248,7 @@ impl OnRoot {
     }
 
     /// The one lease file the enabled scope owns, after asserting there is exactly one.
-    fn single_lease_file(&self, label: &str) -> PathBuf {
+    pub(crate) fn single_lease_file(&self, label: &str) -> PathBuf {
         let mut locks = self.lease_files();
         assert_eq!(
             locks.len(),
@@ -267,13 +267,28 @@ impl OnRoot {
 /// handle is dropped through [`LiveOwner::stop`] on every normal path, and `Drop` starts
 /// a best-effort drain on a failing path, so no owner outlives its test without
 /// attempting the same shutdown.
-struct LiveOwner {
+pub(crate) struct LiveOwner {
     host: Option<WorkspaceIntelligenceHost>,
 }
 
 impl LiveOwner {
     /// Bootstraps the host this process owns the enabled scope with.
-    async fn bootstrap(paths: &Arc<PathManager>, label: &str) -> Self {
+    pub(crate) async fn bootstrap(paths: &Arc<PathManager>, label: &str) -> Self {
+        Self::bootstrap_for_scope(paths, WORKSPACE_ID, label).await
+    }
+
+    /// Bootstraps the host for one enabled scope id.
+    ///
+    /// The scope id must be the record the production catalog lookup resolves for the
+    /// scope root. The scenarios in `host_skip_lifecycle_cli.rs` use one fixed record
+    /// because they own the directory they seed; a scenario whose scope root is composed by
+    /// the command itself has to pass the id production derives for that root, or it would
+    /// be proving a scope no real run names.
+    pub(crate) async fn bootstrap_for_scope(
+        paths: &Arc<PathManager>,
+        scope_id: &str,
+        label: &str,
+    ) -> Self {
         let host = WorkspaceIntelligenceHost::bootstrap(
             Arc::clone(paths),
             None,
@@ -288,7 +303,7 @@ impl LiveOwner {
             "{label}: the real host must own the enabled scope: {status:?}"
         );
         assert_eq!(
-            status.scope_state(WORKSPACE_ID),
+            status.scope_state(scope_id),
             Some(WorkspaceIntelligenceHostScopeState::Active),
             "{label}: the enabled workspace must be the scope this process owns"
         );
@@ -300,14 +315,14 @@ impl LiveOwner {
         Self { host: Some(host) }
     }
 
-    fn handle(&self) -> &WorkspaceIntelligenceHost {
+    pub(crate) fn handle(&self) -> &WorkspaceIntelligenceHost {
         self.host
             .as_ref()
             .expect("a live owner handle is present while the owner is alive")
     }
 
     /// Drains the owner explicitly and asserts the drain it reported.
-    async fn stop(&mut self, label: &str) {
+    pub(crate) async fn stop(&mut self, label: &str) {
         let host = self
             .host
             .take()
@@ -354,7 +369,7 @@ impl Drop for LiveOwner {
 /// file's bytes and length unchanged is not part of this comparison; the live-owner lease is
 /// covered by its own assertion instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TreeEntry {
+pub(crate) struct TreeEntry {
     relative: String,
     content: TreeContent,
 }
@@ -443,7 +458,7 @@ fn snapshot_file(path: &Path, relative: &str) -> TreeContent {
 /// The namespace must exist and every directory under it must be readable: a snapshot
 /// that silently became empty because a root was missing or unreadable would make two
 /// states compare equal without observing anything, so both are hard failures here.
-fn wi_tree_snapshot(root: &Path) -> Vec<TreeEntry> {
+pub(crate) fn wi_tree_snapshot(root: &Path) -> Vec<TreeEntry> {
     fn walk(root: &Path, directory: &Path, entries: &mut Vec<TreeEntry>) {
         let dir_entries = std::fs::read_dir(directory).unwrap_or_else(|error| {
             panic!("read the host namespace directory {directory:?}: {error}")
@@ -519,7 +534,7 @@ fn describe_tree_change(before: &[TreeEntry], after: &[TreeEntry]) -> String {
 }
 
 /// Asserts the host namespace under `root` is byte-identical to `before`.
-fn assert_tree_unchanged(before: &[TreeEntry], root: &Path, label: &str) {
+pub(crate) fn assert_tree_unchanged(before: &[TreeEntry], root: &Path, label: &str) {
     let after = wi_tree_snapshot(root);
     assert_eq!(
         describe_tree_change(before, &after),
@@ -586,7 +601,7 @@ fn files_under(root: &Path) -> Vec<(PathBuf, usize)> {
 /// how they are stored: the anchor is the one document the owner writes outside its
 /// member roots, and the cognition partition only has to be a non-empty file, because
 /// the incarnation token lives inside it and is opaque to this test.
-fn assert_owner_published_state(tree: &[TreeEntry], root: &OnRoot, label: &str) {
+pub(crate) fn assert_owner_published_state(tree: &[TreeEntry], root: &OnRoot, label: &str) {
     let cognition = files_under(&root.paths.workspace_intelligence_cognition_dir());
     assert!(
         cognition.iter().any(|(_, length)| *length > 0),
@@ -638,7 +653,7 @@ fn lines_with<'a>(text: &'a str, needle: &str) -> Vec<&'a str> {
 /// command's plain diagnostics are the subject; the tracing channel is never mined for them.
 /// The shape test is structural rather than a substring search, so a record cannot pass as a
 /// diagnostic by merely containing a date somewhere.
-fn plain_diagnostics(stderr: &str) -> Vec<&str> {
+pub(crate) fn plain_diagnostics(stderr: &str) -> Vec<&str> {
     stderr
         .lines()
         .filter(|line| !is_tracing_record(line))
@@ -689,7 +704,7 @@ fn field_values<'a>(text: &'a str, field: &str) -> Vec<&'a str> {
 /// placement code writes it from `refuse()` before any root, catalog, deployment or slot
 /// is read, so a command that failed while parsing arguments or while starting up cannot
 /// produce it, and a command that admitted a host would report `install`.
-fn assert_skip_site(stderr: &str, skip_code: &str, label: &str) {
+pub(crate) fn assert_skip_site(stderr: &str, skip_code: &str, label: &str) {
     let placements = field_values(stderr, PLACEMENT_FIELD);
     assert_eq!(
         placements.len(),
@@ -751,7 +766,7 @@ impl DrainPath {
 /// The bounded drain is awaited on every `run_cli` return path, so a command that
 /// returns normally reports one `not_installed` drain: it admitted nothing, so there was
 /// nothing to stop.
-fn assert_drained_empty_slot(stderr: &str, label: &str) {
+pub(crate) fn assert_drained_empty_slot(stderr: &str, label: &str) {
     let drains = field_values(stderr, DRAIN_FIELD);
     assert_eq!(
         drains.len(),
@@ -814,7 +829,7 @@ fn assert_same_stdout_and_exit(run: &Output, baseline: &Output, label: &str) {
 ///
 /// The process that took the lease is still running here, so an acquirable lease proves
 /// the owner's own drain released it rather than the OS releasing it at process exit.
-fn assert_lease_released(lease: &Path, label: &str) {
+pub(crate) fn assert_lease_released(lease: &Path, label: &str) {
     let released = ExclusiveFileLease::try_acquire(lease).unwrap_or_else(|error| {
         panic!("{label}: the explicit drain must release the scope lease, not the process exit: {error:?}")
     });
@@ -852,8 +867,18 @@ async fn publish_owner_state(root: &OnRoot, label: &str) -> (PathBuf, Vec<TreeEn
 /// While this owner is alive the scope's lease is held and its incarnation token is
 /// stored, so the warm run is measured against a workspace another live process really
 /// owns rather than against a database the test only believes is populated.
-async fn start_live_owner(root: &OnRoot, lease: &Path, label: &str) -> (LiveOwner, Vec<TreeEntry>) {
-    let owner = LiveOwner::bootstrap(&root.paths, label).await;
+pub(crate) async fn start_live_owner(root: &OnRoot, lease: &Path, label: &str) -> (LiveOwner, Vec<TreeEntry>) {
+    start_live_owner_for_scope(root, lease, WORKSPACE_ID, label).await
+}
+
+/// [`start_live_owner`] for a scope whose record id the test does not choose itself.
+pub(crate) async fn start_live_owner_for_scope(
+    root: &OnRoot,
+    lease: &Path,
+    scope_id: &str,
+    label: &str,
+) -> (LiveOwner, Vec<TreeEntry>) {
+    let owner = LiveOwner::bootstrap_for_scope(&root.paths, scope_id, label).await;
     assert!(
         ExclusiveFileLease::try_acquire(lease).is_err(),
         "{label}: the live owner must hold the scope lease while it runs"
@@ -863,7 +888,7 @@ async fn start_live_owner(root: &OnRoot, lease: &Path, label: &str) -> (LiveOwne
 }
 
 /// Asserts the treated command left the live owner owning exactly the one scope.
-async fn assert_live_owner_intact(owner: &LiveOwner, lease: &Path, label: &str) {
+pub(crate) async fn assert_live_owner_intact(owner: &LiveOwner, lease: &Path, label: &str) {
     let status = owner.handle().status().await;
     assert_eq!(
         status.state(),
@@ -882,7 +907,7 @@ async fn assert_live_owner_intact(owner: &LiveOwner, lease: &Path, label: &str) 
 }
 
 /// Drains the warm owner explicitly and asserts its lease really came back.
-async fn stop_live_owner(mut owner: LiveOwner, lease: &Path, label: &str) {
+pub(crate) async fn stop_live_owner(mut owner: LiveOwner, lease: &Path, label: &str) {
     owner.stop(label).await;
     drop(owner);
     assert_lease_released(lease, label);
@@ -894,8 +919,13 @@ async fn stop_live_owner(mut owner: LiveOwner, lease: &Path, label: &str) {
 /// deliberately kept out of the skip-command snapshots above. It is the evidence that the
 /// earlier owners released their leases explicitly instead of leaving them to process
 /// exit.
-async fn assert_scope_takeable(root: &OnRoot, label: &str) {
-    let mut takeover = LiveOwner::bootstrap(&root.paths, label).await;
+pub(crate) async fn assert_scope_takeable(root: &OnRoot, label: &str) {
+    assert_scope_takeable_for_scope(root, WORKSPACE_ID, label).await
+}
+
+/// [`assert_scope_takeable`] for a scope whose record id the test does not choose itself.
+pub(crate) async fn assert_scope_takeable_for_scope(root: &OnRoot, scope_id: &str, label: &str) {
+    let mut takeover = LiveOwner::bootstrap_for_scope(&root.paths, scope_id, label).await;
     takeover.stop(label).await;
     drop(takeover);
 }

@@ -130,6 +130,18 @@ impl CliTestEnvironment {
         &self.user_root
     }
 
+    /// The product home this environment isolates for the child.
+    ///
+    /// This is the directory the CLI composes its own home-relative state from: it is passed
+    /// as `HOME`/`USERPROFILE`, and on a Unix target the product's home-directory lookup reads
+    /// it. It is not a general stand-in for every "home" a command may name: the daemon's
+    /// workspace scope resolves through the platform home-directory lookup, which on Windows
+    /// answers with the OS profile folder instead of `USERPROFILE`, so a test that seeds that
+    /// scope must resolve that fact itself rather than reading this path.
+    pub(crate) fn home_root(&self) -> &Path {
+        &self.home_root
+    }
+
     pub(crate) fn session_metadata_path(&self, session_id: &str) -> PathBuf {
         fn find(dir: &Path, session_id: &str) -> Option<PathBuf> {
             for entry in std::fs::read_dir(dir).ok()? {
