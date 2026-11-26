@@ -1382,6 +1382,15 @@ mod compiled {
         at_book_lock: Option<HostPause>,
         #[cfg(test)]
         drain_window: Option<HostPause>,
+        /// Real standby-worker creations of this host handle.
+        ///
+        /// The worker slot next to it answers "is a worker retained", which an OFF
+        /// host also answers `false` for because it never creates one at all. This
+        /// counter is incremented at the actual creation seam, so a governance
+        /// fixture can tell "no task was ever created" apart from "a task existed
+        /// and was later stopped".
+        #[cfg(test)]
+        standby_spawns: AtomicUsize,
     }
 
     impl HostCore {
@@ -1437,6 +1446,8 @@ mod compiled {
                 at_book_lock,
                 #[cfg(test)]
                 drain_window,
+                #[cfg(test)]
+                standby_spawns: AtomicUsize::new(0),
             }
         }
 
@@ -2167,7 +2178,7 @@ mod compiled {
                 self.timing.standby_base.as_millis(),
                 self.timing.standby_cap.as_millis()
             );
-            StandbyWorker::spawn(
+            let worker = StandbyWorker::spawn(
                 self.timing.standby_base,
                 self.timing.standby_cap,
                 self.catalog.revision(),
@@ -2180,7 +2191,13 @@ mod compiled {
                         }
                     }
                 },
-            )
+            );
+            // Test-only measurement of this production-wired standby worker creation.
+            // Counted after the creation returned, so an OFF host that merely clears an
+            // already empty slot stays at zero instead of being inferred from a handle.
+            #[cfg(test)]
+            self.standby_spawns.fetch_add(1, Ordering::SeqCst);
+            worker
         }
 
         async fn status(&self) -> WorkspaceIntelligenceHostStatus {
@@ -3438,6 +3455,16 @@ mod compiled {
         /// True while the bounded standby worker exists.
         pub(crate) async fn has_standby_worker_for_tests(&self) -> bool {
             self.core.book.lock().await.worker.is_some()
+        }
+
+        /// Real standby-worker task creations of this host handle.
+        ///
+        /// The slot above reports retention, which cannot distinguish "nothing was
+        /// ever enabled" from "a worker was created and later stopped". This counter
+        /// moves only where the task is really created, so an OFF fixture can prove a
+        /// zero task count instead of inferring it from an empty slot.
+        pub(crate) fn standby_spawns_for_tests(&self) -> usize {
+            self.core.standby_spawns.load(Ordering::SeqCst)
         }
 
         /// Live queued initial-enable preparations of this host, so a fixture can
@@ -9846,6 +9873,296 @@ mod tests {
                 );
                 assert_eq!(fixture.tree_hash(), late, "a stopped host writes nothing: {pair}");
             }
+        }
+    }
+
+    /// Governance evidence for the production-wired standby worker creation path.
+    ///
+    /// The only production-wired long-lived Workspace Intelligence background task is
+    /// the bounded standby worker created by `HostCore::spawn_worker`: it wakes
+    /// `evaluate` on a timer, dispatches no cognitive work and calls no model. Unwired
+    /// initial-enable preparation also uses one-shot host-owned tasks, which this meter
+    /// excludes. `CoordinationStore::register_background_task` has only subagent callers
+    /// and no Workspace Intelligence caller, so it would read zero in both ON and OFF;
+    /// this is not an activation or cognition dispatcher.
+    ///
+    /// `standby_spawns` counts real `StandbyWorker::spawn` creations of one host
+    /// handle at the creation seam itself. An empty worker slot cannot distinguish
+    /// "nothing was ever enabled" from "no host task was created", so every fixture
+    /// below asserts the counter together with the slot, the scope report and the
+    /// persisted owner evidence, and the positive case calibrates the counter.
+    mod governance_spawn {
+        use super::*;
+
+        /// Bootstrap with a standby timer that never fires, so every pass in these
+        /// fixtures is either the real bootstrap pass or one the test asked for.
+        async fn bootstrap(fixture: &Fixture) -> WorkspaceIntelligenceHost {
+            WorkspaceIntelligenceHost::bootstrap_with_options(
+                Arc::clone(&fixture.paths),
+                source(),
+                WorkspaceIntelligenceHostSurface::Desktop,
+                RuntimeDeployment::Embedded,
+                options(sleeping()),
+            )
+            .await
+        }
+
+        /// Applies the owner's own enabled flag through the store's compare-and-swap,
+        /// so the fixture cannot hand-write the record shape the host reads.
+        async fn set_enabled(fixture: &Fixture, scope: &str, enabled: bool) {
+            let generation = fixture.control_generation(scope).await;
+            fixture
+                .control()
+                .update(
+                    scope,
+                    ControlGenerationExpectation::Exactly(generation),
+                    WorkspaceIntelligenceControlPatch {
+                        enabled: ControlFieldUpdate::Set(enabled),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the owner update is applied");
+        }
+
+        /// A vacant root has nothing to enable, so no host task is ever created.
+        #[tokio::test]
+        async fn governance_spawn_empty_root_creates_no_host_task() {
+            let fixture = Fixture::new().await;
+            let before = fixture.tree_hash();
+            let host = bootstrap(&fixture).await;
+
+            let status = host.status().await;
+            assert_eq!(status.state(), WorkspaceIntelligenceHostState::Inactive);
+            assert_eq!(
+                status.reason(),
+                Some(WorkspaceIntelligenceHostReason::NoRecords)
+            );
+            assert_eq!(status.counts().active(), 0);
+            assert_eq!(status.counts().standby(), 0);
+            assert!(!status.anchor_present(), "no anchor is minted");
+            assert_eq!(host.standby_spawns_for_tests(), 0, "no task is created");
+            assert!(!host.has_standby_worker_for_tests().await);
+
+            // An explicit pass is the same gate, not a second chance: the decision is
+            // taken per pass from the live facts, and those facts hold nothing.
+            host.evaluate_for_tests().await;
+            assert_eq!(host.standby_spawns_for_tests(), 0);
+            assert!(!host.has_standby_worker_for_tests().await);
+            assert_eq!(host.in_flight_for_tests().await, 0);
+            assert_eq!(fixture.tree_hash(), before, "a vacant root writes nothing");
+
+            let shutdown = host.shutdown().await;
+            assert_eq!(shutdown.drain(), WorkspaceIntelligenceHostDrain::Drained);
+            assert_eq!(shutdown.state(), WorkspaceIntelligenceHostState::Stopped);
+            assert_eq!(host.standby_spawns_for_tests(), 0, "shutdown creates no task");
+            assert_eq!(fixture.tree_hash(), before, "the shutdown writes nothing");
+        }
+
+        /// A catalog workspace that is not enabled is still genuinely enumerated —
+        /// control absent first, then a real disabled record — takes no lease, writes
+        /// nothing, and starts no host task on either shape.
+        #[tokio::test]
+        async fn governance_spawn_disabled_control_creates_no_host_task() {
+            let fixture = Fixture::new().await;
+            fixture
+                .publish(vec![local_record(&fixture, "workspace-a", "a")])
+                .await;
+            let host_id = fixture.anchor().await;
+            let scope = fixture.scope(&host_id, "workspace-a");
+            let binding = fixture.binding(&host_id, "workspace-a").await;
+            let before = fixture.tree_hash();
+
+            // Control absent: the eligible record is enumerated and reported disabled.
+            let host = bootstrap(&fixture).await;
+            let status = host.status().await;
+            assert_eq!(status.state(), WorkspaceIntelligenceHostState::Inactive);
+            assert_eq!(
+                status.reason(),
+                Some(WorkspaceIntelligenceHostReason::NoEnabledScope)
+            );
+            assert_eq!(status.counts().active(), 0);
+            assert_eq!(status.counts().standby(), 0);
+            assert_eq!(
+                status.scope_state("workspace-a"),
+                Some(WorkspaceIntelligenceHostScopeState::Disabled),
+                "the eligible record is enumerated, so the gate really ran: {status:?}"
+            );
+            assert_eq!(
+                host.standby_spawns_for_tests(),
+                0,
+                "control absent starts no host task"
+            );
+            assert!(!host.has_standby_worker_for_tests().await);
+            assert_eq!(fixture.tree_hash(), before, "control absent writes nothing");
+
+            host.evaluate_for_tests().await;
+            assert_eq!(host.standby_spawns_for_tests(), 0);
+            assert!(!host.has_standby_worker_for_tests().await);
+            assert_eq!(
+                fixture.tree_hash(),
+                before,
+                "an explicit pass over an absent control writes nothing"
+            );
+
+            // A real control record the owner closed: the same gate, and a complete
+            // policy payload does not make a disabled record eligible.
+            fixture
+                .seed_control(&scope, false, Some(Fixture::bound_policy(&binding)))
+                .await;
+            let records = fixture.control_records();
+            let disabled = fixture.tree_hash();
+
+            host.evaluate_for_tests().await;
+            let status = host.status().await;
+            assert_eq!(status.state(), WorkspaceIntelligenceHostState::Inactive);
+            assert_eq!(
+                status.reason(),
+                Some(WorkspaceIntelligenceHostReason::NoEnabledScope)
+            );
+            assert_eq!(status.counts().active(), 0);
+            assert_eq!(status.counts().standby(), 0);
+            assert_eq!(
+                status.scope_state("workspace-a"),
+                Some(WorkspaceIntelligenceHostScopeState::Disabled),
+                "{status:?}"
+            );
+            assert_eq!(
+                host.standby_spawns_for_tests(),
+                0,
+                "a disabled record starts no host task"
+            );
+            assert!(!host.has_standby_worker_for_tests().await);
+            assert_eq!(host.in_flight_for_tests().await, 0);
+            assert_eq!(
+                fixture.control_records(),
+                records,
+                "the host rewrote no control record"
+            );
+            assert_eq!(fixture.tree_hash(), disabled, "a disabled pass writes nothing");
+            assert!(fixture.lock_files().is_empty(), "no owner tenure is taken");
+            assert!(!fixture.lease_root_exists(), "no lease root is created");
+            assert!(
+                !fixture.cognition_dir().exists(),
+                "no cognition partition is opened"
+            );
+            assert!(
+                fixture.sqlite_files().is_empty(),
+                "no cognition database is created"
+            );
+
+            let shutdown = host.shutdown().await;
+            assert_eq!(shutdown.drain(), WorkspaceIntelligenceHostDrain::Drained);
+            assert_eq!(shutdown.state(), WorkspaceIntelligenceHostState::Stopped);
+            assert_eq!(host.standby_spawns_for_tests(), 0, "shutdown creates no task");
+        }
+
+        /// The positive calibration of the same counter: one genuine enabled scope
+        /// creates exactly one host task, closing it stops that task without creating
+        /// another, and re-opening creates exactly one more.
+        #[tokio::test]
+        async fn governance_spawn_enable_transitions_create_exactly_one_task() {
+            let fixture = Fixture::new().await;
+            fixture
+                .publish(vec![local_record(&fixture, "workspace-a", "a")])
+                .await;
+            let host_id = fixture.anchor().await;
+            let scope = fixture.scope(&host_id, "workspace-a");
+            let binding = fixture.binding(&host_id, "workspace-a").await;
+            fixture
+                .seed_control(&scope, true, Some(Fixture::bound_policy(&binding)))
+                .await;
+
+            // ON: the bootstrap pass claims and creates the one host task.
+            let host = bootstrap(&fixture).await;
+            let status = host.status().await;
+            assert_eq!(status.state(), WorkspaceIntelligenceHostState::Active);
+            assert_eq!(status.counts().active(), 1);
+            assert_eq!(
+                status.scope_state("workspace-a"),
+                Some(WorkspaceIntelligenceHostScopeState::Active),
+                "{status:?}"
+            );
+            assert_eq!(
+                host.standby_spawns_for_tests(),
+                1,
+                "the enabled scope creates exactly one host task"
+            );
+            assert!(host.has_standby_worker_for_tests().await);
+            let first_token = fixture.token(&scope).expect("the claim committed an incarnation");
+            assert!(fixture.lease_is_held(&scope), "the claim holds its lease");
+            let partitions = fixture.sqlite_bytes();
+            assert!(!partitions.is_empty(), "the claim opened a cognition partition");
+
+            // OFF: the same scope, closed by the owner. The retained task is stopped
+            // and no new task is created; the slot and the counter therefore disagree
+            // here, which is exactly what the counter is for.
+            set_enabled(&fixture, &scope, false).await;
+            host.evaluate_for_tests().await;
+            let off = host.status().await;
+            assert_eq!(off.state(), WorkspaceIntelligenceHostState::Inactive);
+            assert_eq!(
+                off.reason(),
+                Some(WorkspaceIntelligenceHostReason::NoEnabledScope)
+            );
+            assert_eq!(off.counts().active(), 0);
+            assert_eq!(off.counts().standby(), 0);
+            assert_eq!(
+                off.scope_state("workspace-a"),
+                Some(WorkspaceIntelligenceHostScopeState::Disabled),
+                "{off:?}"
+            );
+            assert_eq!(
+                host.standby_spawns_for_tests(),
+                1,
+                "closing the scope creates no second task"
+            );
+            assert!(
+                !host.has_standby_worker_for_tests().await,
+                "the retained host task was stopped"
+            );
+            assert!(!fixture.lease_is_held(&scope), "the closed claim released its lease");
+            assert_eq!(
+                fixture.token(&scope).as_deref(),
+                Some(first_token.as_str()),
+                "the persisted incarnation is kept, not reset"
+            );
+            assert_eq!(
+                fixture.sqlite_bytes(),
+                partitions,
+                "the OFF transition writes no cognition partition"
+            );
+
+            // ON again: exactly one more task, and the new claim advances the token.
+            set_enabled(&fixture, &scope, true).await;
+            host.evaluate_for_tests().await;
+            let on = host.status().await;
+            assert_eq!(on.state(), WorkspaceIntelligenceHostState::Active);
+            assert_eq!(on.counts().active(), 1);
+            assert_eq!(
+                on.scope_state("workspace-a"),
+                Some(WorkspaceIntelligenceHostScopeState::Active),
+                "{on:?}"
+            );
+            assert_eq!(
+                host.standby_spawns_for_tests(),
+                2,
+                "re-enabling creates exactly one more host task"
+            );
+            assert!(host.has_standby_worker_for_tests().await);
+            let second_token = fixture.token(&scope).expect("the second claim committed");
+            assert_ne!(second_token, first_token, "the token advances on the new claim");
+
+            let shutdown = host.shutdown().await;
+            assert_eq!(shutdown.drain(), WorkspaceIntelligenceHostDrain::Drained);
+            assert_eq!(shutdown.state(), WorkspaceIntelligenceHostState::Stopped);
+            assert!(!host.has_standby_worker_for_tests().await);
+            assert_eq!(host.in_flight_for_tests().await, 0);
+            assert_eq!(
+                host.standby_spawns_for_tests(),
+                2,
+                "shutdown creates no task"
+            );
         }
     }
 }
