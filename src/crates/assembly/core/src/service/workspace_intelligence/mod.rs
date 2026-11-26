@@ -23,6 +23,16 @@
 //! module names the source of each decision while marker affinity and multi-source
 //! progress stay obligations of the persistence owner this tree does not provide.
 //!
+//! The `workspace-intelligence-host`-gated `session_source` module is the first real
+//! source of WP1.5-b: it observes one already resolved Session storage root read-only
+//! and derives a deterministic snapshot marker over the sessions it can see, with an
+//! explicit incomplete state or typed read error instead of partial data. It writes
+//! nothing, takes no index lock, creates no directory, keeps no state and reads no
+//! clock. It always declares `SnapshotOnly`, so a reconcile carries its gap; it has
+//! no consumer, writes no cursor and persists nothing. Its caller passes the Session
+//! root: deriving that root from a workspace, and remote or assistant support, belong
+//! to a later host wiring slice.
+//!
 //! The control and cognition modules are internal and have no production caller
 //! outside the host facade, plus no entry point of their own, no legacy
 //! confirmation gate, UI, command, registry or capability. The gated `host`
@@ -117,6 +127,11 @@ pub(crate) mod host_binding;
 #[allow(dead_code)] // Internal to the host feature; consumed only by `host`.
 #[cfg(feature = "workspace-intelligence-host")]
 pub(crate) mod host_standby;
+// First real source of WP1.5-b: read-only Session snapshot observation. No consumer yet,
+// and nothing here writes a cursor or the observed root.
+#[allow(dead_code)]
+#[cfg(feature = "workspace-intelligence-host")]
+pub(crate) mod session_source;
 #[allow(dead_code)]
 #[cfg(feature = "workspace-intelligence-control")]
 pub(crate) mod control;
