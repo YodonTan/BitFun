@@ -14,6 +14,15 @@
 //! compare-and-swap. The feature-gated `partition` module adds the internal
 //! cognition partition handle over the authoritative per-scope partition store.
 //!
+//! The feature-free `cursor` module is the first slice of WP1.5: it decides one step
+//! per source — duplicate, incremental from the marker the partition recorded, or a
+//! snapshot reconcile that carries its gap — and refuses when the source's own facts
+//! are missing or contradict each other. It orders no marker, proves no ordering,
+//! writes no cursor, keeps no dedup window, adds no schema or store change and has no
+//! caller in this tree. The partition holds one cursor, not one per source, so the
+//! module names the source of each decision while marker affinity and multi-source
+//! progress stay obligations of the persistence owner this tree does not provide.
+//!
 //! The control and cognition modules are internal and have no production caller
 //! outside the host facade, plus no entry point of their own, no legacy
 //! confirmation gate, UI, command, registry or capability. The gated `host`
@@ -93,6 +102,10 @@ pub(crate) mod mode;
 pub(crate) mod policy;
 #[allow(dead_code)]
 pub(crate) mod read_contract;
+// No consumer in this tree: nothing reads a cursor yet, so the WP1.5 decision contract
+// stays a feature-free internal module until the persistence slice names it.
+#[allow(dead_code)]
+pub(crate) mod cursor;
 // Unconditional: a feature-off build must be able to answer `NotCompiled`.
 pub(crate) mod host;
 #[allow(dead_code)] // Internal to the host feature; consumed only by `host`.
