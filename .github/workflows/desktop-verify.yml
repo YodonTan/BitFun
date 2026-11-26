@@ -242,6 +242,88 @@ jobs:
           shared-key: "desktop-verify-${{ matrix.platform.name }}"
           cache-bin: false
 
+      # rust-cache prunes the workspace target directory before saving it, so the
+      # native libraries stored under target need an independent cache lifecycle.
+      # The key is version-qualified from Cargo.lock and carries no branch, so
+      # every verification run reuses the same archive for the same target. The
+      # input accepts any pinned revision, so a revision without the Sherpa
+      # dependency resolves to an empty key and skips these steps, like the Bun
+      # cache above does for revisions that predate its helper script.
+      - name: Resolve Sherpa native cache key
+        id: sherpa-native
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Same expression scripts/prepare-sherpa-dev.mjs uses: the locked crate
+          # version is the only part of this identity that moves with Cargo.lock.
+          VERSION="$(node -e 'const {readFileSync}=require("node:fs");const m=readFileSync("Cargo.lock","utf8").match(/name = "sherpa-onnx-sys"\r?\nversion = "([\d.]+)"/);process.stdout.write(m?m[1]:"");')"
+          if [[ -z "${VERSION}" ]]; then
+            echo "::notice::No locked sherpa-onnx-sys in this source revision; the Sherpa native cache is skipped."
+            echo "cache-key=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Could not resolve a locked sherpa-onnx-sys version: '${VERSION}'." >&2
+            exit 1
+          fi
+          KEY="sherpa-onnx-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.platform.target }}-${VERSION}-static"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "cache-key=${KEY}" >> "$GITHUB_OUTPUT"
+          echo "Resolved sherpa-onnx-sys ${VERSION}; native cache key ${KEY}."
+
+      - name: Restore Sherpa native libraries
+        id: sherpa-native-cache
+        if: steps.sherpa-native.outputs.cache-key != ''
+        uses: actions/cache/restore@v5
+        with:
+          path: target/sherpa-onnx-prebuilt
+          key: ${{ steps.sherpa-native.outputs.cache-key }}
+
+      - name: Repair missing Sherpa native state
+        if: steps.sherpa-native.outputs.cache-key != ''
+        shell: bash
+        run: |
+          if ! find target/sherpa-onnx-prebuilt -type f \
+            \( -name 'sherpa-onnx-c-api.lib' -o -name 'libsherpa-onnx-c-api.a' \) \
+            -print -quit 2>/dev/null | grep -q .; then
+            rm -rf target/sherpa-onnx-prebuilt
+            cargo clean -p sherpa-onnx-sys
+          fi
+
+      # scripts/desktop-tauri-build.mjs does not prepare Sherpa itself (only the
+      # dev loop calls `prepareSherpaDev`, and the script has no CLI entry point),
+      # so the shared preparation is invoked here. It reuses the restored library
+      # or archive and otherwise downloads it once with proxy support, then the
+      # resolved variable is exported for every later build step.
+      - name: Prepare Sherpa native libraries
+        if: steps.sherpa-native.outputs.cache-key != ''
+        shell: bash
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.platform.target }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f scripts/prepare-sherpa-dev.mjs ]]; then
+            echo "::notice::Sherpa preparation is unavailable in this source revision; the build resolves any native dependency on its own."
+            exit 0
+          fi
+          node --input-type=module -e '
+            import { appendFileSync } from "node:fs";
+            import { prepareSherpaDev } from "./scripts/prepare-sherpa-dev.mjs";
+            prepareSherpaDev(process.cwd());
+            const exported = [];
+            for (const key of ["SHERPA_ONNX_LIB_DIR", "SHERPA_ONNX_ARCHIVE_DIR"]) {
+              const value = process.env[key];
+              if (!value) continue;
+              appendFileSync(process.env.GITHUB_ENV, key + "=" + value + "\n");
+              console.log(key + "=" + value);
+              exported.push(key);
+            }
+            if (exported.length === 0) {
+              console.error("Sherpa native state was not prepared.");
+              process.exit(1);
+            }
+          '
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -257,6 +339,15 @@ jobs:
       # the binary this run produced.
       - name: Build desktop frontend and executable
         run: ${{ matrix.platform.build_command }}
+
+      # Only a successful build leaves a complete native state behind, so the
+      # cache is saved here instead of unconditionally at the end of the job.
+      - name: Save Sherpa native libraries
+        if: ${{ success() && steps.sherpa-native.outputs.cache-key != '' && steps.sherpa-native-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: target/sherpa-onnx-prebuilt
+          key: ${{ steps.sherpa-native.outputs.cache-key }}
 
       # Unsigned: the Authenticode signing stages of the release workflow are
       # intentionally absent, and Tauri only signs when
