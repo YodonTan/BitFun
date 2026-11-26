@@ -127,6 +127,10 @@ pub(crate) mod read_contract;
 // stays a feature-free internal module until the persistence slice names it.
 #[allow(dead_code)]
 pub(crate) mod cursor;
+// WP1.6 cognition version and invalidation policy: pure decisions, no IO, no storage and
+// no consumer yet. Feature-free on purpose — it is a contract, not a capability slice.
+#[allow(dead_code)]
+pub(crate) mod cognition;
 // Unconditional: a feature-off build must be able to answer `NotCompiled`.
 pub(crate) mod host;
 #[allow(dead_code)] // Internal to the host feature; consumed only by `host`.
