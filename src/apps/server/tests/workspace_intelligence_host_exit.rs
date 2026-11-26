@@ -6,7 +6,8 @@
 //! arms: this file spawns the binary cargo just built and reads the process, its two
 //! streams and the isolated user-data root it wrote.
 //!
-//! All three tests below drive one real command: `--allowed-origin ftp://localhost:1422`.
+//! The three origin-screen tests below drive one real command:
+//! `--allowed-origin ftp://localhost:1422`.
 //! The startup sequence refuses that value *after* `bootstrap::initialize` (which is
 //! where the host is admitted) and *before* the loopback listener binds, before the
 //! SSH store is resolved and before `dirs::data_local_dir()` is read, so the exit is
@@ -30,6 +31,15 @@
 //!   the first case, and nothing is claimed, because no scope is enabled;
 //! - `--no-default-features`: the same exit reports the typed `NotCompiled` refusal
 //!   and creates no host namespace entry at all.
+//!
+//! One `#[cfg(windows)]` case joins the default-feature runtime: the same real process,
+//! admitted on the same isolated root with an enabled scope, started without
+//! `--allowed-origin` so the product's own defaults pass the origin screen, and run
+//! while this test holds `127.0.0.1:8080` so the listener's `TcpListener::bind` fails
+//! after the host was admitted. That case proves exactly one non-interactive exit path —
+//! the listener's own bind error on Windows — and nothing about Ctrl+C, about any other
+//! way out of `main`, or about a Unix target. It is not compiled on a non-Windows host,
+//! so no run there is evidence in either direction.
 //!
 //! # What is and is not claimed
 //!
@@ -114,6 +124,16 @@ const DRAINED_CODE: &str = "drained";
 const DRAIN_TIMED_OUT_CODE: &str = "drain_timed_out";
 const NOT_INSTALLED_CODE: &str = "not_installed";
 const NOT_COMPILED_CODE: &str = "not_compiled";
+
+/// The loopback port the shipped `main` binds unconditionally. The bind case has to hold
+/// it, so it is the one machine precondition this file does not own itself.
+#[cfg(all(windows, feature = "workspace-intelligence-host"))]
+const LOOPBACK_PORT: u16 = 8080;
+
+/// The stable Windows token of a bind on an address another socket holds. The sentence in
+/// front of it is the platform's localized text and is never compared.
+#[cfg(all(windows, feature = "workspace-intelligence-host"))]
+const WINDOWS_ADDR_IN_USE_TOKEN: &str = "(os error 10048)";
 
 /// Absolute budget for the whole test: the child run, both stream drains and every
 /// blocking wait on the parent side. A step that outlives it fails; none may hang.
@@ -203,15 +223,13 @@ impl IsolatedStorage {
         }
     }
 
-    /// The real Server command with the one refused origin argument.
-    fn command(&self) -> Command {
+    /// The real Server command with this isolated storage and no argument of its own.
+    fn base_command(&self) -> Command {
         let mut command = openbitfun_core::util::process_manager::create_command(env!(
             "CARGO_BIN_EXE_openbitfun-server"
         ));
         command
             .current_dir(self.working_dir())
-            .arg("--allowed-origin")
-            .arg(INVALID_ORIGIN)
             .env_remove("OPENBITFUN_USER_ROOT")
             .env_remove("OPENBITFUN_HOME")
             .env_remove("OPENBITFUN_MODELS_DEV_URL")
@@ -233,6 +251,25 @@ impl IsolatedStorage {
             .env("OPENBITFUN_MODELS_DEV_PATH", models_dev_asset());
         command
     }
+
+    /// The real Server command with the one refused origin argument.
+    ///
+    /// The argument is added after the shared setup so the origin-screen cases keep the
+    /// exact arguments and environment they had before the setup was split out.
+    fn command(&self) -> Command {
+        let mut command = self.base_command();
+        command.arg("--allowed-origin").arg(INVALID_ORIGIN);
+        command
+    }
+
+    /// The real Server command with no origin argument, so the product defaults apply.
+    ///
+    /// A bind failure can only be observed by a process that passes the origin screen, and
+    /// the shipped defaults are the allowed origins an operator would run with.
+    #[cfg(all(windows, feature = "workspace-intelligence-host"))]
+    fn default_origin_command(&self) -> Command {
+        self.base_command()
+    }
 }
 
 /// The repository's own models.dev document, so a refresh source is a local file.
@@ -245,6 +282,40 @@ fn models_dev_asset() -> PathBuf {
     asset
         .canonicalize()
         .expect("the bundled models.dev asset exists in this repository")
+}
+
+/// Holds the product's loopback port and proves this machine reports the conflict.
+///
+/// The shipped `main` binds `127.0.0.1:8080` unconditionally, so the bind case can only be
+/// evaluated where that port is free. The returned listener is the guard: it keeps the
+/// address until dropped, and the second bind inside this process is the proof that the
+/// platform reports an occupied address as `AddrInUse`. A taken port, a platform that
+/// accepts the second bind, or any other failure kind leaves the behavior under test
+/// unevaluated, and the failure says so instead of passing.
+#[cfg(all(windows, feature = "workspace-intelligence-host"))]
+fn occupy_loopback_port() -> std::net::TcpListener {
+    let address = (std::net::Ipv4Addr::LOCALHOST, LOOPBACK_PORT);
+    let listener = match std::net::TcpListener::bind(address) {
+        Ok(listener) => listener,
+        Err(error) => panic!(
+            "this machine's precondition does not hold: {address:?} must be free for the \
+             bind-failure case, but it could not be bound ({error}); the bind error path was \
+             not evaluated"
+        ),
+    };
+    match std::net::TcpListener::bind(address) {
+        Ok(_) => panic!(
+            "this machine's precondition does not hold: a second bind of {address:?} \
+             succeeded inside this process, so no address conflict can be produced here; \
+             the bind error path was not evaluated"
+        ),
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
+        Err(error) => panic!(
+            "this machine's precondition does not hold: a second bind of {address:?} failed \
+             with {error:?} instead of AddrInUse; the bind error path was not evaluated"
+        ),
+    }
+    listener
 }
 
 /// What one real Server process produced.
@@ -723,6 +794,61 @@ fn assert_origin_refusal_exit(run: &ServerRun) {
     }
 }
 
+/// Asserts the process ended on the listener's own TCP bind failure.
+///
+/// This is the mirror image of the origin-screen assertions above: the listener banners are
+/// logged before the bind, so they must be present here. The exit code 1 is what
+/// `Termination` reports for the `anyhow` error `main` returned, but a killed process also
+/// carries it on Windows, so it is paired with stderr: exactly one diagnostic, the `Error: `
+/// line, carrying the stable Windows occupied-address token. The localized sentence in front
+/// of that token is the platform's own text and is never compared.
+#[cfg(all(windows, feature = "workspace-intelligence-host"))]
+fn assert_bind_failure_exit(run: &ServerRun) {
+    assert!(
+        run.stdout.contains(STARTUP_BANNER),
+        "the real Server binary must have run its startup, stdout was:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "the Server must exit 1 on the bind failure, stderr was:\n{}",
+        run.stderr
+    );
+    let diagnostics: Vec<&str> = run
+        .stderr
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "the error exit must print only its diagnostic, stderr was:\n{}",
+        run.stderr
+    );
+    let diagnostic = diagnostics[0].trim();
+    assert!(
+        diagnostic.starts_with("Error: "),
+        "the one diagnostic must be the error `main` returned, stderr was:\n{}",
+        run.stderr
+    );
+    assert!(
+        diagnostic.contains(WINDOWS_ADDR_IN_USE_TOKEN),
+        "the diagnostic must name the occupied loopback address, so it must carry \
+         `{WINDOWS_ADDR_IN_USE_TOKEN}`; stderr was:\n{}",
+        run.stderr
+    );
+    for banner in LISTENER_BANNERS {
+        assert!(
+            run.stdout.contains(banner),
+            "these banners are logged before the listener binds, so `{banner}` must be \
+             present on this path; stdout was:\n{}",
+            run.stdout
+        );
+    }
+}
+
 /// Asserts the placement the startup actually resolved and wrote to its own log.
 fn assert_startup_placement(run: &ServerRun, expected_code: &str) {
     let expected = format!("{PLACEMENT_MESSAGE}: code={expected_code}");
@@ -999,6 +1125,166 @@ mod host_feature_on {
             read_anchor(&paths),
             anchor_before,
             "no admission may rewrite the storage anchor"
+        );
+    }
+
+    /// A real bind failure after admission still drains the host and releases the claim.
+    ///
+    /// Scope: this case covers one non-interactive exit path, the listener's own
+    /// `TcpListener::bind` failure, on Windows only. It is no evidence about Ctrl+C, about
+    /// any other way out of `main`, or about a Unix target.
+    ///
+    /// The child runs the same binary on the same fixture with an enabled scope, so it only
+    /// differs from the case above by reaching the listener: no `--allowed-origin` is
+    /// passed, the product defaults pass the origin screen, and this test holds
+    /// `127.0.0.1:8080` for the whole run. The listener banners are therefore expected
+    /// *present* — they are logged before the bind — the exit is the one `Error: `
+    /// diagnostic carrying the stable occupied-address token, and the drain is still
+    /// `drained` with the claim products intact. The second admission proves the tenure
+    /// itself is gone rather than a file having stayed behind.
+    #[cfg(windows)]
+    #[test]
+    fn a_real_bind_failure_after_admission_still_drains_and_releases_the_claim() {
+        let deadline = Instant::now() + DEADLINE;
+        // Held until the child has exited, so the listener it reaches is this test's. A
+        // machine where 8080 is taken fails here with the precondition report instead of
+        // evaluating anything.
+        let held_port = occupy_loopback_port();
+        let storage = IsolatedStorage::new();
+        storage.prepare();
+        // The shipped `main` resolves its SSH store through the Windows shell known folder for
+        // local application data. That API expands `%USERPROFILE%` and then verifies the path
+        // exists, so it never reads the product's environment overrides: without the default
+        // folders under the isolated home the child stops before the listener and the case
+        // would prove nothing. It is layout this case needs, not a product assertion — a
+        // machine whose known folder is redirected resolves its own existing path instead.
+        for folder in ["Local", "Roaming"] {
+            std::fs::create_dir_all(storage.home_root().join("AppData").join(folder))
+                .expect("the shell known-folder layout under the isolated home");
+        }
+        let user_root = storage.user_root();
+        let workspace_root = storage.working_dir();
+        let paths = host_fixture::test_path_manager(&user_root);
+
+        let seeded = run_parent_step(deadline, async {
+            host_fixture::seed_local_workspace(&paths, WORKSPACE_ID, &workspace_root)
+                .await
+                .expect("seed the workspace record");
+            host_fixture::enable_workspace(&paths, WORKSPACE_ID)
+                .await
+                .expect("enable the seeded workspace")
+        });
+        assert_eq!(
+            seeded.workspace_id(),
+            WORKSPACE_ID,
+            "the enabled scope is the one this test claims"
+        );
+
+        let anchor_before = read_anchor(&paths);
+        let control_before = read_control_record(&paths);
+        let catalog_before = catalog_workspace_root(&paths);
+        let claim_absent = !paths.workspace_intelligence_cognition_dir().exists()
+            && lease_files(&paths).is_empty();
+        assert!(claim_absent, "no claim product may exist before the process runs");
+
+        let run = run_server(storage.default_origin_command(), deadline);
+        println!(
+            "server exit: {:?}\n--- server stdout ---\n{}--- server stderr ---\n{}",
+            run.status.code(),
+            run.stdout,
+            run.stderr
+        );
+
+        assert_bind_failure_exit(&run);
+        assert_startup_placement(&run, "install");
+        let drain = parse_drain_record(&run.stdout, &run.stderr)
+            .unwrap_or_else(|error| panic!("the drain record could not be read: {error}"));
+        println!("drain record on {}: {}", drain.stream, drain.line);
+        assert_eq!(
+            drain.value, DRAINED_CODE,
+            "a host admitted before the bind failure must still report an awaited drain, never \
+             {NOT_INSTALLED_CODE}"
+        );
+
+        // The port is only needed while the child runs; the second admission is in-process.
+        drop(held_port);
+
+        let cognition_after_child = existing_cognition_files(&paths);
+        assert_eq!(
+            cognition_after_child.len(),
+            1,
+            "the claim must leave exactly one cognition partition behind, got {:?}",
+            cognition_after_child
+                .iter()
+                .map(|(name, bytes)| (name, bytes.len()))
+                .collect::<Vec<_>>()
+        );
+        assert_committed_partition(&cognition_after_child[0]);
+        let leases_after_child = lease_files(&paths);
+        assert_eq!(
+            leases_after_child.len(),
+            1,
+            "the claim must leave exactly one owner lease document behind, got {leases_after_child:?}"
+        );
+        assert_eq!(
+            read_anchor(&paths),
+            anchor_before,
+            "neither the claim nor the bind failure may rewrite the storage anchor"
+        );
+        assert_eq!(
+            read_control_record(&paths),
+            control_before,
+            "the control record must survive the claim and the bind failure"
+        );
+        assert_eq!(
+            catalog_workspace_root(&paths),
+            catalog_before,
+            "the workspace owner's record must survive the claim and the bind failure"
+        );
+
+        let takeover = takeover(deadline, paths.clone());
+        assert_eq!(
+            takeover.state, "active",
+            "the released root must be admitted again, got state {} with active {} standby {}",
+            takeover.state, takeover.active, takeover.standby
+        );
+        assert_eq!(
+            takeover.active, 1,
+            "the same enabled scope must be owned by the second admission"
+        );
+        assert_eq!(
+            takeover.standby, 0,
+            "a standby row is the only row a still-held tenure produces, so a lease the failed \
+             process never released would show up here"
+        );
+        assert_eq!(
+            takeover.scope,
+            Some("active"),
+            "the scope itself must be claimed, not merely enumerated as standby"
+        );
+        assert_eq!(
+            takeover.drain, DRAINED_CODE,
+            "the second admission must drain as well, so it leaves no tenure behind"
+        );
+
+        let cognition_after_takeover = existing_cognition_files(&paths);
+        assert_eq!(
+            cognition_after_takeover.len(),
+            1,
+            "the second claim must not add or remove a partition, got {:?}",
+            cognition_after_takeover
+                .iter()
+                .map(|(name, bytes)| (name, bytes.len()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            cognition_after_takeover[0].0, cognition_after_child[0].0,
+            "the second claim must reuse the partition the child used"
+        );
+        assert_ne!(
+            cognition_after_takeover, cognition_after_child,
+            "the second claim mints a new incarnation over the persisted one; the distinct bytes \
+             are the token advance, and the partition is never reset or deleted"
         );
     }
 
