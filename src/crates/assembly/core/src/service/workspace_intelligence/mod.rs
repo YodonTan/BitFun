@@ -148,6 +148,12 @@ pub(crate) mod session_source;
 #[allow(dead_code)]
 #[cfg(feature = "workspace-intelligence-host")]
 pub(crate) mod cursor_record;
+// First real consumer of WP1.5-b: it joins one Session snapshot observation with the decoded
+// cursor and answers what a pass may do. Pure decision only; the host performs the reads and
+// the guarded advance.
+#[allow(dead_code)]
+#[cfg(feature = "workspace-intelligence-host")]
+pub(crate) mod cursor_consumer;
 #[allow(dead_code)]
 #[cfg(feature = "workspace-intelligence-control")]
 pub(crate) mod control;

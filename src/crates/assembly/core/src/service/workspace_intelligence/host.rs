@@ -702,10 +702,11 @@ mod compiled {
     use log::{info, warn};
     use openbitfun_services_core::runtime_ownership::RuntimeDeployment;
     use openbitfun_services_core::workspace_intelligence_claim::{
-        ClaimAttempt, ClaimVerification, GovernedClaim, InitialEnableAttempt,
+        ClaimAttempt, ClaimVerification, CursorAttempt, GovernedClaim, InitialEnableAttempt,
         InitialEnableExpectation, InitialEnableRefusal as ReservationRefusal,
         InitialEnableReservation, WorkspaceIntelligenceClaimError,
     };
+    use openbitfun_services_core::workspace_intelligence_cognition::WorkspaceIntelligenceCognitionStore;
     use openbitfun_services_core::workspace_intelligence_commit::{
         GovernedClaimRefusal, WorkspaceIntelligenceCommitError,
     };
@@ -722,6 +723,14 @@ mod compiled {
         self, PersistedCatalog, PersistedCatalogEntry, PersistedCatalogUnsupported,
         PersistedWorkspace,
     };
+    use crate::service::workspace_intelligence::cursor::SourceId;
+    use crate::service::workspace_intelligence::cursor_consumer::{
+        self, ConsumerAction, SESSION_SNAPSHOT_SOURCE,
+    };
+    use crate::service::workspace_intelligence::cursor_record::{
+        CursorRecord, CursorRecordRefusal,
+    };
+    use crate::service::workspace_intelligence::session_source::{self, SessionIndexState};
     use crate::service::workspace_intelligence::host_binding::{
         self, BindingState, ExecutionBinding, LOCAL_EXECUTION_DOMAIN,
     };
@@ -1248,6 +1257,20 @@ mod compiled {
         reason: WorkspaceIntelligenceHostReason,
     }
 
+    /// Volatile progress of one scope's source cursor.
+    ///
+    /// Deliberately not persisted and not part of any report: the durable fact is the cursor
+    /// column itself, and this only lets a later pass remember what it already saw and how many
+    /// times a stale snapshot was detected. A restart starts from fresh facts, exactly like the
+    /// admission latch.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    struct CursorProgress {
+        /// Index state the last successful advance reconciled, when one succeeded.
+        last_index_state: Option<SessionIndexState>,
+        /// Detected compare-and-set conflicts since the last successful advance.
+        conflicts: u32,
+    }
+
     /// Mutable book of one host. Never held across an owner await except for the
     /// short, fully synchronous sections below.
     struct Book {
@@ -1259,6 +1282,9 @@ mod compiled {
         /// Volatile per-scope admission latch. Deliberately not persisted: it holds
         /// one host's own observation, and a restart starts from fresh facts.
         blocked_generation: BTreeMap<String, BlockedScope>,
+        /// Volatile per-scope source-cursor progress, keyed like the claims. Never
+        /// persisted: the cursor column is the durable fact and a restart re-reads it.
+        cursors: BTreeMap<String, CursorProgress>,
         /// Queued initial-enable reservations, keyed by scope key. The book owns the
         /// slot so a held permit cannot extend the lease lifetime past this host's own
         /// decision, and the drain transition is written under the same lock that owns
@@ -1276,6 +1302,7 @@ mod compiled {
                 scopes: Vec::new(),
                 claims: BTreeMap::new(),
                 blocked_generation: BTreeMap::new(),
+                cursors: BTreeMap::new(),
                 initial_enable: BTreeMap::new(),
                 worker: None,
             }
@@ -1382,6 +1409,8 @@ mod compiled {
         at_book_lock: Option<HostPause>,
         #[cfg(test)]
         drain_window: Option<HostPause>,
+        #[cfg(test)]
+        after_cursor_observe: Option<HostPause>,
         /// Real standby-worker creations of this host handle.
         ///
         /// The worker slot next to it answers "is a worker retained", which an OFF
@@ -1419,6 +1448,11 @@ mod compiled {
             #[cfg(test)]
             let drain_window =
                 super::pauses::for_user_root_of(&paths, super::pauses::PausePoint::DrainWait);
+            #[cfg(test)]
+            let after_cursor_observe = super::pauses::for_user_root_of(
+                &paths,
+                super::pauses::PausePoint::AfterCursorObserve,
+            );
             let tenancy_slot = OnceLock::new();
             if let Some(tenancy) = tenancy {
                 let _ = tenancy_slot.set(tenancy);
@@ -1447,6 +1481,8 @@ mod compiled {
                 #[cfg(test)]
                 drain_window,
                 #[cfg(test)]
+                after_cursor_observe,
+                #[cfg(test)]
                 standby_spawns: AtomicUsize::new(0),
             }
         }
@@ -1467,6 +1503,7 @@ mod compiled {
             book.fatal = Some(reason);
             book.scopes.clear();
             book.claims.clear();
+            book.cursors.clear();
         }
 
         /// Reads the persisted workspace registry through the read-only reader.
@@ -1664,6 +1701,7 @@ mod compiled {
                     // still holding one. The leases release on drop, and a later
                     // pass re-claims from fresh persisted facts.
                     book.claims.clear();
+                    book.cursors.clear();
                     book.fatal = Some(WorkspaceIntelligenceHostReason::CatalogUnreadable);
                     book.scopes.clear();
                     book.settle();
@@ -1671,10 +1709,11 @@ mod compiled {
                 }
             };
 
-            let (mut owned, latched, retry_earned): (
+            let (mut owned, latched, retry_earned, mut cursors): (
                 BTreeMap<String, GovernedClaim>,
                 BTreeMap<String, BlockedScope>,
                 bool,
+                BTreeMap<String, CursorProgress>,
             ) = {
                 let mut book = self.book.lock().await;
                 // Retry is earned by evidence this host already observed, never by an
@@ -1689,6 +1728,7 @@ mod compiled {
                     std::mem::take(&mut book.claims),
                     std::mem::take(&mut book.blocked_generation),
                     retry_earned,
+                    std::mem::take(&mut book.cursors),
                 )
             };
             // Rebuilt from the scopes this pass actually enumerates, so a scope that
@@ -1696,6 +1736,11 @@ mod compiled {
             let mut next_latched: BTreeMap<String, BlockedScope> = BTreeMap::new();
             let mut reports: Vec<WorkspaceIntelligenceHostScopeReport> = Vec::new();
             let mut published: BTreeMap<String, GovernedClaim> = BTreeMap::new();
+            // `(observed_binding, raw_expected_policy)` of every scope this pass publishes.
+            // Kept beside `published` so the cursor stage reads the same binding the claim was
+            // made under instead of re-deriving one from the catalog.
+            let mut bindings: BTreeMap<String, (ExecutionBinding, Option<serde_json::Value>)> =
+                BTreeMap::new();
             // `(scope_id, observed_binding, observed_control_generation,
             //   raw_expected_policy, claim)`. The control facts are the ones this
             // pass observed when it made the claim, so the publish step can prove the
@@ -1915,6 +1960,12 @@ mod compiled {
                                     WorkspaceIntelligenceHostReason::ClaimRefused,
                                 ));
                             } else {
+                                // A held claim reaches the cursor stage too, under the
+                                // binding and policy this pass just verified.
+                                bindings.insert(
+                                    scope_id.clone(),
+                                    (observed.clone(), record.policy.clone()),
+                                );
                                 published.insert(scope_id.clone(), claim);
                                 reports.push(active(label));
                             }
@@ -2082,6 +2133,8 @@ mod compiled {
                         };
                         match (catalog_outcome, control_outcome) {
                             (Ok(()), Ok(())) => {
+                                bindings
+                                    .insert(scope_id.clone(), (observed.clone(), expected_policy));
                                 published.insert(scope_id, claim);
                                 reports.push(active(observed.workspace_id()));
                             }
@@ -2097,6 +2150,13 @@ mod compiled {
                     }
                 }
             }
+
+            // The cursor stage runs after every claim of this pass is published and before
+            // the book records the pass, so a scope that is no longer admitted never
+            // advances a cursor. It holds no book lock: only the local maps are touched,
+            // and the result is written back inside the lock below.
+            self.advance_cursors(&published, &bindings, &mut cursors)
+                .await;
 
             #[cfg(test)]
             if let Some(book_pause) = self.before_book.as_ref() {
@@ -2135,6 +2195,7 @@ mod compiled {
                     demote_active_reports(&mut reports);
                 }
                 book.claims = published;
+                book.cursors = cursors;
                 book.scopes = reports;
                 // The rebuilt latch replaces the previous one wholesale, so a scope
                 // that left the catalog or went OFF is no longer latched.
@@ -2316,6 +2377,7 @@ mod compiled {
                 // not reported as one: the persisted control record, the cognition
                 // partition and the owner's own writes are untouched.
                 book.claims.clear();
+                book.cursors.clear();
                 // No scope is owned any more, so the per-scope snapshot is cleared
                 // instead of leaving stale `active` rows behind.
                 book.scopes.clear();
@@ -2335,6 +2397,233 @@ mod compiled {
                     WorkspaceIntelligenceHostDrain::DrainTimedOut { outstanding },
                     book.state,
                 )
+            }
+        }
+
+        /// Advances the recorded source cursor of every scope this pass published.
+        ///
+        /// Serial across scopes on purpose: this is not the interactive path, the book lock is
+        /// held only for the final write-back, one scope reads a bounded directory, the
+        /// blocking work already left the runtime worker, and the drain protocol accounts for
+        /// one pass of in-flight work. Concurrent blocking tasks would rework that protocol for
+        /// no measured gain; a pass that measurably exceeds the standby floor can revisit this
+        /// with bounded concurrency.
+        ///
+        /// The Session root is resolved through `PathManager::project_sessions_dir`, which may
+        /// run the one-time legacy runtime-directory migration (`create_dir_all` on the projects
+        /// root plus a `rename` of a legacy directory). That is an accepted, idempotent side
+        /// effect already carried by every other Session-reading path, and it is the only write
+        /// this stage can cause outside the cognition partition. This stage itself never creates
+        /// a sessions directory, never repairs or rebuilds an index, and writes nothing at all
+        /// under the Session root.
+        ///
+        /// Nothing here decides admission: a scope reaches this stage only after its claim was
+        /// published, and every write goes back through that claim's own governed fence. A
+        /// drain that starts mid-stage may still complete the advance, which is safe: writing
+        /// the observed marker is idempotent (the next pass answers that it is a duplicate), the
+        /// claim still holds its lease while it advances, and the book discards the published
+        /// tenure when it observes the teardown.
+        ///
+        /// Diagnostics carry the scope label and the stable codes only: never the marker text,
+        /// which is a digest of user content.
+        async fn advance_cursors(
+            &self,
+            published: &BTreeMap<String, GovernedClaim>,
+            bindings: &BTreeMap<String, (ExecutionBinding, Option<serde_json::Value>)>,
+            cursors: &mut BTreeMap<String, CursorProgress>,
+        ) {
+            for (scope_id, claim) in published {
+                let Some((binding, expected_policy)) = bindings.get(scope_id) else {
+                    continue;
+                };
+                let label = binding.workspace_id();
+                let paths = Arc::clone(&self.paths);
+                let workspace_root = PathBuf::from(binding.workspace_root());
+                let sessions_root = match tokio::task::spawn_blocking(move || {
+                    paths.project_sessions_dir(&workspace_root)
+                })
+                .await
+                {
+                    Ok(root) => root,
+                    Err(_) => {
+                        warn!(
+                            "Workspace intelligence host could not resolve the Session root: workspace={} code=cursor_stage_blocking_task_failed",
+                            label
+                        );
+                        continue;
+                    }
+                };
+                let observed_root = sessions_root;
+                let observation = match tokio::task::spawn_blocking(move || {
+                    session_source::observe_sessions_snapshot(&observed_root)
+                })
+                .await
+                {
+                    Ok(Ok(observation)) => observation,
+                    Ok(Err(error)) => {
+                        warn!(
+                            "Workspace intelligence host could not observe the Session snapshot: workspace={} code={}",
+                            label,
+                            error.as_str()
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Workspace intelligence host could not observe the Session snapshot: workspace={} code=cursor_stage_blocking_task_failed",
+                            label
+                        );
+                        continue;
+                    }
+                };
+                let store = WorkspaceIntelligenceCognitionStore::new(self.cognition_root.clone());
+                let read_scope = scope_id.clone();
+                let read = tokio::task::spawn_blocking(move || store.read(&read_scope)).await;
+                let (recorded_raw, expected_raw) = match read {
+                    Ok(Ok(Some(state))) => (state.cursor.clone(), state.cursor),
+                    Ok(Ok(None)) => (None, None),
+                    Ok(Err(error)) => {
+                        warn!(
+                            "Workspace intelligence host could not read the cognition partition: workspace={} code={}",
+                            label,
+                            error.code()
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Workspace intelligence host could not read the cognition partition: workspace={} code=cursor_stage_blocking_task_failed",
+                            label
+                        );
+                        continue;
+                    }
+                };
+                #[cfg(test)]
+                if let Some(pause) = self.after_cursor_observe.as_ref() {
+                    // Test-only: the snapshot and the recorded cursor are both observed and
+                    // nothing is written yet, which is the window a concurrent writer, a
+                    // control change or a drain can race.
+                    pause.wait().await;
+                }
+                let source_id = SourceId::parse(SESSION_SNAPSHOT_SOURCE)
+                    .expect("the Session snapshot source identifier is valid");
+                let record = CursorRecord::new(&source_id);
+                let recorded = match record.decode(recorded_raw.as_deref()) {
+                    Ok(recorded) => recorded,
+                    Err(CursorRecordRefusal::SourceMismatch) => {
+                        warn!(
+                            "Workspace intelligence host left a cursor another source recorded: workspace={} code=cursor_source_mismatch",
+                            label
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(
+                            "Workspace intelligence host could not decode a recorded cursor: workspace={} code={}",
+                            label,
+                            error.code()
+                        );
+                        continue;
+                    }
+                };
+                let action = match cursor_consumer::decide(
+                    &source_id,
+                    recorded,
+                    session_source::offered_step(&observation),
+                ) {
+                    Ok(action) => action,
+                    Err(refusal) => {
+                        warn!(
+                            "Workspace intelligence host could not decide a cursor step: workspace={} code={}",
+                            label,
+                            refusal.as_str()
+                        );
+                        continue;
+                    }
+                };
+                let (marker, gap) = match action {
+                    ConsumerAction::Advance { to, gap } => (to, gap),
+                    ConsumerAction::Nothing => continue,
+                    ConsumerAction::SourceMismatch => {
+                        warn!(
+                            "Workspace intelligence host left a foreign source cursor: workspace={} code=cursor_source_mismatch",
+                            label
+                        );
+                        continue;
+                    }
+                    ConsumerAction::SourceRefused(refusal) => {
+                        warn!(
+                            "Workspace intelligence host had a cursor step refused: workspace={} code={}",
+                            label,
+                            refusal.as_str()
+                        );
+                        continue;
+                    }
+                };
+                let replacement = match record.encode(marker) {
+                    Ok(replacement) => replacement,
+                    Err(error) => {
+                        warn!(
+                            "Workspace intelligence host could not encode a cursor: workspace={} code={}",
+                            label,
+                            error.code()
+                        );
+                        continue;
+                    }
+                };
+                match claim
+                    .advance_cursor(
+                        claim.ticket(),
+                        expected_policy.as_ref(),
+                        expected_raw.as_deref(),
+                        &replacement,
+                    )
+                    .await
+                {
+                    Ok(CursorAttempt::Advanced(_)) => {
+                        let previous_index_state = cursors
+                            .get(scope_id.as_str())
+                            .and_then(|progress| progress.last_index_state);
+                        info!(
+                            "Workspace intelligence host advanced a source cursor: workspace={} index_state={} previous_index_state={} sessions={} invalid={} gap={}",
+                            label,
+                            observation.index_state().as_str(),
+                            previous_index_state.map_or("none", |state| state.as_str()),
+                            observation.sessions(),
+                            observation.invalid_sessions(),
+                            gap.as_str()
+                        );
+                        cursors.insert(
+                            scope_id.clone(),
+                            CursorProgress {
+                                last_index_state: Some(observation.index_state()),
+                                conflicts: 0,
+                            },
+                        );
+                    }
+                    Ok(CursorAttempt::Conflict) => {
+                        let progress = cursors.entry(scope_id.clone()).or_default();
+                        progress.conflicts = progress.conflicts.saturating_add(1);
+                        warn!(
+                            "Workspace intelligence host detected a stale cursor snapshot: workspace={} conflicts={}",
+                            label, progress.conflicts
+                        );
+                    }
+                    Ok(CursorAttempt::Refused(refusal)) => {
+                        warn!(
+                            "Workspace intelligence host had a cursor advance refused: workspace={} code={}",
+                            label,
+                            refusal.code()
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            "Workspace intelligence host could not advance a cursor: workspace={} code={}",
+                            label,
+                            claim_error_code(&error)
+                        );
+                    }
+                }
             }
         }
     }
@@ -3569,6 +3858,11 @@ mod pauses {
         AfterInitialEnableReserve,
         /// In the drain loop, between the in-flight check and the wait.
         DrainWait,
+        /// After the cursor stage of a pass observed both the Session snapshot and the
+        /// recorded cursor and strictly before it decides and advances, so a fixture can
+        /// write the cursor behind the pass, change the control authority, or start a
+        /// drain in exactly that window.
+        AfterCursorObserve,
         /// After a queued initial-enable reservation was taken out of its slot and
         /// strictly before its OS lease is released, so a fixture can hold a physical
         /// release in flight while a drain decides. Used by the drain batch, which
@@ -9429,6 +9723,487 @@ mod tests {
         assert_eq!(outcome_name(&refused), "refused");
         // `Committed` needs owner results a fixture must not fabricate; the
         // exhaustive match above already pins both variant names at compile time.
+    }
+
+    // ---- the cursor stage of a pass ---------------------------------------
+    //
+    // Every case below drives real passes over the real stores. None of them
+    // fabricates a cursor or a marker, and none of them asserts on log text: the
+    // durable cursor column is the observable.
+
+    /// One enabled scope plus the paths its cursor stage will read.
+    ///
+    /// Kept apart from the host handle so a case can register a pause point that
+    /// `HostCore::new` has to see while it builds.
+    struct CursorScope {
+        fixture: Fixture,
+        scope: String,
+        bound_policy: Value,
+        sessions_root: PathBuf,
+    }
+
+    impl CursorScope {
+        /// A published local workspace under its own exact binding.
+        ///
+        /// `enabled` decides whether the first pass claims it. A case that must observe
+        /// the cursor stage of the very first advance starts disabled: a host that
+        /// claims during bootstrap reaches the stage before a test can park it.
+        async fn prepare(enabled: bool) -> Self {
+            let fixture = Fixture::new().await;
+            fixture
+                .publish(vec![local_record(&fixture, "workspace-a", "a")])
+                .await;
+            let host_id = fixture.anchor().await;
+            let scope = fixture.scope(&host_id, "workspace-a");
+            let binding = fixture.binding(&host_id, "workspace-a").await;
+            let bound_policy = Fixture::bound_policy(&binding);
+            fixture
+                .seed_control(&scope, enabled, Some(bound_policy.clone()))
+                .await;
+            let sessions_root = fixture.paths.project_sessions_dir(&fixture.dir.path().join("a"));
+            Self {
+                fixture,
+                scope,
+                bound_policy,
+                sessions_root,
+            }
+        }
+
+        async fn enabled() -> Self {
+            Self::prepare(true).await
+        }
+
+        async fn inactive() -> Self {
+            Self::prepare(false).await
+        }
+
+        async fn bootstrap(self) -> CursorFixture {
+            let host = WorkspaceIntelligenceHost::bootstrap_with_options(
+                Arc::clone(&self.fixture.paths),
+                source(),
+                WorkspaceIntelligenceHostSurface::Desktop,
+                RuntimeDeployment::Embedded,
+                options(sleeping()),
+            )
+            .await;
+            CursorFixture { scope: self, host }
+        }
+    }
+
+    struct CursorFixture {
+        scope: CursorScope,
+        host: WorkspaceIntelligenceHost,
+    }
+
+    impl CursorFixture {
+        /// Enabled before the first pass, so bootstrap itself claims the scope.
+        async fn enabled() -> Self {
+            let cursor = CursorScope::enabled().await.bootstrap().await;
+            assert_eq!(
+                cursor.host.status().await.state(),
+                WorkspaceIntelligenceHostState::Active,
+                "the fixture must reach a claimed scope"
+            );
+            cursor
+        }
+
+        /// Enabled only after bootstrap, so the first pass through the cursor stage is
+        /// the one a case drives itself.
+        async fn inactive() -> Self {
+            CursorScope::inactive().await.bootstrap().await
+        }
+
+        /// Turns the scope on through the owner, keeping the policy it already stores.
+        async fn enable(&self) {
+            let generation = self.fixture().control_generation(self.scope_id()).await;
+            self.fixture()
+                .control()
+                .update(
+                    self.scope_id(),
+                    ControlGenerationExpectation::Exactly(generation),
+                    WorkspaceIntelligenceControlPatch {
+                        enabled: ControlFieldUpdate::Set(true),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the owner update is applied");
+        }
+
+        fn fixture(&self) -> &Fixture {
+            &self.scope.fixture
+        }
+
+        fn scope_id(&self) -> &str {
+            &self.scope.scope
+        }
+
+        fn sessions_root(&self) -> &Path {
+            &self.scope.sessions_root
+        }
+
+        fn recorded(&self) -> Option<String> {
+            WorkspaceIntelligenceCognitionStore::new(self.fixture().cognition_dir())
+                .read(self.scope_id())
+                .unwrap()
+                .and_then(|state| state.cursor)
+        }
+
+        /// The marker this host recorded, read back out of its own envelope.
+        fn marker(&self) -> String {
+            let raw = self.recorded().expect("the pass recorded a cursor");
+            let envelope: Value =
+                serde_json::from_str(&raw).expect("the recorded cursor is this envelope");
+            assert_eq!(
+                envelope["source"],
+                json!("session_snapshot"),
+                "the envelope names the source kind the observation declares"
+            );
+            envelope["marker"]
+                .as_str()
+                .expect("the envelope carries a marker")
+                .to_owned()
+        }
+
+        fn token(&self) -> Option<String> {
+            self.fixture().token(self.scope_id())
+        }
+    }
+
+    /// Writes one real Session through the metadata owner, so the index shape the
+    /// cursor stage reads is the production one.
+    async fn save_session(sessions_root: &Path, session_id: &str, last_active_at: u64) {
+        let store = openbitfun_services_core::session::SessionMetadataStore::new(
+            sessions_root.to_path_buf(),
+        );
+        let mut metadata = openbitfun_services_core::session::types::SessionMetadata::new(
+            session_id.to_owned(),
+            format!("Session {session_id}"),
+            "Standard".to_owned(),
+            "model".to_owned(),
+        );
+        metadata.last_active_at = last_active_at;
+        store
+            .save_metadata(&metadata)
+            .await
+            .expect("the metadata owner writes the fixture");
+    }
+
+    /// The sorted names directly under a Session root, so "the stage wrote nothing"
+    /// is a property of the whole directory rather than of one guessed file.
+    fn session_entries(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn a_pass_records_a_marker_for_a_workspace_without_sessions() {
+        let cursor = CursorFixture::enabled().await;
+        let marker = cursor.marker();
+        assert!(
+            marker.starts_with("s1-root_absent-0-0-"),
+            "a workspace with no Session root records an empty observation: {marker}"
+        );
+        assert!(
+            !cursor.sessions_root().exists(),
+            "the stage never creates the Session root it reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_snapshot_keeps_the_recorded_cursor() {
+        let cursor = CursorFixture::enabled().await;
+        let before = cursor.recorded();
+        let token = cursor.token();
+        cursor.host.evaluate_for_tests().await;
+        assert_eq!(cursor.recorded(), before, "the same marker is a duplicate");
+        assert_eq!(cursor.token(), token, "a duplicate pass advances no token");
+    }
+
+    #[tokio::test]
+    async fn a_new_session_moves_the_marker_and_keeps_the_incarnation_token() {
+        let cursor = CursorFixture::enabled().await;
+        let before = cursor.marker();
+        let token = cursor.token();
+        save_session(cursor.sessions_root(), "session-a", 10).await;
+        cursor.host.evaluate_for_tests().await;
+        let after = cursor.marker();
+        assert_ne!(after, before, "one more Session changes the marker");
+        assert!(
+            after.starts_with("s1-usable-1-0-"),
+            "the owner-written index is usable: {after}"
+        );
+        assert_eq!(
+            cursor.token(),
+            token,
+            "a cursor advance never advances the incarnation token"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_index_degrades_the_marker_without_rebuilding_it() {
+        let cursor = CursorFixture::enabled().await;
+        save_session(cursor.sessions_root(), "session-a", 10).await;
+        cursor.host.evaluate_for_tests().await;
+        assert!(cursor.marker().starts_with("s1-usable-1-0-"));
+        let index = cursor.sessions_root().join("index.json");
+        std::fs::remove_file(&index).expect("the owner wrote an index");
+        let entries = session_entries(cursor.sessions_root());
+        cursor.host.evaluate_for_tests().await;
+        let marker = cursor.marker();
+        assert!(
+            marker.starts_with(&format!("s1-index_missing-0-{}-", entries.len())),
+            "every enumerated entry counts as invalid instead: {marker}"
+        );
+        assert!(!index.exists(), "the stage never rebuilds an index");
+        assert_eq!(
+            session_entries(cursor.sessions_root()),
+            entries,
+            "the stage writes nothing at all under the Session root, lock file included"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_root_that_is_a_plain_file_leaves_the_cursor_untouched() {
+        let cursor = CursorFixture::enabled().await;
+        let before = cursor.recorded();
+        std::fs::create_dir_all(cursor.sessions_root().parent().unwrap()).unwrap();
+        std::fs::write(cursor.sessions_root(), b"not a directory").unwrap();
+        cursor.host.evaluate_for_tests().await;
+        assert_eq!(cursor.recorded(), before, "an unreadable root writes nothing");
+        assert!(
+            cursor.sessions_root().is_file(),
+            "the stage never repairs the root it could not read"
+        );
+        assert_eq!(
+            cursor.host.status().await.state(),
+            WorkspaceIntelligenceHostState::Active,
+            "a failed observation is not an admission fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_an_enabled_scope_advances_a_cursor() {
+        let fixture = Fixture::new().await;
+        fixture
+            .publish(vec![
+                local_record(&fixture, "workspace-a", "a"),
+                local_record(&fixture, "workspace-b", "b"),
+            ])
+            .await;
+        let host_id = fixture.anchor().await;
+        let enabled = fixture.scope(&host_id, "workspace-a");
+        let disabled = fixture.scope(&host_id, "workspace-b");
+        let binding = fixture.binding(&host_id, "workspace-a").await;
+        fixture
+            .seed_control(&enabled, true, Some(Fixture::bound_policy(&binding)))
+            .await;
+        fixture.seed_control(&disabled, false, None).await;
+        let host = WorkspaceIntelligenceHost::bootstrap_with_options(
+            Arc::clone(&fixture.paths),
+            source(),
+            WorkspaceIntelligenceHostSurface::Desktop,
+            RuntimeDeployment::Embedded,
+            options(sleeping()),
+        )
+        .await;
+        let store = WorkspaceIntelligenceCognitionStore::new(fixture.cognition_dir());
+        assert!(
+            store.read(&enabled).unwrap().is_some(),
+            "the enabled scope was claimed and advanced"
+        );
+        assert!(
+            store.read(&disabled).unwrap().is_none(),
+            "a disabled scope is never claimed, so it has no partition"
+        );
+        assert_eq!(fixture.sqlite_files().len(), 1, "exactly one partition exists");
+        assert_eq!(host.status().await.counts().active(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_host_does_not_advance_a_cursor_it_does_not_own() {
+        let cursor = CursorFixture::enabled().await;
+        let before = cursor.recorded();
+        let second = WorkspaceIntelligenceHost::bootstrap_with_options(
+            Arc::clone(&cursor.fixture().paths),
+            source(),
+            WorkspaceIntelligenceHostSurface::Desktop,
+            RuntimeDeployment::Embedded,
+            options(sleeping()),
+        )
+        .await;
+        assert_ne!(
+            second.status().await.scope_state("workspace-a"),
+            Some(WorkspaceIntelligenceHostScopeState::Active),
+            "the owner already holds this scope"
+        );
+        second.evaluate_for_tests().await;
+        assert_eq!(
+            cursor.recorded(),
+            before,
+            "a scope this host does not own is never advanced"
+        );
+        assert_eq!(
+            cursor.fixture().sqlite_files().len(),
+            1,
+            "the second host opened no partition of its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drain_that_starts_during_the_cursor_stage_waits_for_it() {
+        let (pause, mut entered) = HostPause::new();
+        let scope = CursorScope::inactive().await;
+        let _registration = super::pauses::register(
+            scope.fixture.paths.user_root_dir(),
+            super::pauses::PausePoint::AfterCursorObserve,
+            pause.clone(),
+        );
+        let cursor = scope.bootstrap().await;
+        // The first advance of this scope is the pass this case parks.
+        cursor.enable().await;
+        assert_eq!(cursor.recorded(), None, "the scope starts with no cursor");
+        let pass = tokio::spawn({
+            let host = cursor.host.clone();
+            async move { host.evaluate_for_tests().await }
+        });
+        tokio::time::timeout(DEADLINE, entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let stop = tokio::spawn({
+            let host = cursor.host.clone();
+            async move { host.shutdown().await }
+        });
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        while cursor.host.status().await.state() != WorkspaceIntelligenceHostState::Draining {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the drain never reported Draining"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            cursor.recorded(),
+            None,
+            "the parked stage has written nothing yet"
+        );
+        pause.release();
+        pass.await.unwrap();
+        let drained = stop.await.unwrap();
+        assert_eq!(drained.drain(), WorkspaceIntelligenceHostDrain::Drained);
+        assert!(
+            cursor.recorded().is_some(),
+            "the advance that was already in flight completed under the held lease"
+        );
+        assert_eq!(cursor.host.in_flight_for_tests().await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_cognition_partition_is_never_recreated_by_a_pass() {
+        let cursor = CursorFixture::enabled().await;
+        let before = cursor.recorded();
+        assert!(before.is_some(), "the fixture recorded a cursor");
+        for path in cursor.fixture().sqlite_files() {
+            std::fs::remove_file(&path).expect("the partition is not held open");
+        }
+        cursor.host.evaluate_for_tests().await;
+        assert_eq!(
+            cursor.recorded(),
+            None,
+            "no pass writes a cursor into a partition it did not find"
+        );
+        assert!(
+            cursor.fixture().sqlite_files().is_empty(),
+            "the missing partition is not recreated"
+        );
+        let status = cursor.host.status().await;
+        assert_ne!(
+            status.state(),
+            WorkspaceIntelligenceHostState::Active,
+            "the tenure cannot be verified against a partition that is gone"
+        );
+        assert_eq!(
+            status.counts().active(),
+            0,
+            "no scope reports itself active over a missing partition"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_change_during_the_cursor_stage_refuses_the_advance() {
+        let (pause, mut entered) = HostPause::new();
+        let scope = CursorScope::inactive().await;
+        let _registration = super::pauses::register(
+            scope.fixture.paths.user_root_dir(),
+            super::pauses::PausePoint::AfterCursorObserve,
+            pause.clone(),
+        );
+        let cursor = scope.bootstrap().await;
+        cursor.enable().await;
+        let pass = tokio::spawn({
+            let host = cursor.host.clone();
+            async move { host.evaluate_for_tests().await }
+        });
+        tokio::time::timeout(DEADLINE, entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut changed = cursor.scope.bound_policy.clone();
+        changed["domains"]["memory"]["enabled"] = json!(false);
+        cursor.fixture().patch_policy_same_generation(changed);
+        pause.release();
+        pass.await.unwrap();
+        assert_eq!(
+            cursor.recorded(),
+            None,
+            "an authority change refuses the advance"
+        );
+        // The refusal is transient: the same policy restored lets the next pass write.
+        cursor
+            .fixture()
+            .patch_policy_same_generation(cursor.scope.bound_policy.clone());
+        cursor.host.evaluate_for_tests().await;
+        assert!(
+            cursor.recorded().is_some(),
+            "the authority is read again next pass instead of being given up"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_with_no_enabled_scope_runs_no_cursor_stage() {
+        let fixture = Fixture::new().await;
+        fixture
+            .publish(vec![local_record(&fixture, "workspace-a", "a")])
+            .await;
+        let host_id = fixture.anchor().await;
+        let scope = fixture.scope(&host_id, "workspace-a");
+        fixture.seed_control(&scope, false, None).await;
+        let sessions_root = fixture.paths.project_sessions_dir(&fixture.dir.path().join("a"));
+        let host = WorkspaceIntelligenceHost::bootstrap_with_options(
+            Arc::clone(&fixture.paths),
+            source(),
+            WorkspaceIntelligenceHostSurface::Desktop,
+            RuntimeDeployment::Embedded,
+            options(sleeping()),
+        )
+        .await;
+        assert_ne!(
+            host.status().await.state(),
+            WorkspaceIntelligenceHostState::Active
+        );
+        assert!(
+            !fixture.cognition_dir().exists(),
+            "no claim means no cognition partition"
+        );
+        assert!(
+            !sessions_root.exists(),
+            "no claim means no Session observation either"
+        );
     }
 
     /// WP1.4 exit evidence for the delivery gate: every bootstrap of the 12 x 2
