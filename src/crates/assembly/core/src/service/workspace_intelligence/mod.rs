@@ -33,6 +33,17 @@
 //! root: deriving that root from a workspace, and remote or assistant support, belong
 //! to a later host wiring slice.
 //!
+//! The `workspace-intelligence-host`-gated `cursor_record` module is the pure half of a
+//! persisted cursor: it encodes one source and one marker into the stored text and
+//! decodes that text back, refusing an envelope that names another source and keeping
+//! anything it did not write verbatim. It performs no IO, takes no lock, reads no
+//! clock, has no consumer and writes no cursor. The governed advance that stores the
+//! text lives in the services layer, and binding a cursor write to a cognition content
+//! update in one transaction is an obligation of the later content store that this
+//! tree does not provide: that advance opens and commits its own `IMMEDIATE`
+//! transaction today, so a merged write must be a new primitive rather than a nested
+//! call.
+//!
 //! The control and cognition modules are internal and have no production caller
 //! outside the host facade, plus no entry point of their own, no legacy
 //! confirmation gate, UI, command, registry or capability. The gated `host`
@@ -132,6 +143,11 @@ pub(crate) mod host_standby;
 #[allow(dead_code)]
 #[cfg(feature = "workspace-intelligence-host")]
 pub(crate) mod session_source;
+// The pure half of a persisted cursor: envelope encode/decode with source affinity.
+// No consumer, no IO, no lock and no stored state of its own.
+#[allow(dead_code)]
+#[cfg(feature = "workspace-intelligence-host")]
+pub(crate) mod cursor_record;
 #[allow(dead_code)]
 #[cfg(feature = "workspace-intelligence-control")]
 pub(crate) mod control;

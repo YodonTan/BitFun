@@ -4,8 +4,11 @@
 //! holds a single `partition_state` row. The plain cognition / bootstrap contract,
 //! without `workspace-intelligence-claim`, initializes and reads partitions with
 //! shape-only `cursor` and `incarnation_token` values; it does not advance or
-//! interpret either value. Cursor/gap consumption (WP1.5) remains out of scope.
-//! The governed commit gate is the narrow runtime caller of this seam.
+//! interpret either value. Under `workspace-intelligence-claim` a raw cursor
+//! compare-and-swap primitive exists, but cursor/gap decision making and gap
+//! recording (WP1.5) remain out of scope, and nothing here encodes or decodes a
+//! cursor payload. The governed commit gate is the narrow runtime caller of this
+//! seam.
 //!
 //! # Layout and scope opacity
 //!
@@ -38,15 +41,21 @@
 //! [`CognitionInitialization::Existing`] without writing any user field.
 //! `initialize` remains a public low-level primitive, not an authorization path.
 //!
-//! Only under `workspace-intelligence-claim`, two `pub(crate)` operations extend
-//! this seam. `advance_incarnation` is the claim-gated surface's only real
-//! mutation: one IMMEDIATE transaction creates or validates the v1 partition,
-//! generates the tenure marker inside that transaction and writes
-//! `incarnation_token`. `verify_incarnation` is read-only, never creates a root,
-//! database, table or row, and refuses on any disagreement between the stored,
-//! live-claim and request markers. Both use the same v1 shape and `user_version`
-//! contract; `cursor` and extra columns/tables remain unchanged. This is not an
-//! enabling path, a WP1.4 exit or a P1 exit.
+//! Only under `workspace-intelligence-claim`, three `pub(crate)` operations extend
+//! this seam. `advance_incarnation` and `advance_cursor` are the claim-gated
+//! surface's only two real mutations: each runs one IMMEDIATE transaction through
+//! COMMIT and writes exactly one column. `advance_incarnation` creates or
+//! validates the v1 partition, generates the tenure marker inside that transaction
+//! and writes `incarnation_token`. `advance_cursor` creates nothing: it requires an
+//! existing v1 partition, compares the stored cursor text exactly against the
+//! caller's expectation and replaces it only on a match. It is the only cursor
+//! writer in this crate and it still does not interpret the value: the cursor
+//! envelope belongs to the caller, so this module compares and stores raw text
+//! only. `verify_incarnation` is read-only, never creates a root, database, table
+//! or row, and refuses on any disagreement between the stored, live-claim and
+//! request markers. All three use the same v1 shape and `user_version` contract;
+//! extra columns/tables remain unchanged. This is not an enabling path, a WP1.4
+//! exit or a P1 exit.
 //!
 //! An empty v0 database (no user objects) is a valid starting point that
 //! `advance_incarnation` initializes as v1. A v0 database carrying user objects
@@ -269,6 +278,14 @@ pub enum WorkspaceIntelligenceCognitionError {
     #[error("Cognition partition record {path} has a stale incarnation")]
     StaleIncarnation { path: PathBuf },
 
+    #[cfg(feature = "workspace-intelligence-claim")]
+    #[error("Cognition partition record {path} has no initialized partition for a cursor advance")]
+    CursorPartitionUnavailable { path: PathBuf },
+
+    #[cfg(feature = "workspace-intelligence-claim")]
+    #[error("Cognition partition record {path} cursor changed since it was observed")]
+    CursorConflict { path: PathBuf },
+
     #[error("Cognition partition record storage failed: {0}")]
     Storage(#[from] rusqlite::Error),
 
@@ -291,6 +308,10 @@ impl WorkspaceIntelligenceCognitionError {
             Self::CorruptDatabase { .. } => "corrupt_database",
             #[cfg(feature = "workspace-intelligence-claim")]
             Self::StaleIncarnation { .. } => "stale_incarnation",
+            #[cfg(feature = "workspace-intelligence-claim")]
+            Self::CursorPartitionUnavailable { .. } => "cursor_partition_unavailable",
+            #[cfg(feature = "workspace-intelligence-claim")]
+            Self::CursorConflict { .. } => "cursor_conflict",
             Self::Storage(_) => "sqlite_storage",
             Self::Io(_) => "io",
         }
@@ -325,11 +346,13 @@ impl WorkspaceIntelligenceCognitionError {
     }
 }
 
-/// Shape-only cognition partition state.
+/// Opaque cognition partition state.
 ///
 /// `cursor` and `incarnation_token` are opaque nullable text. This module never
-/// interprets them, never advances them and never assigns governance meaning to
-/// them.
+/// interprets either value and never assigns governance meaning to them.
+/// `advance_incarnation` is the only writer of the token and `advance_cursor` the
+/// only writer of the cursor (both gated on `workspace-intelligence-claim`);
+/// `read` and `initialize` never write either field of an existing row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CognitionPartitionState {
     /// Opaque cursor text, stored verbatim. Consumption is owned elsewhere.
@@ -383,6 +406,18 @@ impl std::fmt::Debug for IncarnationAdvance {
     }
 }
 
+/// Result of one accepted cursor advance, called only by the governed fence
+/// under a live lease. Both fields are opaque cursor text, stored and returned
+/// verbatim; this module attaches no meaning to them.
+#[cfg(feature = "workspace-intelligence-claim")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CursorAdvance {
+    /// Stored cursor before this advance; `None` means the column held NULL.
+    pub(crate) previous: Option<String>,
+    /// Cursor text this call wrote.
+    pub(crate) written: String,
+}
+
 #[cfg(feature = "workspace-intelligence-claim")]
 impl WorkspaceIntelligenceCognitionStore {
     /// Advance only incarnation_token in one IMMEDIATE transaction through COMMIT.
@@ -421,6 +456,71 @@ impl WorkspaceIntelligenceCognitionStore {
         ).map_err(|e| sqlite_error(&path, e))?;
         transaction.commit().map_err(|e| sqlite_error(&path, e))?;
         Ok(IncarnationAdvance { previous_token, token })
+    }
+
+    /// Replace only the `cursor` column in one IMMEDIATE transaction through COMMIT.
+    ///
+    /// This is the crate's only cursor writer and it is the narrow primitive behind
+    /// the governed fence; it is never a general-purpose writer. It requires a
+    /// partition a claim already created: a missing record, an uninitialized
+    /// database (version `0`) and any other version are
+    /// [`WorkspaceIntelligenceCognitionError::CursorPartitionUnavailable`], and this
+    /// call never creates a root, a record, a table or a row.
+    ///
+    /// `expected` is compared with the stored cursor text exactly — no trim, no case
+    /// folding, no parsing — so `None` (SQL NULL) and `Some("")` are different
+    /// stored states. A mismatch is
+    /// [`WorkspaceIntelligenceCognitionError::CursorConflict`] and the transaction
+    /// rolls back, leaving the file bytes unchanged. The replacement is stored
+    /// verbatim and never interpreted here: any envelope, affinity or gap decision
+    /// belongs to the caller.
+    pub(crate) fn advance_cursor(
+        &self,
+        scope: &str,
+        expected: Option<&str>,
+        replacement: &str,
+    ) -> Result<CursorAdvance, WorkspaceIntelligenceCognitionError> {
+        let key = scope_digest(scope)?;
+        let path = self.record_path(&key);
+        let Some(mut connection) = self.open_existing_record(&path, WRITE_FLAGS)? else {
+            return Err(WorkspaceIntelligenceCognitionError::CursorPartitionUnavailable { path });
+        };
+        connection.busy_timeout(BUSY_TIMEOUT).map_err(|e| sqlite_error(&path, e))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| sqlite_error(&path, e))?;
+        match schema_version(&transaction, &path)? {
+            COGNITION_SCHEMA_VERSION => {
+                observe_v1_partition(&transaction, &path, &key)?;
+            }
+            // Deliberately not `UninitializedDatabase`: a cursor advance states that a
+            // claim already established the partition, and unlike the token path this
+            // operation never creates one.
+            _ => {
+                return Err(WorkspaceIntelligenceCognitionError::CursorPartitionUnavailable { path });
+            }
+        }
+        let stored = read_cursor(&transaction, &path)?;
+        if stored.as_deref() != expected {
+            return Err(WorkspaceIntelligenceCognitionError::CursorConflict { path });
+        }
+        transaction.execute(
+            "UPDATE partition_state SET cursor = ?1 WHERE state_id = 1",
+            params![replacement],
+        ).map_err(|e| sqlite_error(&path, e))?;
+        // Test-only failpoint: fail after the row was written, so the rollback proof
+        // covers the write itself.
+        #[cfg(test)]
+        {
+            if self.cursor_failpoint {
+                return Err(WorkspaceIntelligenceCognitionError::Io(
+                    std::io::Error::other(
+                        "injected cognition cursor advance failure (test-only failpoint)",
+                    ),
+                ));
+            }
+        }
+        transaction.commit().map_err(|e| sqlite_error(&path, e))?;
+        Ok(CursorAdvance { previous: stored, written: replacement.to_owned() })
     }
 
     /// Verification with no data writes in ONE IMMEDIATE transaction, acquiring
@@ -481,6 +581,18 @@ fn read_incarnation(connection: &Connection, path: &Path) -> Result<Option<Strin
     read_optional_text(row, 0, path, PartitionShapeFault::IncarnationTokenNotText)
 }
 
+#[cfg(feature = "workspace-intelligence-claim")]
+fn read_cursor(connection: &Connection, path: &Path) -> Result<Option<String>, WorkspaceIntelligenceCognitionError> {
+    // The same strict nullable-text rule used by the shape-only reader.
+    let mut statement = connection.prepare(
+        "SELECT cursor FROM partition_state WHERE state_id = 1"
+    ).map_err(|e| sqlite_error(path, e))?;
+    let mut rows = statement.query([]).map_err(|e| sqlite_error(path, e))?;
+    let row = rows.next().map_err(|e| sqlite_error(path, e))?
+        .ok_or_else(|| WorkspaceIntelligenceCognitionError::MissingPartitionRow { path: path.to_path_buf() })?;
+    read_optional_text(row, 0, path, PartitionShapeFault::CursorNotText)
+}
+
 /// Durable cognition partition store over a host-injected, host-local root.
 ///
 /// Each opaque scope maps to one SQLite database directly inside `root`.
@@ -491,6 +603,9 @@ pub struct WorkspaceIntelligenceCognitionStore {
     inject_initialize_failure: bool,
     #[cfg(all(test, feature = "workspace-intelligence-claim"))]
     pub(crate) verify_pause: Option<crate::workspace_intelligence_commit::TestPause>,
+    /// Test-only failpoint that fails a cursor advance after the row was written.
+    #[cfg(all(test, feature = "workspace-intelligence-claim"))]
+    pub(crate) cursor_failpoint: bool,
 }
 
 impl WorkspaceIntelligenceCognitionStore {
@@ -513,6 +628,8 @@ impl WorkspaceIntelligenceCognitionStore {
             inject_initialize_failure: false,
             #[cfg(feature = "workspace-intelligence-claim")]
             verify_pause: None,
+            #[cfg(feature = "workspace-intelligence-claim")]
+            cursor_failpoint: false,
         }
     }
 
@@ -527,6 +644,8 @@ impl WorkspaceIntelligenceCognitionStore {
             inject_initialize_failure: true,
             #[cfg(feature = "workspace-intelligence-claim")]
             verify_pause: None,
+            #[cfg(feature = "workspace-intelligence-claim")]
+            cursor_failpoint: false,
         }
     }
 
@@ -2289,6 +2408,166 @@ mod tests {
                 assert_eq!(store.verify_incarnation(SCOPE, "live", "live").unwrap_err().code(), code);
                 assert_eq!(file_bytes(&path), bytes);
             }
+        }
+
+        fn cursor_of(path: &Path) -> Option<String> {
+            raw_read_connection(path)
+                .query_row(
+                    "SELECT cursor FROM partition_state WHERE state_id = 1",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .expect("the fixture cursor is readable")
+        }
+
+        /// A partition a claim already created, as `advance_cursor` requires.
+        fn claimed(temp: &TempDir) -> (WorkspaceIntelligenceCognitionStore, PathBuf) {
+            let store = WorkspaceIntelligenceCognitionStore::new(store_root(temp));
+            store
+                .advance_incarnation(SCOPE)
+                .expect("a claim creates the fixture partition");
+            let path = record_path_for(&store, SCOPE);
+            (store, path)
+        }
+
+        #[test]
+        fn advance_cursor_from_null_writes_only_the_cursor() {
+            let temp = TempDir::new().unwrap();
+            let (store, path) = claimed(&temp);
+            let before = store.read(SCOPE).unwrap().unwrap();
+            assert_eq!(before.cursor, None);
+
+            let advance = store.advance_cursor(SCOPE, None, "m-1").unwrap();
+
+            assert_eq!(advance.previous, None);
+            assert_eq!(advance.written, "m-1");
+            assert_eq!(cursor_of(&path).as_deref(), Some("m-1"));
+            let after = store.read(SCOPE).unwrap().unwrap();
+            assert_eq!(after.cursor.as_deref(), Some("m-1"));
+            assert_eq!(after.incarnation_token, before.incarnation_token);
+            let db = raw_read_connection(&path);
+            assert_eq!(user_version_of(&db), 1, "the schema version does not move");
+            assert_eq!(partition_row_count(&db), 1);
+            assert_eq!(
+                column_names(&db, "partition_state"),
+                ["state_id", "partition_key", "cursor", "incarnation_token"],
+                "no column is added or removed"
+            );
+        }
+
+        #[test]
+        fn advance_cursor_requires_the_exact_stored_text() {
+            let temp = TempDir::new().unwrap();
+            let (store, path) = claimed(&temp);
+            store.advance_cursor(SCOPE, None, "x").unwrap();
+
+            let advance = store.advance_cursor(SCOPE, Some("x"), "y").unwrap();
+
+            assert_eq!(advance.previous.as_deref(), Some("x"));
+            assert_eq!(advance.written, "y");
+            assert_eq!(cursor_of(&path).as_deref(), Some("y"));
+        }
+
+        #[test]
+        fn advance_cursor_cas_mismatch_writes_nothing() {
+            let temp = TempDir::new().unwrap();
+            let (store, path) = claimed(&temp);
+            // Stored NULL accepts no text expectation, including the empty string.
+            let bytes = file_bytes(&path);
+            for expected in [Some("x"), Some("")] {
+                let error = store.advance_cursor(SCOPE, expected, "next").unwrap_err();
+                assert_eq!(error.code(), "cursor_conflict", "{expected:?}");
+                assert_eq!(file_bytes(&path), bytes, "{expected:?}");
+            }
+            store.advance_cursor(SCOPE, None, " x ").unwrap();
+            // Stored " x ": no trim, no case folding, no parsing.
+            let bytes = file_bytes(&path);
+            for expected in [None, Some("x"), Some("X"), Some(" x"), Some("x ")] {
+                let error = store.advance_cursor(SCOPE, expected, "next").unwrap_err();
+                assert_eq!(error.code(), "cursor_conflict", "{expected:?}");
+                assert_eq!(file_bytes(&path), bytes, "{expected:?}");
+            }
+            assert_eq!(cursor_of(&path).as_deref(), Some(" x "));
+        }
+
+        #[test]
+        fn advance_cursor_requires_an_existing_partition() {
+            // No record at all: this operation never creates the root or the record.
+            let temp = TempDir::new().unwrap();
+            let store = WorkspaceIntelligenceCognitionStore::new(store_root(&temp));
+            let error = store.advance_cursor(SCOPE, None, "m-1").unwrap_err();
+            assert_eq!(error.code(), "cursor_partition_unavailable");
+            assert!(!store_root(&temp).exists(), "no root is created");
+
+            // An empty version-0 database is not adopted either, and keeps its own code
+            // rather than the token path's `uninitialized_database`.
+            let temp = TempDir::new().unwrap();
+            let root = store_root(&temp);
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join(format!("{}.sqlite", scope_digest(SCOPE).unwrap()));
+            drop(raw_write_connection(&path));
+            let store = WorkspaceIntelligenceCognitionStore::new(root);
+            let error = store.advance_cursor(SCOPE, None, "m-1").unwrap_err();
+            assert_eq!(error.code(), "cursor_partition_unavailable");
+            assert!(file_bytes(&path).is_empty(), "the empty fixture stays empty");
+
+            // An unsupported version and a foreign partition key keep their existing codes.
+            for (label, statement, code) in [
+                ("version", "PRAGMA user_version=2", "cursor_partition_unavailable"),
+                ("foreign-key", "UPDATE partition_state SET partition_key='other'", "partition_scope_mismatch"),
+            ] {
+                let temp = TempDir::new().unwrap();
+                let (store, path) = claimed(&temp);
+                raw_write_connection(&path).execute_batch(statement).unwrap();
+                let bytes = file_bytes(&path);
+                let error = store.advance_cursor(SCOPE, None, "m-1").unwrap_err();
+                assert_eq!(error.code(), code, "{label}");
+                assert_eq!(file_bytes(&path), bytes, "{label}");
+            }
+
+            // Bytes that are not a database are corrupt, never reset.
+            let temp = TempDir::new().unwrap();
+            let (store, path) = claimed(&temp);
+            fs::write(&path, b"not a SQLite database").unwrap();
+            let bytes = file_bytes(&path);
+            let error = store.advance_cursor(SCOPE, None, "m-1").unwrap_err();
+            assert_eq!(error.code(), "corrupt_database");
+            assert_eq!(file_bytes(&path), bytes);
+        }
+
+        #[test]
+        fn a_failed_cursor_advance_rolls_back() {
+            let temp = TempDir::new().unwrap();
+            let (store, path) = claimed(&temp);
+            let mut failing = WorkspaceIntelligenceCognitionStore::new(store_root(&temp));
+            failing.cursor_failpoint = true;
+            let bytes = file_bytes(&path);
+
+            let error = failing.advance_cursor(SCOPE, None, "m-1").unwrap_err();
+
+            assert!(matches!(error, WorkspaceIntelligenceCognitionError::Io(_)), "{error}");
+            assert_eq!(error.code(), "io");
+            assert_eq!(cursor_of(&path), None, "the written row was rolled back");
+            assert_eq!(file_bytes(&path), bytes, "the file bytes are unchanged");
+            // The same store without the failpoint still advances, so the fixture proves
+            // the rollback rather than a broken record.
+            assert_eq!(store.advance_cursor(SCOPE, None, "m-1").unwrap().written, "m-1");
+        }
+
+        #[test]
+        fn cursor_and_incarnation_advances_are_independent() {
+            let temp = TempDir::new().unwrap();
+            let (store, path) = claimed(&temp);
+            store.advance_cursor(SCOPE, None, "m-1").unwrap();
+            let token_before = store.read(SCOPE).unwrap().unwrap().incarnation_token;
+
+            let advance = store.advance_incarnation(SCOPE).unwrap();
+
+            assert_eq!(advance.previous_token, token_before);
+            let state = store.read(SCOPE).unwrap().unwrap();
+            assert_eq!(state.cursor.as_deref(), Some("m-1"), "the cursor survives a tenure advance");
+            assert_eq!(state.incarnation_token, Some(advance.token));
+            assert_eq!(cursor_of(&path).as_deref(), Some("m-1"));
         }
     }
 }

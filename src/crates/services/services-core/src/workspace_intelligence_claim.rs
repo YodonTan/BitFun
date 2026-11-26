@@ -1,8 +1,16 @@
 //! Owner-lifecycle evidence for an already-enabled scope, plus one single-purpose
 //! pre-held lease for an initial-enable preparation. NOT a WP1.4 exit or P1 exit
 //! and NOT the OFF-to-ON enabling path: no enabling write, no `allow_off`, no
-//! tenure marker, no host bootstrap, apps wiring, standby retry loop, background
-//! task, cursor/gap, revision/epoch, or content mutation.
+//! tenure marker outside a claim, no host bootstrap, apps wiring, standby retry
+//! loop, background task, gap recording, revision/epoch, or content mutation.
+//!
+//! One cursor entry point exists under this feature: [`GovernedClaim::advance_cursor`]
+//! replaces the scope's opaque cursor text through the governed fence, under the
+//! same lease, the same five binding checks and the same control guard as tenure
+//! advancement. It records no gap, keeps no dedup window, performs no cognition
+//! update and has no consumer in this tree; it stores a caller-supplied string
+//! verbatim and never interprets, orders or compares it beyond exact equality
+//! against the caller's own expectation.
 //!
 //! The lease is the only tenure object. A token is a tenure marker, not a
 //! secret, authorization or grant. Fixed lock order: lease -> control -> SQLite;
@@ -239,6 +247,32 @@ pub enum ClaimVerification {
     Refused(GovernedClaimRefusal),
 }
 
+/// Result of one accepted cursor advance.
+///
+/// Both fields are the opaque cursor text stored in the cognition partition. They
+/// carry no ordering, no secret and no decoded envelope: a caller decides what the
+/// text means and the fence only guarantees the compare-and-swap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorOutcome {
+    /// Stored cursor before this advance; `None` means the column held NULL.
+    pub previous: Option<String>,
+    /// Cursor text this call wrote, verbatim.
+    pub written: String,
+}
+
+/// Outcome of one governed cursor advance request.
+#[derive(Debug)]
+pub enum CursorAttempt {
+    /// The fence accepted the compare-and-swap and the transaction committed.
+    Advanced(CursorOutcome),
+    /// The stored cursor was no longer the expected text, so nothing was written. This is
+    /// a stale cursor snapshot, not an ownership refusal: the caller re-reads the cursor,
+    /// decides again and retries, and must not give up the scope because of it.
+    Conflict,
+    /// Typed refusal; nothing was written.
+    Refused(GovernedClaimRefusal),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceIntelligenceClaimError {
     #[error("Workspace intelligence claim lease failed: {0}")]
@@ -289,7 +323,7 @@ impl GovernedClaim {
                     scope: scope.to_owned(), token: advance.token, ticket }))
             }
             GovernedFenceOutcome::Refused(refusal) => Ok(ClaimAttempt::Refused(refusal)),
-            GovernedFenceOutcome::Verified { .. } => Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
+            GovernedFenceOutcome::Verified { .. } | GovernedFenceOutcome::CursorAdvanced(_) | GovernedFenceOutcome::CursorConflict => Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
                 operation: "advance_incarnation",
             }),
         }
@@ -373,7 +407,7 @@ impl GovernedClaim {
                     scope: scope.to_owned(), token: advance.token, ticket }))
             }
             GovernedFenceOutcome::Refused(refusal) => Ok(ClaimAttempt::Refused(refusal)),
-            GovernedFenceOutcome::Verified { .. } => Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
+            GovernedFenceOutcome::Verified { .. } | GovernedFenceOutcome::CursorAdvanced(_) | GovernedFenceOutcome::CursorConflict => Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
                 operation: "advance_incarnation",
             }),
         }
@@ -404,7 +438,7 @@ impl GovernedClaim {
         }, &self.binding).await? {
             GovernedFenceOutcome::Verified { control_generation } => Ok(ClaimVerification::Verified { control_generation }),
             GovernedFenceOutcome::Refused(refusal) => Ok(ClaimVerification::Refused(refusal)),
-            GovernedFenceOutcome::Advanced(_) => Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
+            GovernedFenceOutcome::Advanced(_) | GovernedFenceOutcome::CursorAdvanced(_) | GovernedFenceOutcome::CursorConflict => Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
                 operation: "verify_incarnation",
             }),
         }
@@ -453,9 +487,69 @@ impl GovernedClaim {
         }, &self.binding).await? {
             GovernedFenceOutcome::Verified { control_generation } => Ok(ClaimVerification::Verified { control_generation }),
             GovernedFenceOutcome::Refused(refusal) => Ok(ClaimVerification::Refused(refusal)),
-            GovernedFenceOutcome::Advanced(_) => Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
+            GovernedFenceOutcome::Advanced(_) | GovernedFenceOutcome::CursorAdvanced(_) | GovernedFenceOutcome::CursorConflict => Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
                 operation: "verify_incarnation",
             }),
+        }
+    }
+
+    /// Replace the scope's opaque cursor text under the live lease.
+    ///
+    /// The `origin`-versus-live-claim binding checks are identical to `verify`, so a
+    /// foreign ticket is refused before any IO. The admission then re-checks the
+    /// caller's expected execution binding against a fresh observation, exactly like
+    /// `verify_expecting`: `expected_policy` is an exact `Option<Value>` expectation
+    /// and `None` is not a wildcard. A mismatch refuses with `AuthorityChanged`
+    /// before the fence runs.
+    ///
+    /// Enabling is deliberately not re-checked here: the fence's own projection
+    /// comparison refuses a scope that is not enabled with `NotEnabled`, so that
+    /// decision stays in one authoritative place.
+    ///
+    /// `expected` is the exact cursor text the caller observed; `None` states "the
+    /// column is NULL". A stale expectation is answered as
+    /// [`CursorAttempt::Conflict`] and writes nothing: the caller's cursor snapshot is
+    /// old, so the right response is to re-read the cursor, decide again and retry, not
+    /// to abandon the scope, and it is therefore not a `Refused` refusal. The
+    /// replacement is stored verbatim: this records no gap, decodes no envelope and
+    /// derives no ordering, and a returned [`CursorOutcome`] is evidence of one
+    /// committed compare-and-swap, nothing more.
+    pub async fn advance_cursor(
+        &self,
+        origin: &OriginTicket,
+        expected_policy: Option<&serde_json::Value>,
+        expected: Option<&str>,
+        replacement: &str,
+    ) -> Result<CursorAttempt, WorkspaceIntelligenceClaimError> {
+        if origin.scope != self.scope
+            || origin.control_root.as_os_str() != self.gate.control_root().as_os_str()
+            || origin.cognition_root.as_os_str() != self.gate.cognition_root().as_os_str()
+            || origin.control_root.as_os_str() != self.binding.control_root().as_os_str()
+            || origin.cognition_root.as_os_str() != self.binding.cognition_root().as_os_str()
+            || origin.scope != self.binding.scope()
+            || origin.lease_path.as_os_str() != self.binding.lease_path().as_os_str()
+        {
+            return Ok(CursorAttempt::Refused(GovernedClaimRefusal::ForeignBinding));
+        }
+        let Some(snapshot) = self.gate.observe(&self.scope).await? else {
+            return Ok(CursorAttempt::Refused(GovernedClaimRefusal::NotObserved));
+        };
+        if snapshot.authority().policy() != expected_policy {
+            return Ok(CursorAttempt::Refused(GovernedClaimRefusal::AuthorityChanged));
+        }
+        match self.gate.commit_governed(&snapshot, GovernedFenceOperation::AdvanceCursor {
+            expected: expected.map(str::to_owned),
+            replacement: replacement.to_owned(),
+        }, &self.binding).await? {
+            GovernedFenceOutcome::CursorAdvanced(advance) => Ok(CursorAttempt::Advanced(CursorOutcome {
+                previous: advance.previous, written: advance.written,
+            })),
+            GovernedFenceOutcome::CursorConflict => Ok(CursorAttempt::Conflict),
+            GovernedFenceOutcome::Refused(refusal) => Ok(CursorAttempt::Refused(refusal)),
+            GovernedFenceOutcome::Advanced(_) | GovernedFenceOutcome::Verified { .. } =>
+                Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
+                    operation: "advance_cursor",
+                }),
         }
     }
 }
@@ -1408,6 +1502,7 @@ mod tests {
         let cognition = include_str!("workspace_intelligence_cognition.rs");
         assert!(cognition.contains("pub(crate) fn advance_incarnation"));
         assert!(cognition.contains("pub(crate) fn verify_incarnation"));
+        assert!(cognition.contains("pub(crate) fn advance_cursor"));
     }
 
     #[tokio::test]
@@ -2201,7 +2296,7 @@ mod tests {
         assert_eq!(production.matches("#[cfg(test)]\n    fn lease_path(&self)").count(), 1);
         assert!(production.contains("#[cfg(test)]\n    fn lease_path(&self)"));
         // The reservation path can never write control, cognition or tenure state.
-        for forbidden in [".update(", "commit_governed", "advance_incarnation", "initialize(", "ControlFieldUpdate"] {
+        for forbidden in [".update(", "commit_governed", "advance_incarnation", "advance_cursor", "initialize(", "ControlFieldUpdate"] {
             assert!(!section.contains(forbidden), "the reservation must not write: {forbidden}");
         }
         // The hard gate on the normal lifecycle is untouched: both claim entry
@@ -2248,5 +2343,122 @@ mod tests {
         assert_eq!(authority.model_ref(), Some("workspace-model-a"));
         assert_eq!(authority.policy(), Some(&policy));
         drop(reservation);
+    }
+
+    fn cursor_stored(base: &Path, scope: &str) -> Option<String> {
+        WorkspaceIntelligenceCognitionStore::new(base.join("cognition"))
+            .read(scope).unwrap().unwrap().cursor
+    }
+    fn refused_cursor(outcome: CursorAttempt, reason: GovernedClaimRefusal) {
+        assert!(matches!(outcome, CursorAttempt::Refused(actual) if actual == reason), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn advance_cursor_writes_the_cursor_under_the_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), SCOPE, true).await;
+        let claim = acquire(tmp.path(), SCOPE).await;
+        let token = stored(tmp.path(), SCOPE);
+        assert_eq!(cursor_stored(tmp.path(), SCOPE), None);
+
+        let outcome = claim.advance_cursor(claim.ticket(), None, None, "m-1").await.unwrap();
+
+        let CursorAttempt::Advanced(result) = outcome else { panic!("{outcome:?}") };
+        assert_eq!(result.previous, None);
+        assert_eq!(result.written, "m-1");
+        assert_eq!(cursor_stored(tmp.path(), SCOPE).as_deref(), Some("m-1"));
+        assert_eq!(stored(tmp.path(), SCOPE), token, "the tenure marker is untouched");
+    }
+
+    #[tokio::test]
+    async fn advance_cursor_refuses_a_foreign_ticket_without_a_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), SCOPE, true).await;
+        let claim = acquire(tmp.path(), SCOPE).await;
+        // A second claim over another root pairing yields a ticket this claim cannot use.
+        let other = tempfile::tempdir().unwrap();
+        seed(other.path(), SCOPE, true).await;
+        let foreign = acquire(other.path(), SCOPE).await;
+        let before_control = control_bytes(tmp.path());
+        let before_cognition = cognition_bytes(tmp.path());
+
+        refused_cursor(claim.advance_cursor(foreign.ticket(), None, None, "m-1").await.unwrap(),
+            GovernedClaimRefusal::ForeignBinding);
+
+        assert_eq!(control_bytes(tmp.path()), before_control);
+        assert_eq!(cognition_bytes(tmp.path()), before_cognition, "the partition is untouched");
+        assert_eq!(cursor_stored(tmp.path(), SCOPE), None);
+    }
+
+    #[tokio::test]
+    async fn advance_cursor_refuses_a_different_expected_policy_before_the_fence() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), SCOPE, true).await;
+        let claim = acquire(tmp.path(), SCOPE).await;
+        let before_control = control_bytes(tmp.path());
+        let before_cognition = cognition_bytes(tmp.path());
+
+        refused_cursor(claim.advance_cursor(claim.ticket(), Some(&bound_policy(HOST_ID)), None, "m-1").await.unwrap(),
+            GovernedClaimRefusal::AuthorityChanged);
+
+        // A caller-belief mismatch is decided from the observation alone: neither the
+        // control record nor the partition moved, so the fence never ran.
+        assert_eq!(control_bytes(tmp.path()), before_control);
+        assert_eq!(cognition_bytes(tmp.path()), before_cognition);
+        assert_eq!(cursor_stored(tmp.path(), SCOPE), None);
+    }
+
+    #[tokio::test]
+    async fn advance_cursor_uses_the_previous_write_as_the_next_expectation() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), SCOPE, true).await;
+        let claim = acquire(tmp.path(), SCOPE).await;
+        let CursorAttempt::Advanced(first) = claim.advance_cursor(claim.ticket(), None, None, "m-1").await.unwrap()
+            else { panic!("the first advance must be accepted") };
+
+        let CursorAttempt::Advanced(second) = claim.advance_cursor(claim.ticket(), None, Some(&first.written), "m-2").await.unwrap()
+            else { panic!("the chained advance must be accepted") };
+
+        assert_eq!(second.previous.as_deref(), Some("m-1"));
+        assert_eq!(second.written, "m-2");
+        assert_eq!(cursor_stored(tmp.path(), SCOPE).as_deref(), Some("m-2"));
+        // An expectation that is already stale is a conflict, not an ownership refusal and
+        // not a write: the caller re-reads, decides again and retries.
+        let before_cognition = cognition_bytes(tmp.path());
+        let stale = claim.advance_cursor(claim.ticket(), None, Some(&first.written), "m-3").await.unwrap();
+        assert!(matches!(stale, CursorAttempt::Conflict), "{stale:?}");
+        assert!(!matches!(stale, CursorAttempt::Refused(_)), "a stale snapshot is not a refusal");
+        assert_eq!(cognition_bytes(tmp.path()), before_cognition, "a conflict writes nothing");
+        assert_eq!(cursor_stored(tmp.path(), SCOPE).as_deref(), Some("m-2"));
+    }
+
+    #[test]
+    fn cursor_outcome_and_attempt_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CursorOutcome>();
+        assert_send_sync::<CursorAttempt>();
+        // A conflict carries no cursor text and no secret, so its debug output is just the
+        // variant name.
+        assert_eq!(format!("{:?}", CursorAttempt::Conflict), "Conflict");
+    }
+
+    #[test]
+    fn impossible_cursor_outcomes_are_unexpected_fence_outcomes() {
+        // The tenure and verification entry points can never observe a cursor outcome, and
+        // their match arms say so by name instead of with a wildcard. This is a source
+        // check because those paths are unreachable by construction.
+        let source = include_str!("workspace_intelligence_claim.rs");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(production.contains(
+            "GovernedFenceOutcome::Verified { .. } | GovernedFenceOutcome::CursorAdvanced(_) | GovernedFenceOutcome::CursorConflict =>"
+        ));
+        assert!(production.contains(
+            "GovernedFenceOutcome::Advanced(_) | GovernedFenceOutcome::CursorAdvanced(_) | GovernedFenceOutcome::CursorConflict =>"
+        ));
+        assert_eq!(
+            production.matches("GovernedFenceOutcome::CursorConflict").count(),
+            5,
+            "four impossible-case arms plus the one real cursor-conflict arm"
+        );
     }
 }

@@ -68,7 +68,7 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "workspace-intelligence-claim")]
 use crate::workspace_intelligence_claim::ClaimLeaseBinding;
 #[cfg(feature = "workspace-intelligence-claim")]
-use crate::workspace_intelligence_cognition::{scope_digest, IncarnationAdvance};
+use crate::workspace_intelligence_cognition::{scope_digest, CursorAdvance, IncarnationAdvance};
 #[cfg(all(test, feature = "workspace-intelligence-claim"))]
 use std::sync::Arc;
 #[cfg(all(test, feature = "workspace-intelligence-claim"))]
@@ -961,6 +961,160 @@ mod tests {
         assert_eq!(std::fs::read(&db).unwrap(), bytes);
     }
 
+    #[cfg(feature = "workspace-intelligence-claim")]
+    fn cognition_state(gate: &WorkspaceIntelligenceCommitGate, scope: &str) -> crate::workspace_intelligence_cognition::CognitionPartitionState {
+        WorkspaceIntelligenceCognitionStore::new(gate.cognition_root.clone()).read(scope).unwrap().unwrap()
+    }
+    #[cfg(feature = "workspace-intelligence-claim")]
+    async fn advance_cursor(
+        gate: &WorkspaceIntelligenceCommitGate, snapshot: &GovernedCommitSnapshot,
+        held: &ClaimLeaseBinding, expected: Option<&str>, replacement: &str,
+    ) -> GovernedFenceOutcome {
+        gate.commit_governed(snapshot, GovernedFenceOperation::AdvanceCursor {
+            expected: expected.map(str::to_owned), replacement: replacement.to_owned(),
+        }, held).await.unwrap()
+    }
+
+    #[cfg(feature = "workspace-intelligence-claim")]
+    #[tokio::test]
+    async fn cursor_advance_is_refused_before_io_by_the_same_five_bindings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = gate(tmp.path());
+        seed(&gate, SCOPE, true).await;
+        let snapshot = gate.observe(SCOPE).await.unwrap().unwrap();
+        let before = control_bytes(&gate);
+        // Each binding is dropped before the next one, because the three same-scope cases
+        // reuse one lease path and the OS lock is exclusive.
+        {
+            let lease_path = path(&gate.control_root().join("leases"), "other-scope", "lock");
+            let binding = ClaimLeaseBinding::bind(Arc::new(ExclusiveFileLease::try_acquire(&lease_path).unwrap()),
+                gate.control_root.clone(), gate.cognition_root.clone(), "other-scope".into(), lease_path);
+            claim_refused(advance_cursor(&gate, &snapshot, &binding, None, "m-1").await, GovernedClaimRefusal::ForeignBinding);
+        }
+        {
+            let lease_path = path(&gate.control_root().join("leases"), SCOPE, "lock");
+            let binding = ClaimLeaseBinding::bind(Arc::new(ExclusiveFileLease::try_acquire(&lease_path).unwrap()),
+                tmp.path().join("foreign-control"), gate.cognition_root.clone(), SCOPE.into(), lease_path);
+            claim_refused(advance_cursor(&gate, &snapshot, &binding, None, "m-1").await, GovernedClaimRefusal::ForeignBinding);
+        }
+        {
+            let lease_path = path(&gate.control_root().join("leases"), SCOPE, "lock");
+            let binding = ClaimLeaseBinding::bind(Arc::new(ExclusiveFileLease::try_acquire(&lease_path).unwrap()),
+                gate.control_root.clone(), tmp.path().join("foreign-cognition"), SCOPE.into(), lease_path);
+            claim_refused(advance_cursor(&gate, &snapshot, &binding, None, "m-1").await, GovernedClaimRefusal::ForeignBinding);
+        }
+        // Every refusal happened before the owner ran: no control byte and no database.
+        assert_eq!(control_bytes(&gate), before);
+        assert!(!gate.cognition_root().exists());
+    }
+
+    #[cfg(feature = "workspace-intelligence-claim")]
+    #[tokio::test]
+    async fn cursor_advance_obeys_the_authority_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = gate(tmp.path());
+        seed(&gate, SCOPE, true).await;
+        let snapshot = gate.observe(SCOPE).await.unwrap().unwrap();
+        let held = lease(&gate, SCOPE);
+        close(&gate, SCOPE).await;
+        // A close after the observation is an authority change, refused before the owner.
+        claim_refused(advance_cursor(&gate, &snapshot, &held, None, "m-1").await, GovernedClaimRefusal::AuthorityChanged);
+        let disabled = gate.observe(SCOPE).await.unwrap().unwrap();
+        claim_refused(advance_cursor(&gate, &disabled, &held, None, "m-1").await, GovernedClaimRefusal::NotEnabled);
+        std::fs::remove_file(path(gate.control_root(), SCOPE, "json")).unwrap();
+        claim_refused(advance_cursor(&gate, &snapshot, &held, None, "m-1").await, GovernedClaimRefusal::NotObserved);
+        assert!(!gate.cognition_root().exists(), "no refusal reaches the cognition store");
+    }
+
+    #[cfg(feature = "workspace-intelligence-claim")]
+    #[tokio::test]
+    async fn cursor_advance_touches_only_the_cursor_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = gate(tmp.path());
+        seed(&gate, SCOPE, true).await;
+        let snapshot = gate.observe(SCOPE).await.unwrap().unwrap();
+        let held = lease(&gate, SCOPE);
+        let outcome = gate.commit_governed(&snapshot, GovernedFenceOperation::AdvanceIncarnation, &held).await.unwrap();
+        let GovernedFenceOutcome::Advanced(tenure) = outcome else { panic!("{outcome:?}") };
+        let before = cognition_state(&gate, SCOPE);
+        assert_eq!(before.cursor, None);
+        assert_eq!(before.incarnation_token.as_deref(), Some(tenure.token.as_str()));
+
+        let outcome = advance_cursor(&gate, &snapshot, &held, None, "m-1").await;
+        let GovernedFenceOutcome::CursorAdvanced(written) = outcome else { panic!("{outcome:?}") };
+        assert_eq!(written.previous, None);
+        assert_eq!(written.written, "m-1");
+
+        let after = cognition_state(&gate, SCOPE);
+        assert_eq!(after.cursor.as_deref(), Some("m-1"));
+        assert_eq!(after.incarnation_token, before.incarnation_token, "the tenure marker is untouched");
+        let db = rusqlite::Connection::open(path(gate.cognition_root(), SCOPE, "sqlite")).unwrap();
+        assert_eq!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM partition_state", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[cfg(feature = "workspace-intelligence-claim")]
+    #[tokio::test]
+    async fn cursor_advance_holds_the_guard_and_the_lease_through_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gate = gate(tmp.path());
+        seed(&gate, SCOPE, true).await;
+        let snapshot = gate.observe(SCOPE).await.unwrap().unwrap();
+        {
+            // The fixture partition must exist before the measured attempt.
+            let first = lease(&gate, SCOPE);
+            gate.commit_governed(&snapshot, GovernedFenceOperation::AdvanceIncarnation, &first).await.unwrap();
+        }
+        let held = lease(&gate, SCOPE);
+        let lease_path = held.lease_path().to_path_buf();
+        let (hook, mut receiver, release) = pause();
+        gate.inside_owner = Some(hook);
+        let cloned = gate.clone();
+        let task = tokio::spawn(async move {
+            cloned.commit_governed(&snapshot, GovernedFenceOperation::AdvanceCursor {
+                expected: None, replacement: "m-2".to_owned(),
+            }, &held).await
+        });
+        entered(&mut receiver).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let probe = std::fs::OpenOptions::new().read(true).write(true).open(&lease_path).unwrap();
+        let error = fs2::FileExt::try_lock_exclusive(&probe).unwrap_err();
+        assert_eq!(error.raw_os_error(), fs2::lock_contended_error().raw_os_error());
+        drop(probe);
+        release.send(()).unwrap();
+        tokio::time::timeout(DEADLINE, close(&gate, SCOPE)).await.unwrap();
+        // The close completion proves the blocking closure dropped the control guard,
+        // and its committed cursor write happened before that.
+        assert_eq!(cognition_state(&gate, SCOPE).cursor.as_deref(), Some("m-2"));
+    }
+
+    #[cfg(feature = "workspace-intelligence-claim")]
+    #[tokio::test]
+    async fn a_stale_cursor_snapshot_is_a_conflict_not_a_refusal_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = gate(tmp.path());
+        seed(&gate, SCOPE, true).await;
+        let snapshot = gate.observe(SCOPE).await.unwrap().unwrap();
+        let held = lease(&gate, SCOPE);
+        gate.commit_governed(&snapshot, GovernedFenceOperation::AdvanceIncarnation, &held).await.unwrap();
+        let db = path(gate.cognition_root(), SCOPE, "sqlite");
+        let before = std::fs::read(&db).unwrap();
+
+        let outcome = advance_cursor(&gate, &snapshot, &held, Some("stale"), "m-1").await;
+
+        // A lost compare-and-swap is a stale cursor snapshot, so it is neither an error nor
+        // an ownership refusal: the caller re-reads, decides again and retries.
+        assert!(matches!(outcome, GovernedFenceOutcome::CursorConflict), "{outcome:?}");
+        assert!(!matches!(outcome, GovernedFenceOutcome::Refused(_)), "not an ownership refusal");
+        assert_eq!(std::fs::read(&db).unwrap(), before, "a conflict writes nothing");
+        assert_eq!(cognition_state(&gate, SCOPE).cursor, None);
+        // The positive control proves the conflict was about the expectation, not the path.
+        let outcome = advance_cursor(&gate, &snapshot, &held, None, "m-1").await;
+        assert!(matches!(outcome, GovernedFenceOutcome::CursorAdvanced(_)), "{outcome:?}");
+        assert_eq!(cognition_state(&gate, SCOPE).cursor.as_deref(), Some("m-1"));
+    }
+
 
     /// The former bare-Arc gate accepted any matching file name, even when the
     /// lease was acquired for another root pairing. The sealed tuple closes that
@@ -1138,6 +1292,9 @@ mod tests {
 pub(crate) enum GovernedFenceOperation {
     AdvanceIncarnation,
     VerifyIncarnation { expected: String, origin: String },
+    /// Replace one cursor column under the fence's CAS. `expected` is the exact stored
+    /// cursor text the caller observed; `None` states "the column is NULL".
+    AdvanceCursor { expected: Option<String>, replacement: String },
 }
 
 #[cfg(feature = "workspace-intelligence-claim")]
@@ -1145,6 +1302,11 @@ pub(crate) enum GovernedFenceOperation {
 pub(crate) enum GovernedFenceOutcome {
     Advanced(IncarnationAdvance),
     Verified { control_generation: u64 },
+    CursorAdvanced(CursorAdvance),
+    /// The cursor compare-and-swap lost: the caller's cursor snapshot was stale. This is
+    /// not an ownership refusal, so it is not a `Refused`; the correct response is to
+    /// re-read the cursor, decide again and retry.
+    CursorConflict,
     Refused(GovernedClaimRefusal),
 }
 
@@ -1242,10 +1404,16 @@ impl WorkspaceIntelligenceCommitGate {
                 GovernedFenceOperation::VerifyIncarnation { expected, origin } =>
                     store.verify_incarnation(&scope, &expected, &origin)
                         .map(|_| GovernedFenceOutcome::Verified { control_generation }),
+                GovernedFenceOperation::AdvanceCursor { expected, replacement } =>
+                    store.advance_cursor(&scope, expected.as_deref(), &replacement)
+                        .map(GovernedFenceOutcome::CursorAdvanced),
             }
         }).await.map_err(WorkspaceIntelligenceCommitError::OwnerTask)?;
         match outcome {
             Err(WorkspaceIntelligenceCognitionError::StaleIncarnation { .. }) => Ok(Refused(GovernedClaimRefusal::StaleIncarnation)),
+            // A lost cursor compare-and-swap is a stale snapshot the caller can retry, not
+            // an ownership refusal, so it leaves this fence as its own outcome.
+            Err(WorkspaceIntelligenceCognitionError::CursorConflict { .. }) => Ok(GovernedFenceOutcome::CursorConflict),
             Err(error) => Err(error.into()),
             Ok(outcome) => Ok(outcome),
         }
