@@ -1,5 +1,8 @@
 //! CLI command and product-assembly contract tests.
 
+#[cfg(windows)]
+#[path = "cli_command_contracts/dispatch_submit_windows.rs"]
+mod dispatch_submit_windows;
 #[path = "cli_command_contracts/exec_cli_contracts.rs"]
 mod exec_cli_contracts;
 #[path = "cli_command_contracts/host_lifecycle_cli.rs"]
