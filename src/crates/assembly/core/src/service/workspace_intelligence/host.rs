@@ -699,7 +699,7 @@ mod compiled {
     use std::sync::{Arc, OnceLock};
     use std::time::Duration;
 
-    use log::{info, warn};
+    use log::{debug, info, warn};
     use openbitfun_services_core::runtime_ownership::RuntimeDeployment;
     use openbitfun_services_core::workspace_intelligence_claim::{
         ClaimAttempt, ClaimVerification, CursorAttempt, GovernedClaim, InitialEnableAttempt,
@@ -2867,6 +2867,32 @@ mod compiled {
         }
     }
 
+    /// Reads the host id of the persisted storage anchor, if there is one.
+    ///
+    /// This is the one read-only entry a caller outside this module needs in order
+    /// to compose a host-and-domain key and a workspace scope of its own. The
+    /// anchor document is read through its owner
+    /// ([`HostAnchorStore::read_strict`]), which never creates, repairs or deletes
+    /// it: this function creates no directory, writes no file and takes no lock.
+    ///
+    /// `None` means the anchor is absent or unreadable. A caller must then skip the
+    /// work that needed a host id rather than inventing, defaulting or deriving one
+    /// from a path, a device, an account or a process fact.
+    #[allow(dead_code)] // Used only by `scoped_read_io`, which also requires `agent-runtime`.
+    pub(crate) async fn read_persisted_host_id(paths: &PathManager) -> Option<String> {
+        match HostAnchorStore::new(anchor_root(paths)).read_strict().await {
+            Ok(HostAnchorState::Present(anchor)) => Some(anchor.host_id().to_owned()),
+            Ok(HostAnchorState::Absent) => None,
+            Err(error) => {
+                debug!(
+                    "Workspace intelligence host could not read its storage anchor: code={}",
+                    anchor_error_code(&error)
+                );
+                None
+            }
+        }
+    }
+
     /// Storage-namespace root the host anchor document lives in.
     ///
     /// [`PathManager::workspace_intelligence_dir`] is the single owner of this
@@ -3801,6 +3827,11 @@ mod compiled {
 pub use not_compiled::WorkspaceIntelligenceHost;
 #[cfg(feature = "workspace-intelligence-host")]
 pub use compiled::WorkspaceIntelligenceHost;
+/// The one read-only anchor entry a caller outside this module may use to compose a
+/// host key of its own. It never creates, repairs or deletes the anchor.
+#[allow(unused_imports)] // The only consumer, `scoped_read_io`, also requires `agent-runtime`.
+#[cfg(feature = "workspace-intelligence-host")]
+pub(crate) use compiled::read_persisted_host_id;
 
 #[allow(unused_imports)]
 #[cfg(all(test, feature = "workspace-intelligence-host"))]

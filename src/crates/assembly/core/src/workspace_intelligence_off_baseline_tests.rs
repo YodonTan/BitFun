@@ -443,6 +443,55 @@ async fn off_baseline_prompt_text_digests_are_pinned() {
     }
 }
 
+/// SHA-256 baseline of the memory reminder the off path renders from a fixture root.
+///
+/// Owner: `agentic/agents/prompt_builder/prompt_builder_impl.rs`
+/// (`build_user_context_reminder`).
+///
+/// Off means: the memory section is still built from the legacy memory root and its
+/// `memory_summary.md`, byte for byte, and no scoped workspace intelligence content
+/// reaches the prompt.
+///
+/// The fixture root is a temporary directory, so both textual forms of that path are
+/// replaced by the literal `{MEMORY_ROOT}` before hashing: the pin covers the
+/// reminder text, not the temp path one run happened to receive. That is why this
+/// test does mention `{MEMORY_ROOT}` while the prompt-text pin above deliberately
+/// avoids it.
+#[tokio::test]
+async fn off_baseline_memory_reminder_digest_is_pinned() {
+    const FIXTURE_SUMMARY: &str = "Off baseline memory summary: one fixed sentence.";
+
+    let root = tempfile::tempdir().expect("temporary root");
+    let memory_root = root.path().join("memories");
+    std::fs::create_dir_all(&memory_root).expect("create the fixture memory root");
+    std::fs::write(memory_root.join("memory_summary.md"), FIXTURE_SUMMARY)
+        .expect("write the fixture memory summary");
+
+    let context = PromptBuilderContext::new(FIXTURE_WORKSPACE_PATH, None, None)
+        .with_memory_root_for_tests(memory_root.clone())
+        .with_memory_enabled_for_tests(true);
+    let reminder = PromptBuilder::new(context)
+        .build_user_context_reminder(&UserContextPolicy::empty().with_memory_summary())
+        .await
+        .expect("the memory section must produce a reminder");
+
+    let raw_path = memory_root.to_string_lossy().to_string();
+    let normalized = reminder
+        .replace(&raw_path.replace('\\', "/"), "{MEMORY_ROOT}")
+        .replace(&raw_path, "{MEMORY_ROOT}");
+
+    assert!(
+        !normalized.contains(&raw_path) && !normalized.contains(&raw_path.replace('\\', "/")),
+        "the fixture root path must not survive normalization"
+    );
+    assert!(normalized.contains("## Memory"));
+    assert!(normalized.contains(FIXTURE_SUMMARY));
+    assert_eq!(
+        sha256_hex(&normalized),
+        "493acd5f3292668db33c51d0415f41da9c296463e9f2b15e73bdb860ea12d4e3"
+    );
+}
+
 /// Independent structural baseline of the same prompt text: literal section and
 /// keyword sequences, so the digest above is not the only expectation.
 #[tokio::test]

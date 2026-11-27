@@ -17,6 +17,13 @@ use crate::service::instruction_context::build_workspace_instruction_files_conte
 use crate::service::remote_ssh::workspace_state::get_remote_workspace_manager;
 use crate::service::workspace::get_global_workspace_service;
 use crate::service::workspace::RelatedPath;
+use crate::service::workspace_intelligence::scoped_read::ScopedMemoryReadContext;
+#[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+use crate::service::workspace_intelligence::scoped_read::render_scoped_memory_reminder;
+#[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+use crate::service::workspace_intelligence::scoped_read_io::{
+    read_scoped_memory, resolve_scoped_memory_context,
+};
 use crate::util::errors::{OpenBitFunError, OpenBitFunResult};
 use log::{debug, info, warn};
 use openbitfun_agent_runtime::prompt::{
@@ -28,7 +35,7 @@ use openbitfun_agent_runtime::prompt::{
 };
 use openbitfun_agent_runtime::remote_file_delivery::user_workspace_relative_file_link;
 use openbitfun_core_types::{product_identity::hidden_data_directory, SessionExecutionTargetKind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Placeholder constants
 const PLACEHOLDER_PERSONA: &str = "{PERSONA}";
@@ -94,6 +101,19 @@ pub struct PromptBuilderContext {
     pub workspace_instruction_files_context: Option<String>,
     /// Distinguishes a resolved empty result from a caller that has not resolved instructions.
     pub workspace_instruction_files_context_resolved: bool,
+    /// Stable workspace identifier this context was built for, when the caller had one.
+    pub(crate) workspace_id: Option<String>,
+    /// Scoped workspace intelligence read decision. `None` keeps the legacy memory path.
+    pub(crate) scoped_memory: Option<ScopedMemoryReadContext>,
+    /// Memory root the reminder reads from. Production always uses the global root;
+    /// only a test sets this, so a fixture cannot read the developer's real memories.
+    pub(crate) memory_root_override: Option<PathBuf>,
+    /// Test-only paths the scoped read uses instead of the global path manager.
+    #[cfg(test)]
+    pub(crate) scoped_read_paths: Option<std::sync::Arc<crate::infrastructure::PathManager>>,
+    /// Test-only fixed answer for the global `memories.use_memories` switch.
+    #[cfg(test)]
+    pub(crate) memory_enabled_override: Option<bool>,
 }
 
 impl PromptBuilderContext {
@@ -116,6 +136,13 @@ impl PromptBuilderContext {
             remote_file_delivery_channel: false,
             workspace_instruction_files_context: None,
             workspace_instruction_files_context_resolved: false,
+            workspace_id: None,
+            scoped_memory: None,
+            memory_root_override: None,
+            #[cfg(test)]
+            scoped_read_paths: None,
+            #[cfg(test)]
+            memory_enabled_override: None,
         }
     }
 
@@ -162,6 +189,31 @@ impl PromptBuilderContext {
     pub fn with_workspace_instruction_files_context(mut self, context: Option<String>) -> Self {
         self.workspace_instruction_files_context = context;
         self.workspace_instruction_files_context_resolved = true;
+        self
+    }
+
+    /// Points the memory reminder at a fixture root instead of the global one.
+    #[cfg(test)]
+    pub(crate) fn with_memory_root_for_tests(mut self, root: PathBuf) -> Self {
+        self.memory_root_override = Some(root);
+        self
+    }
+
+    /// Points the scoped read at fixture paths instead of the global path manager.
+    #[cfg(test)]
+    pub(crate) fn with_scoped_read_paths_for_tests(
+        mut self,
+        paths: std::sync::Arc<crate::infrastructure::PathManager>,
+    ) -> Self {
+        self.scoped_read_paths = Some(paths);
+        self
+    }
+
+    /// Fixes the global memory switch for a test, so the assertions do not depend on
+    /// process-global configuration another test may have initialized.
+    #[cfg(test)]
+    pub(crate) fn with_memory_enabled_for_tests(mut self, enabled: bool) -> Self {
+        self.memory_enabled_override = Some(enabled);
         self
     }
 }
@@ -213,6 +265,20 @@ pub async fn build_prompt_context_for_workspace(
     }
     if let Some(supports_image_understanding) = supports_image_understanding {
         base = base.with_supports_image_understanding(supports_image_understanding);
+    }
+
+    base.workspace_id = workspace_id.map(str::to_string);
+
+    // The scoped read decision needs the persisted storage anchor and the control
+    // owner, so it only exists in a build that carries the host slice. Every other
+    // build keeps `scoped_memory = None`, which is the legacy path.
+    #[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+    {
+        if let Some(workspace_id) = workspace_id {
+            if let Some(paths) = scoped_read_paths(&base) {
+                base.scoped_memory = resolve_scoped_memory_context(&paths, workspace_id).await;
+            }
+        }
     }
 
     if !workspace.is_remote() {
@@ -433,6 +499,12 @@ impl PromptBuilder {
         let memory_section_allowed = self.context.remote_execution.is_none()
             && policy.includes(UserContextSection::MemorySummary);
         if memory_section_allowed {
+            #[cfg(test)]
+            let enabled = match self.context.memory_enabled_override {
+                Some(enabled) => enabled,
+                None => memory_summary_enabled().await,
+            };
+            #[cfg(not(test))]
             let enabled = memory_summary_enabled().await;
             info!(
                 "Memory prompt injection evaluated: session_id={:?}, workspace_path={}, use_memories={}, remote_execution=false",
@@ -441,22 +513,43 @@ impl PromptBuilder {
                 enabled
             );
             if enabled {
-                let memory_root = memory_root_dir();
-                if let Some(memory_read_path) = build_memory_read_path_reminder(&memory_root).await
-                {
-                    info!(
-                        "Memory prompt injection added: session_id={:?}, memory_root={}, reminder_bytes={}",
-                        self.context.session_id,
-                        memory_root.display(),
-                        memory_read_path.len()
+                if let Some(scoped) = self.context.scoped_memory.as_ref() {
+                    // A permitted scoped read is the only memory source for this
+                    // workspace: an empty scoped read injects nothing and never falls
+                    // back to the global summary.
+                    #[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+                    self.push_scoped_memory_section(scoped, &mut additional_sections)
+                        .await;
+                    #[cfg(not(all(
+                        feature = "workspace-intelligence-host",
+                        feature = "agent-runtime"
+                    )))]
+                    debug!(
+                        "Scoped memory read skipped: workspace_id={} reason=feature_disabled",
+                        scoped.workspace_id
                     );
-                    additional_sections.push(memory_read_path);
                 } else {
-                    info!(
-                        "Memory prompt injection skipped because no reminder was available: session_id={:?}, memory_root={}",
-                        self.context.session_id,
-                        memory_root.display()
-                    );
+                    let memory_root = self
+                        .context
+                        .memory_root_override
+                        .clone()
+                        .unwrap_or_else(memory_root_dir);
+                    if let Some(memory_read_path) = build_memory_read_path_reminder(&memory_root).await
+                    {
+                        info!(
+                            "Memory prompt injection added: session_id={:?}, memory_root={}, reminder_bytes={}",
+                            self.context.session_id,
+                            memory_root.display(),
+                            memory_read_path.len()
+                        );
+                        additional_sections.push(memory_read_path);
+                    } else {
+                        info!(
+                            "Memory prompt injection skipped because no reminder was available: session_id={:?}, memory_root={}",
+                            self.context.session_id,
+                            memory_root.display()
+                        );
+                    }
                 }
             }
         } else {
@@ -474,6 +567,68 @@ impl PromptBuilder {
         }
 
         render_user_context_reminder(additional_sections)
+    }
+
+    /// Pushes the scoped memory section of a permitted read, or nothing.
+    ///
+    /// A read that returns no entries pushes no section: the diagnostics are logged
+    /// and the prompt stays without a memory block. This method never consults the
+    /// legacy memory root, so another workspace's content cannot appear here.
+    #[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+    async fn push_scoped_memory_section(
+        &self,
+        scoped: &ScopedMemoryReadContext,
+        additional_sections: &mut Vec<String>,
+    ) {
+        if !scoped.permits_scoped_read() {
+            debug!(
+                "Scoped memory read skipped: workspace_id={} reason=tier_off",
+                scoped.workspace_id
+            );
+            return;
+        }
+
+        // The context field is the workspace this prompt belongs to; the scoped
+        // decision carries the same id, so the field is authoritative and the
+        // decision is the fallback when a caller built the context without one.
+        let workspace_id = self
+            .context
+            .workspace_id
+            .as_deref()
+            .unwrap_or(scoped.workspace_id.as_str());
+
+        let Some(paths) = scoped_read_paths(&self.context) else {
+            debug!(
+                "Scoped memory read skipped: workspace_id={} reason=path_manager_unavailable",
+                workspace_id
+            );
+            return;
+        };
+
+        let (entries, diagnostics) = read_scoped_memory(&paths, workspace_id).await;
+        for diagnostic in &diagnostics {
+            debug!(
+                "Scoped memory read skipped: workspace_id={} reason={}",
+                workspace_id,
+                diagnostic.as_str()
+            );
+        }
+
+        let Some(entries) = entries else {
+            return;
+        };
+        let Some(reminder) = render_scoped_memory_reminder(&entries, workspace_id) else {
+            return;
+        };
+
+        info!(
+            "Scoped memory prompt injection added: session_id={:?}, workspace_id={}, entries={}, reminder_bytes={}",
+            self.context.session_id,
+            workspace_id,
+            entries.len(),
+            reminder.len()
+        );
+        additional_sections.push(reminder);
     }
 
     pub async fn build_prepended_reminders(
@@ -647,6 +802,26 @@ For instructions on locating and reading the transcripts, read: `{}`
         }
 
         Ok(result.trim().to_string())
+    }
+}
+
+/// Resolved paths the scoped read uses.
+///
+/// A test never reads the process-global path manager: it either injects fixture
+/// paths or the scoped read is skipped, so a test cannot touch the developer's real
+/// user data. Every other build uses the global path manager.
+#[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+fn scoped_read_paths(
+    context: &PromptBuilderContext,
+) -> Option<std::sync::Arc<crate::infrastructure::PathManager>> {
+    #[cfg(test)]
+    {
+        context.scoped_read_paths.clone()
+    }
+    #[cfg(not(test))]
+    {
+        let _ = context;
+        try_get_path_manager_arc().ok()
     }
 }
 
@@ -1168,5 +1343,153 @@ mod tests {
         assert!(workspace_context.contains("Worktree ID: wt-1"));
         assert!(workspace_context.contains("Worktree checkout: detached HEAD"));
         assert!(workspace_context.contains("Worktree base commit: 0123456789abcdef"));
+    }
+
+    /// Fixed summary body the memory fixture writes, so a pinned digest cannot drift
+    /// on content the test did not choose.
+    const MEMORY_FIXTURE_SUMMARY: &str =
+        "Fixture memory summary for the workspace intelligence scoped read tests.";
+
+    fn write_memory_fixture(memory_root: &std::path::Path) {
+        std::fs::create_dir_all(memory_root).expect("create the fixture memory root");
+        std::fs::write(
+            memory_root.join("memory_summary.md"),
+            MEMORY_FIXTURE_SUMMARY,
+        )
+        .expect("write the fixture memory summary");
+    }
+
+    /// With no scoped read context the reminder still takes the legacy path: it reads
+    /// the memory root and injects its summary, exactly as before this slice.
+    #[tokio::test]
+    async fn an_off_context_keeps_the_legacy_memory_section() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let memory_root = root.path().join("memories");
+        write_memory_fixture(&memory_root);
+
+        let context = PromptBuilderContext::new("/fixtures/wi-p1/workspace", None, None)
+            .with_memory_root_for_tests(memory_root.clone())
+            .with_memory_enabled_for_tests(true);
+        let reminder = PromptBuilder::new(context)
+            .build_user_context_reminder(&UserContextPolicy::empty().with_memory_summary())
+            .await
+            .expect("the legacy memory section must produce a reminder");
+
+        assert!(reminder.contains("## Memory"));
+        assert!(reminder.contains(MEMORY_FIXTURE_SUMMARY));
+        assert!(reminder.contains(&memory_root.display().to_string()));
+        assert!(!reminder.contains("Scoped workspace records"));
+    }
+
+    #[cfg(feature = "workspace-intelligence-host")]
+    async fn anchor_fixture_paths(
+        root: &std::path::Path,
+    ) -> std::sync::Arc<crate::infrastructure::PathManager> {
+        use openbitfun_services_core::workspace_intelligence_host_anchor::HostAnchorStore;
+
+        let paths = std::sync::Arc::new(
+            crate::infrastructure::PathManager::with_user_root_for_tests(root.join("user")),
+        );
+        let store = HostAnchorStore::new(
+            crate::service::workspace_intelligence::host::WorkspaceIntelligenceHost::anchor_root_for_tests(
+                &paths,
+            ),
+        );
+        store
+            .ensure()
+            .await
+            .expect("the fixture host anchor must mint");
+
+        paths
+    }
+
+    /// A permitted scoped read that finds nothing injects nothing: no section, and no
+    /// fallback to the legacy summary that is still present in the fixture root.
+    #[cfg(feature = "workspace-intelligence-host")]
+    #[tokio::test]
+    async fn a_permitted_scoped_read_never_falls_back_to_the_global_summary() {
+        use crate::service::workspace_intelligence::scoped_read::{
+            ScopedMemoryReadContext, ScopedReadDiagnostic,
+        };
+        use crate::service::workspace_intelligence::scoped_read_io::read_scoped_memory;
+        use crate::service::workspace_intelligence::mode::WorkspaceIntelligenceTier;
+
+        let root = tempfile::tempdir().expect("temporary root");
+        let memory_root = root.path().join("memories");
+        write_memory_fixture(&memory_root);
+        let paths = anchor_fixture_paths(root.path()).await;
+
+        let workspace_id = "workspace-fixture-scoped";
+        let (entries, diagnostics) = read_scoped_memory(&paths, workspace_id).await;
+        assert!(entries.is_none());
+        assert_eq!(diagnostics, vec![ScopedReadDiagnostic::PartitionAbsent]);
+
+        let mut context = PromptBuilderContext::new("/fixtures/wi-p1/workspace", None, None)
+            .with_memory_root_for_tests(memory_root.clone())
+            .with_memory_enabled_for_tests(true)
+            .with_scoped_read_paths_for_tests(paths);
+        context.workspace_id = Some(workspace_id.to_string());
+        context.scoped_memory = Some(ScopedMemoryReadContext {
+            workspace_id: workspace_id.to_string(),
+            tier: WorkspaceIntelligenceTier::Baseline,
+        });
+
+        let reminder = PromptBuilder::new(context)
+            .build_user_context_reminder(
+                &UserContextPolicy::empty()
+                    .with_workspace_context()
+                    .with_memory_summary(),
+            )
+            .await
+            .expect("the workspace context section still produces a reminder");
+
+        assert!(!reminder.contains("## Memory"));
+        assert!(!reminder.contains(MEMORY_FIXTURE_SUMMARY));
+        assert!(!reminder.contains("Scoped workspace records"));
+    }
+
+    /// A remote turn keeps the existing gate: the memory section is not eligible even
+    /// when a scoped read was resolved, so nothing scoped is injected.
+    #[cfg(feature = "workspace-intelligence-host")]
+    #[tokio::test]
+    async fn a_remote_turn_never_injects_the_scoped_memory_section() {
+        use crate::service::workspace_intelligence::scoped_read::ScopedMemoryReadContext;
+        use crate::service::workspace_intelligence::mode::WorkspaceIntelligenceTier;
+
+        let root = tempfile::tempdir().expect("temporary root");
+        let memory_root = root.path().join("memories");
+        write_memory_fixture(&memory_root);
+        let paths = anchor_fixture_paths(root.path()).await;
+
+        let mut context = PromptBuilderContext::new("/fixtures/wi-p1/workspace", None, None)
+            .with_memory_root_for_tests(memory_root)
+            .with_memory_enabled_for_tests(true)
+            .with_scoped_read_paths_for_tests(paths)
+            .with_remote_prompt_overlay(
+                RemoteExecutionHints {
+                    connection_display_name: "dev-server".to_string(),
+                    kernel_name: "Linux".to_string(),
+                    hostname: "devbox".to_string(),
+                },
+                None,
+            );
+        context.workspace_id = Some("workspace-fixture-remote".to_string());
+        context.scoped_memory = Some(ScopedMemoryReadContext {
+            workspace_id: "workspace-fixture-remote".to_string(),
+            tier: WorkspaceIntelligenceTier::Intelligent,
+        });
+
+        let reminder = PromptBuilder::new(context)
+            .build_user_context_reminder(
+                &UserContextPolicy::empty()
+                    .with_workspace_context()
+                    .with_memory_summary(),
+            )
+            .await
+            .expect("the workspace context section still produces a reminder");
+
+        assert!(!reminder.contains("## Memory"));
+        assert!(!reminder.contains(MEMORY_FIXTURE_SUMMARY));
+        assert!(!reminder.contains("Scoped workspace records"));
     }
 }

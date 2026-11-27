@@ -157,6 +157,15 @@ where
     }
 }
 
+/// True when a tier may read scoped workspace intelligence content.
+///
+/// `Off` owns no cognition partition, so it must never read one. `Baseline` and
+/// `Intelligent` both carry the switch and may look; whether a read then returns
+/// content is a separate fact about the partition, not about the tier.
+pub(crate) fn tier_permits_scoped_read(tier: WorkspaceIntelligenceTier) -> bool {
+    !matches!(tier, WorkspaceIntelligenceTier::Off)
+}
+
 /// True when the workspace is intelligent but every enhancement domain is off.
 ///
 /// The per-domain configuration schema belongs to a later phase; the count is
@@ -322,5 +331,31 @@ mod tests {
         );
         assert!(is_idle(derived.tier, 0));
         assert_eq!(derived.tier, WorkspaceIntelligenceTier::Intelligent);
+    }
+
+    #[test]
+    fn only_an_enabled_tier_permits_a_scoped_read() {
+        assert!(!tier_permits_scoped_read(WorkspaceIntelligenceTier::Off));
+        assert!(tier_permits_scoped_read(
+            WorkspaceIntelligenceTier::Baseline
+        ));
+        assert!(tier_permits_scoped_read(
+            WorkspaceIntelligenceTier::Intelligent
+        ));
+
+        // A missing switch field and an explicit off both derive `Off`, so both
+        // refuse the read.
+        for enabled in [None, Some(false)] {
+            let derived = derive_mode(
+                ModeFacts {
+                    enabled,
+                    model_ref: None,
+                    delivery: CapabilityDelivery::Delivered,
+                },
+                panic_resolver,
+            );
+            assert_eq!(derived.tier, WorkspaceIntelligenceTier::Off);
+            assert!(!tier_permits_scoped_read(derived.tier));
+        }
     }
 }

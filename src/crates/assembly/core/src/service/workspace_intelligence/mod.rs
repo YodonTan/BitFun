@@ -94,6 +94,14 @@
 //! are gated on `workspace-intelligence-host` together with the rest of the host
 //! feature.
 //!
+//! The `scoped_read` module is the WP2.1 read decision: which tier may read a
+//! workspace's own cognition content, what one entry looks like, and which typed
+//! diagnostic explains an empty read. It performs no IO and adds no fallback, so an
+//! empty scoped read injects nothing rather than another workspace's content. Its IO
+//! half is `scoped_read_io`, gated on the host feature because it reads the persisted
+//! anchor and this host's control record: in this slice the v1 partition holds the
+//! partition state only, so a permitted read still returns no entries.
+//!
 //! The gated `legacy_preview` module is the read-only WP2.3 preview of the legacy
 //! Memory rows and files. It attributes a row only through the row's own
 //! `workspace_path`, never derives a scope from a path, never creates, repairs or
@@ -179,6 +187,17 @@ pub(crate) mod commit;
 #[allow(dead_code)]
 #[cfg(feature = "workspace-intelligence-claim")]
 pub(crate) mod claim;
+// WP2.1 scoped read contract: the pure decision of whether a workspace may read its
+// own cognition content, the narrow entry shape and the typed diagnostics. No IO, no
+// storage and no clock, so it stays feature-free like `cognition` and `cursor`.
+#[allow(dead_code)]
+pub(crate) mod scoped_read;
+// WP2.1 scoped read IO: it resolves the persisted host anchor and reads this host's
+// cognition partition. It needs the host slice for the anchor and the control owner,
+// so it is gated on `workspace-intelligence-host`, which already implies the
+// cognition feature the partition handle needs.
+#[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+pub(crate) mod scoped_read_io;
 // WP2.3 legacy read-only preview: it reads one Memory database and one Memory root
 // without creating, repairing or dropping anything, and it decides no migration.
 // Gated on the WP1.6 cognition feature family, and on `agent-runtime` for the memory
