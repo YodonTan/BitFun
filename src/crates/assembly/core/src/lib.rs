@@ -73,6 +73,8 @@ pub mod util; // General types, errors, helper functions
 mod workspace_intelligence_off_baseline_tests;
 #[cfg(all(test, feature = "workspace-intelligence-cognition", feature = "agent-runtime"))]
 mod workspace_intelligence_cognition_tests;
+#[cfg(all(test, feature = "workspace-intelligence-cognition", feature = "agent-runtime"))]
+mod workspace_intelligence_legacy_preview_tests;
 
 #[cfg(feature = "remote-connect")]
 pub use openbitfun_services_integrations::remote_connect::{

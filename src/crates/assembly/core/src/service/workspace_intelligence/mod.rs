@@ -94,6 +94,15 @@
 //! are gated on `workspace-intelligence-host` together with the rest of the host
 //! feature.
 //!
+//! The gated `legacy_preview` module is the read-only WP2.3 preview of the legacy
+//! Memory rows and files. It attributes a row only through the row's own
+//! `workspace_path`, never derives a scope from a path, never creates, repairs or
+//! drops anything, and takes no migration decision: the keep/skip/defer choice
+//! belongs to the confirmation slice that consumes it. It is compiled only when the
+//! cognition partition owner and the memory store owner are both selected, so a
+//! build without either answers nothing here rather than reading a shape it cannot
+//! validate.
+//!
 //! This tree still adds no first enable, no `allow_off`, no pending cursor, no
 //! content mutation, no model run, no Tauri command, no Product Operation
 //! Registry row and no UI, so a real first enable still has to pass the enable
@@ -170,6 +179,15 @@ pub(crate) mod commit;
 #[allow(dead_code)]
 #[cfg(feature = "workspace-intelligence-claim")]
 pub(crate) mod claim;
+// WP2.3 legacy read-only preview: it reads one Memory database and one Memory root
+// without creating, repairing or dropping anything, and it decides no migration.
+// Gated on the WP1.6 cognition feature family, and on `agent-runtime` for the memory
+// workspace layout helpers and the validated store shape. Its only consumer in this
+// tree is its own integration test, so the non-test build allows the items it does
+// not reach yet.
+#[allow(dead_code)] // Internal to the WP2.3 preview; consumed only by its integration test.
+#[cfg(all(feature = "workspace-intelligence-cognition", feature = "agent-runtime"))]
+pub(crate) mod legacy_preview;
 // Test-only, and behind both features: it publishes an enabled scope for a test
 // that must have one, while the production enable gate stays outside this tree.
 // Nothing a `test-support` build produces is part of a product assembly.
