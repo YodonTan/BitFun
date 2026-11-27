@@ -99,8 +99,16 @@
 //! diagnostic explains an empty read. It performs no IO and adds no fallback, so an
 //! empty scoped read injects nothing rather than another workspace's content. Its IO
 //! half is `scoped_read_io`, gated on the host feature because it reads the persisted
-//! anchor and this host's control record: in this slice the v1 partition holds the
-//! partition state only, so a permitted read still returns no entries.
+//! anchor and this host's control record: it reads the workspace's own v2 partition
+//! and injects the rows the pure filter calls eligible.
+//!
+//! The feature-free `entries_contract` module is the WP2.4 human entry contract: it
+//! accepts or refuses one statement, owns the stable kind/state code table and decides
+//! which stored rows may be injected. The gated `entries` module is its IO half and the
+//! only content writer here: it writes one human entry through the services merged
+//! entries-plus-cursor transaction and withdraws one entry under an exact revision
+//! expectation. Neither module creates a partition, upgrades a v1 record, derives a
+//! scope from a path, shares a record across workspaces or reaches a model.
 //!
 //! The gated `legacy_preview` module is the read-only WP2.3 preview of the legacy
 //! Memory rows and files. It attributes a row only through the row's own
@@ -192,6 +200,19 @@ pub(crate) mod claim;
 // storage and no clock, so it stays feature-free like `cognition` and `cursor`.
 #[allow(dead_code)]
 pub(crate) mod scoped_read;
+// WP2.4 human entry contract: statement validation, the stable kind/state code table
+// and the injection projection. Pure and feature-free like `cognition`; the code table
+// is shared with `scoped_read` so the written and the parsed codes cannot drift.
+#[allow(dead_code)]
+pub(crate) mod entries_contract;
+// WP2.4 human entry IO: the only content writer in the tree. Gated on the commit
+// primitive that owns the merged entries-plus-cursor transaction, and on
+// `agent-runtime` for the Tokio runtime primitives (`tokio::task::spawn_blocking`
+// needs `tokio/rt`) the blocking hand-off uses. It creates no partition, upgrades
+// nothing and derives no scope from a path.
+#[allow(dead_code)] // Consumed by its own tests and the scoped read end-to-end tests.
+#[cfg(all(feature = "workspace-intelligence-commit", feature = "agent-runtime"))]
+pub(crate) mod entries;
 // WP2.1 scoped read IO: it resolves the persisted host anchor and reads this host's
 // cognition partition. It needs the host slice for the anchor and the control owner,
 // so it is gated on `workspace-intelligence-host`, which already implies the

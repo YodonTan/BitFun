@@ -37,8 +37,8 @@
 use std::path::PathBuf;
 
 use openbitfun_services_core::workspace_intelligence_cognition::{
-    CognitionInitialization, CognitionPartitionState, WorkspaceIntelligenceCognitionError,
-    WorkspaceIntelligenceCognitionStore,
+    CognitionInitialization, CognitionPartitionState, StoredCognitionEntry,
+    WorkspaceIntelligenceCognitionError, WorkspaceIntelligenceCognitionStore,
 };
 
 use crate::infrastructure::PathManager;
@@ -129,6 +129,30 @@ impl WorkspaceIntelligenceCognition {
             return Err(CognitionError::HostScopeMismatch);
         }
         self.store.read(&scope.as_str()).map_err(CognitionError::Store)
+    }
+
+    /// Observes the stored content entries of `scope`.
+    ///
+    /// This is a forward of the store's own read-only content read, so the same
+    /// guarantees hold: it never creates the root, the record or a schema, it never
+    /// upgrades a v1 record, and it never resets or deletes anything.
+    ///
+    /// - a scope owned by another host is rejected with
+    ///   [`CognitionError::HostScopeMismatch`] before any store call;
+    /// - `Ok(None)` is an observation that this call did not see a record;
+    /// - a v1 record answers [`WorkspaceIntelligenceCognitionError::ContentTableAbsent`]
+    ///   through [`CognitionError::Store`], because a v1 record holds no content;
+    /// - rows come back in the store's own order, for this partition only.
+    pub(crate) fn read_entries(
+        &self,
+        scope: &WorkspaceControlScope,
+    ) -> Result<Option<Vec<StoredCognitionEntry>>, CognitionError> {
+        if !scope.host_matches(&self.host) {
+            return Err(CognitionError::HostScopeMismatch);
+        }
+        self.store
+            .read_entries(&scope.as_str())
+            .map_err(CognitionError::Store)
     }
 }
 

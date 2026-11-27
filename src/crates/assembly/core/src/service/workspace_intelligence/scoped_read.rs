@@ -37,6 +37,7 @@
 //! not by this module.
 
 use super::cognition::{CognitionKind, CognitionRevision};
+use super::entries_contract::kind_code;
 use super::mode::{tier_permits_scoped_read, WorkspaceIntelligenceTier};
 
 /// The scoped read decision of one workspace.
@@ -88,6 +89,9 @@ pub(crate) enum ScopedReadDiagnostic {
     PartitionAbsent,
     /// The partition exists but is at the v1 shape, which holds no content.
     PartitionV1NoContent,
+    /// The partition exists and holds content, but no entry of it may be injected
+    /// right now.
+    NoEligibleEntries,
     /// This host could not turn the workspace id into a scope: no persisted
     /// anchor, an unusable host key, or a blank workspace id.
     ScopeUnavailable,
@@ -101,6 +105,7 @@ impl ScopedReadDiagnostic {
         match self {
             Self::PartitionAbsent => "partition_absent",
             Self::PartitionV1NoContent => "partition_v1_no_content",
+            Self::NoEligibleEntries => "no_eligible_entries",
             Self::ScopeUnavailable => "scope_unavailable",
             Self::PartitionUnavailable => "partition_unavailable",
         }
@@ -139,21 +144,6 @@ pub(crate) fn render_scoped_memory_reminder(
     }
 
     Some(rendered.trim_end().to_string())
-}
-
-/// Stable lowercase code of one cognition kind.
-///
-/// The rendering uses these codes rather than the derived `Debug` form, so a
-/// future derive change cannot silently rewrite prompt text.
-fn kind_code(kind: CognitionKind) -> &'static str {
-    match kind {
-        CognitionKind::Goal => "goal",
-        CognitionKind::Knowledge => "knowledge",
-        CognitionKind::Relation => "relation",
-        CognitionKind::Commitment => "commitment",
-        CognitionKind::Action => "action",
-        CognitionKind::Gap => "gap",
-    }
 }
 
 #[cfg(test)]
@@ -234,6 +224,10 @@ mod tests {
         assert_eq!(
             ScopedReadDiagnostic::PartitionV1NoContent.as_str(),
             "partition_v1_no_content"
+        );
+        assert_eq!(
+            ScopedReadDiagnostic::NoEligibleEntries.as_str(),
+            "no_eligible_entries"
         );
         assert_eq!(
             ScopedReadDiagnostic::ScopeUnavailable.as_str(),

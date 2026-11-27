@@ -30,11 +30,23 @@
 //! prompt side: a permitted tier is necessary but not sufficient, so an enabled tier
 //! never overrides the user's global switch.
 //!
-//! # What a read returns in this slice
+//! # Blocking boundary
 //!
-//! No entries. The v1 cognition partition holds the partition state only, so an
-//! existing partition is reported as [`ScopedReadDiagnostic::PartitionV1NoContent`]
-//! until the slice that writes content tables lands.
+//! The content read is a blocking SQLite read, so it runs on Tokio's blocking pool
+//! and never on a runtime worker. `resolve_scoped_memory_context` still performs its
+//! single-row partition observation inside the async context; that is unchanged here
+//! and the slice that converges the scoped read (WP2.4) owns moving it onto the same
+//! boundary.
+//!
+//! # What a read returns
+//!
+//! The content of this workspace's own v2 partition, filtered to what may be
+//! injected right now. A v1 partition holds no content table and reports
+//! [`ScopedReadDiagnostic::PartitionV1NoContent`]; a v2 partition whose rows are all
+//! inactive, expired, shared, self-contradicting or a commitment without a validity
+//! bound reports [`ScopedReadDiagnostic::NoEligibleEntries`] and injects nothing.
+//! The filter itself is the pure decision of `entries_contract`; this module only
+//! projects the stored rows into it and forwards the clock.
 //!
 //! # Delivery profile
 //!
@@ -45,15 +57,23 @@
 //! keeps a prompt build from reaching a model provider.
 
 use log::debug;
+use openbitfun_services_core::workspace_intelligence_cognition::{
+    StoredCognitionEntry, WorkspaceIntelligenceCognitionError,
+};
 
 use crate::infrastructure::PathManager;
 use crate::service::workspace_intelligence::control::WorkspaceIntelligenceControl;
+use crate::service::workspace_intelligence::entries_contract::{
+    project_for_injection, StoredEntryProjection,
+};
 use crate::service::workspace_intelligence::host::read_persisted_host_id;
 use crate::service::workspace_intelligence::host_binding::LOCAL_EXECUTION_DOMAIN;
 use crate::service::workspace_intelligence::mode::{
     tier_permits_scoped_read, CapabilityDelivery, WorkspaceModelResolution,
 };
-use crate::service::workspace_intelligence::partition::WorkspaceIntelligenceCognition;
+use crate::service::workspace_intelligence::partition::{
+    CognitionError, WorkspaceIntelligenceCognition,
+};
 use crate::service::workspace_intelligence::scope::{
     HostExecutionDomainKey, WorkspaceControlScope,
 };
@@ -109,14 +129,27 @@ pub(crate) async fn resolve_scoped_memory_context(
     })
 }
 
-/// Reads the scoped cognition content of one workspace.
+/// Reads the scoped cognition content of one workspace against the current clock.
 ///
-/// The first value is `Some(entries)` only when the partition actually carried
-/// content; this slice never does. The diagnostics say which fact was missing, and
-/// an empty read is never replaced by the legacy global memory files.
+/// The first value is `Some(entries)` only when the partition carried content that
+/// may be injected right now. The diagnostics say which fact was missing, and an
+/// empty read is never replaced by the legacy global memory files.
 pub(crate) async fn read_scoped_memory(
     paths: &PathManager,
     workspace_id: &str,
+) -> (Option<Vec<ScopedMemoryEntry>>, Vec<ScopedReadDiagnostic>) {
+    read_scoped_memory_at(paths, workspace_id, now_unix_ms()).await
+}
+
+/// Reads the scoped cognition content of one workspace at a caller-supplied instant.
+///
+/// A validity bound is compared against `now_unix_ms`, so a test decides expiry
+/// instead of the wall clock. Everything else is identical to
+/// [`read_scoped_memory`].
+pub(crate) async fn read_scoped_memory_at(
+    paths: &PathManager,
+    workspace_id: &str,
+    now_unix_ms: i64,
 ) -> (Option<Vec<ScopedMemoryEntry>>, Vec<ScopedReadDiagnostic>) {
     let Some(host) = scoped_read_host(paths, workspace_id).await else {
         return (None, vec![ScopedReadDiagnostic::ScopeUnavailable]);
@@ -126,13 +159,87 @@ pub(crate) async fn read_scoped_memory(
     };
 
     let cognition = WorkspaceIntelligenceCognition::for_host(paths, host);
-    match cognition.observe(&scope) {
+    let read = match tokio::task::spawn_blocking(move || cognition.read_entries(&scope)).await {
+        Ok(read) => read,
+        // A cancelled or panicked blocking task is a read that did not happen: the
+        // caller injects nothing rather than treating it as empty content.
+        Err(_) => return (None, vec![ScopedReadDiagnostic::PartitionUnavailable]),
+    };
+    match read {
         // No record yet: nothing to read, and nothing was created by this call.
         Ok(None) => (None, vec![ScopedReadDiagnostic::PartitionAbsent]),
-        // The v1 partition state is readable, but v1 stores no content rows.
-        Ok(Some(_state)) => (None, vec![ScopedReadDiagnostic::PartitionV1NoContent]),
+        Ok(Some(stored)) => {
+            let projected = stored
+                .iter()
+                .map(project_stored_entry)
+                .collect::<Vec<_>>();
+            let (entries, skipped) = project_for_injection(&projected, now_unix_ms);
+            log_skipped_entries(workspace_id, skipped.as_slice());
+            if entries.is_empty() {
+                (None, vec![ScopedReadDiagnostic::NoEligibleEntries])
+            } else {
+                (Some(entries), Vec::new())
+            }
+        }
+        // Defensive: the v2 branch above is the only way a content read succeeds, and
+        // 39a guarantees a v2 record always carries both content tables. A record that
+        // reports "no content table" therefore reports the v1 shape it was read as.
+        Err(CognitionError::Store(
+            WorkspaceIntelligenceCognitionError::ContentTableAbsent { .. },
+        )) => (None, vec![ScopedReadDiagnostic::PartitionV1NoContent]),
         Err(_) => (None, vec![ScopedReadDiagnostic::PartitionUnavailable]),
     }
+}
+
+/// Projects one stored row onto the fields the injection decision reads.
+///
+/// The projection never carries a record id, a partition key or an epoch: the
+/// injection decision and the prompt text have no use for a storage identity.
+fn project_stored_entry(entry: &StoredCognitionEntry) -> StoredEntryProjection {
+    StoredEntryProjection {
+        kind: entry.kind.clone(),
+        state: entry.state.clone(),
+        visibility: entry.visibility.clone(),
+        authority: entry.authority.clone(),
+        statement: entry.statement.clone(),
+        revision: entry.revision,
+        valid_until_unix_ms: entry.valid_until_unix_ms,
+    }
+}
+
+/// Logs one debug line per skip reason, with the number of rows it removed.
+///
+/// A skipped row is an outcome, not an error: an empty section stays empty and the
+/// reason is only visible to an operator.
+fn log_skipped_entries(
+    workspace_id: &str,
+    skipped: &[crate::service::workspace_intelligence::entries_contract::InjectionSkip],
+) {
+    if skipped.is_empty() {
+        return;
+    }
+    let mut counts: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    for skip in skipped {
+        *counts.entry(skip.as_str()).or_default() += 1;
+    }
+    for (reason, count) in counts {
+        debug!(
+            "Scoped memory entries skipped: workspace_id={} reason={} count={}",
+            workspace_id, reason, count
+        );
+    }
+}
+
+/// The current wall clock in Unix milliseconds.
+///
+/// A clock before the Unix epoch or a duration that does not fit in `i64` falls
+/// back to the nearest representable instant instead of failing a read.
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 /// Builds this host's key for a workspace, or reports why it cannot.
@@ -167,10 +274,18 @@ async fn scoped_read_host(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openbitfun_services_core::workspace_intelligence_cognition::{
+        NewCognitionEntry, WorkspaceIntelligenceCognitionStore,
+    };
     use openbitfun_services_core::workspace_intelligence_host_anchor::{
         HostAnchorEnsure, HostAnchorStore,
     };
 
+    use crate::service::workspace_intelligence::cognition::CognitionKind;
+    use crate::service::workspace_intelligence::entries::{
+        create_human_entry, partition_key_for_scope, retire_human_entry,
+    };
+    use crate::service::workspace_intelligence::entries_contract::NewHumanEntry;
     use crate::service::workspace_intelligence::host::WorkspaceIntelligenceHost;
     use crate::service::workspace_intelligence::mode::WorkspaceIntelligenceTier;
 
@@ -227,15 +342,26 @@ mod tests {
     async fn a_v1_partition_reports_that_it_holds_no_content() {
         let root = tempfile::tempdir().expect("temporary root");
         let paths = fixture_paths(root.path());
-        let host_id = mint_anchor(&paths).await;
-        let host = host_key(&host_id);
-        let scope = WorkspaceControlScope::new(&host, FIXTURE_WORKSPACE_ID)
-            .expect("the fixture scope is valid");
+        owned_scope(&paths).await;
 
-        WorkspaceIntelligenceCognition::for_host(&paths, host)
-            .initialize(&scope)
-            .expect("the fixture partition must initialize");
-        assert!(paths.workspace_intelligence_cognition_dir().exists());
+        // Reproduce a record an older build left behind: `partition_state` only, at
+        // `user_version = 1`. No writer in this tree produces that shape any more,
+        // so the fixture is built at the file-format level.
+        let record = std::fs::read_dir(paths.workspace_intelligence_cognition_dir())
+            .expect("the cognition root is readable")
+            .map(|entry| entry.expect("readable directory entry").path())
+            .find(|path| {
+                path.extension().and_then(|extension| extension.to_str()) == Some("sqlite")
+            })
+            .expect("the fixture record exists");
+        rusqlite::Connection::open(&record)
+            .expect("the fixture record opens")
+            .execute_batch(
+                "DROP TABLE cognition_entries;
+                 DROP TABLE cognition_dependencies;
+                 PRAGMA user_version = 1;",
+            )
+            .expect("the v1 fixture is created");
 
         let (entries, diagnostics) = read_scoped_memory(&paths, FIXTURE_WORKSPACE_ID).await;
 
@@ -283,5 +409,179 @@ mod tests {
 
         assert!(context.permits_scoped_read());
         assert_eq!(context.workspace_id, FIXTURE_WORKSPACE_ID);
+    }
+
+    /// A fixture host whose control record is irrelevant here: these tests read the
+    /// partition content only.
+    const NOW: i64 = 1_700_000_000_000;
+
+    async fn owned_scope(
+        paths: &PathManager,
+    ) -> (HostExecutionDomainKey, WorkspaceControlScope) {
+        let host_id = mint_anchor(paths).await;
+        let host = host_key(&host_id);
+        let scope = WorkspaceControlScope::new(&host, FIXTURE_WORKSPACE_ID)
+            .expect("the fixture scope is valid");
+        WorkspaceIntelligenceCognition::for_host(paths, host.clone())
+            .initialize(&scope)
+            .expect("the fixture v2 partition must initialize");
+        (host, scope)
+    }
+
+    fn human_entry(kind: CognitionKind, statement: &str) -> NewHumanEntry {
+        NewHumanEntry {
+            kind,
+            statement: statement.to_string(),
+            source_resource: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_created_human_entry_is_injected() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let paths = fixture_paths(root.path());
+        let (host, _scope) = owned_scope(&paths).await;
+        create_human_entry(
+            &paths,
+            &host,
+            FIXTURE_WORKSPACE_ID,
+            human_entry(CognitionKind::Goal, "ship the scoped read"),
+            None,
+            NOW,
+        )
+        .await
+        .expect("the entry is created");
+
+        let (entries, diagnostics) =
+            read_scoped_memory_at(&paths, FIXTURE_WORKSPACE_ID, NOW).await;
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let entries = entries.expect("a created entry must be injected");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, CognitionKind::Goal);
+        assert_eq!(entries[0].text, "ship the scoped read");
+    }
+
+    #[tokio::test]
+    async fn an_empty_v2_partition_reports_no_eligible_entries() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let paths = fixture_paths(root.path());
+        owned_scope(&paths).await;
+
+        let (entries, diagnostics) =
+            read_scoped_memory_at(&paths, FIXTURE_WORKSPACE_ID, NOW).await;
+
+        assert!(entries.is_none());
+        assert_eq!(diagnostics, vec![ScopedReadDiagnostic::NoEligibleEntries]);
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_entry_is_no_longer_injected() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let paths = fixture_paths(root.path());
+        let (host, _scope) = owned_scope(&paths).await;
+        let receipt = create_human_entry(
+            &paths,
+            &host,
+            FIXTURE_WORKSPACE_ID,
+            human_entry(CognitionKind::Knowledge, "the partition is v2"),
+            None,
+            NOW,
+        )
+        .await
+        .expect("the entry is created");
+
+        retire_human_entry(
+            &paths,
+            &host,
+            FIXTURE_WORKSPACE_ID,
+            &receipt.entry_id,
+            receipt.revision,
+            "superseded by a newer decision",
+            None,
+        )
+        .await
+        .expect("the entry is withdrawn");
+
+        let (entries, diagnostics) =
+            read_scoped_memory_at(&paths, FIXTURE_WORKSPACE_ID, NOW).await;
+
+        assert!(entries.is_none());
+        assert_eq!(diagnostics, vec![ScopedReadDiagnostic::NoEligibleEntries]);
+    }
+
+    #[tokio::test]
+    async fn a_commitment_without_a_validity_bound_is_not_injected() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let paths = fixture_paths(root.path());
+        let (host, _scope) = owned_scope(&paths).await;
+        create_human_entry(
+            &paths,
+            &host,
+            FIXTURE_WORKSPACE_ID,
+            human_entry(CognitionKind::Commitment, "promised without a date"),
+            None,
+            NOW,
+        )
+        .await
+        .expect("the entry is created");
+
+        let (entries, diagnostics) =
+            read_scoped_memory_at(&paths, FIXTURE_WORKSPACE_ID, NOW).await;
+
+        assert!(entries.is_none());
+        assert_eq!(diagnostics, vec![ScopedReadDiagnostic::NoEligibleEntries]);
+    }
+
+    #[tokio::test]
+    async fn only_an_unexpired_validity_bound_is_injected() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let paths = fixture_paths(root.path());
+        let (_host, scope) = owned_scope(&paths).await;
+        let store = WorkspaceIntelligenceCognitionStore::new(
+            paths.workspace_intelligence_cognition_dir(),
+        );
+        let store_scope = scope.as_str();
+        let mut entry = NewCognitionEntry {
+            entry_id: "bounded-1".to_string(),
+            kind: "goal".to_string(),
+            category: "fact".to_string(),
+            authority: "human".to_string(),
+            state: "active".to_string(),
+            statement: "bounded goal".to_string(),
+            workspace_partition: partition_key_for_scope(&store_scope),
+            visibility: "partition".to_string(),
+            shared_scope: None,
+            shared_authorization: None,
+            source_owner: "human".to_string(),
+            source_resource: None,
+            source_revision: None,
+            observed_at_unix_ms: NOW,
+            valid_until_unix_ms: Some(NOW - 1),
+            confidence: None,
+            revision: 1,
+            epoch: 1,
+            supersedes: None,
+            invalidated_reason: None,
+        };
+        store
+            .commit_entries_with_cursor(&store_scope, None, None, &[entry.clone()], &[])
+            .expect("the expired fixture is stored");
+
+        let (entries, diagnostics) =
+            read_scoped_memory_at(&paths, FIXTURE_WORKSPACE_ID, NOW).await;
+        assert!(entries.is_none(), "an elapsed bound is not injected");
+        assert_eq!(diagnostics, vec![ScopedReadDiagnostic::NoEligibleEntries]);
+
+        entry.entry_id = "bounded-2".to_string();
+        entry.valid_until_unix_ms = Some(NOW + 1);
+        store
+            .commit_entries_with_cursor(&store_scope, None, None, &[entry], &[])
+            .expect("the live fixture is stored");
+
+        let (entries, diagnostics) =
+            read_scoped_memory_at(&paths, FIXTURE_WORKSPACE_ID, NOW).await;
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(entries.expect("the live bound is injected").len(), 1);
     }
 }
