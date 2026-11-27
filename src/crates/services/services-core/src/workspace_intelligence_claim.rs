@@ -1287,7 +1287,7 @@ mod tests {
     async fn claim_over_an_unrecognized_cognition_schema_preserves_bytes_and_releases_the_lease() {
         let tmp = tempfile::tempdir().unwrap(); seed(tmp.path(), SCOPE, true).await;
         std::fs::create_dir_all(tmp.path().join("cognition")).unwrap();
-        rusqlite::Connection::open(db(tmp.path(), SCOPE)).unwrap().execute_batch("PRAGMA user_version=2").unwrap();
+        rusqlite::Connection::open(db(tmp.path(), SCOPE)).unwrap().execute_batch("PRAGMA user_version=3").unwrap();
         let before_control = control_bytes(tmp.path());
         let before_database = cognition_bytes(tmp.path());
         let error = GovernedClaim::claim(control(tmp.path()), tmp.path().join("cognition"), tmp.path().join("leases"), SCOPE).await.unwrap_err();
@@ -1331,7 +1331,7 @@ mod tests {
         let outcome = GovernedClaim::claim(control(tmp.path()), tmp.path().join("cognition"), tmp.path().join("leases"), SCOPE).await.unwrap();
         let ClaimAttempt::Claimed(claim) = outcome else { panic!("empty v0 must be claimed, got {outcome:?}") };
         let connection = rusqlite::Connection::open(&path).unwrap();
-        assert_eq!(connection.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(connection.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
         assert_eq!(connection.query_row("SELECT count(*) FROM partition_state", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         let (token, cursor) = connection.query_row(
             "SELECT incarnation_token, cursor FROM partition_state WHERE state_id=1", [],

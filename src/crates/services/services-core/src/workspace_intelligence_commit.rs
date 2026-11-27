@@ -373,7 +373,7 @@ mod tests {
         assert_eq!(state.cursor, None);
         assert_eq!(state.incarnation_token, None);
         let db = rusqlite::Connection::open(path(gate.cognition_root(), scope, "sqlite")).unwrap();
-        assert_eq!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
         assert_eq!(db.query_row("SELECT COUNT(*) FROM partition_state", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         let columns: Vec<String> = db.prepare("PRAGMA table_info(partition_state)").unwrap()
             .query_map([], |r| r.get(1)).unwrap().map(Result::unwrap).collect();
@@ -847,7 +847,7 @@ mod tests {
             std::fs::create_dir_all(gate.cognition_root()).unwrap();
             let dbpath = path(gate.cognition_root(), SCOPE, "sqlite");
             match case {
-                "unsupported_schema_version" => { rusqlite::Connection::open(&dbpath).unwrap().execute_batch("PRAGMA user_version = 2;").unwrap(); }
+                "unsupported_schema_version" => { rusqlite::Connection::open(&dbpath).unwrap().execute_batch("PRAGMA user_version = 3;").unwrap(); }
                 "corrupt_database" => std::fs::write(&dbpath, b"this is not SQLite").unwrap(),
                 _ => {
                     WorkspaceIntelligenceCognitionStore::new(gate.cognition_root.clone()).initialize("foreign").unwrap();
@@ -1049,7 +1049,7 @@ mod tests {
         assert_eq!(after.cursor.as_deref(), Some("m-1"));
         assert_eq!(after.incarnation_token, before.incarnation_token, "the tenure marker is untouched");
         let db = rusqlite::Connection::open(path(gate.cognition_root(), SCOPE, "sqlite")).unwrap();
-        assert_eq!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
         assert_eq!(db.query_row("SELECT COUNT(*) FROM partition_state", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     }
 
