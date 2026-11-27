@@ -6,6 +6,7 @@ use crate::agentic::round_preempt::DialogRoundInjectionInterrupt;
 use crate::agentic::tools::ToolRuntimeRestrictions;
 use crate::agentic::workspace::WorkspaceServices;
 use crate::agentic::WorkspaceBinding;
+use crate::infrastructure::PathManager;
 use openbitfun_agent_tools::{ResolvedToolInvocation, ValidationResult};
 use openbitfun_runtime_ports::{
     DelegationPolicy, PermissionApprovalOnAsk, PermissionApprovalOnError,
@@ -48,6 +49,54 @@ pub struct ToolExecutionOptions {
     /// Optional owner-provided token that latches cancellation before tool
     /// validation and permission preflight have registered pipeline state.
     pub parent_cancellation_token: Option<CancellationToken>,
+    /// When `Some`, the permission commit point re-reads the approval strategy
+    /// and provider for this workspace instead of trusting the round-start
+    /// snapshot. `None` (the default) keeps the snapshot, which is the OFF path.
+    pub workspace_intelligence: Option<WorkspaceIntelligenceCommitContext>,
+    /// The execution context variables the commit point needs to re-run the
+    /// layered approval-strategy resolution. Empty when the caller has none.
+    pub approval_context_vars: HashMap<String, String>,
+    /// Set when a non-invocation source (a hook's explicit ask) has already
+    /// forced `Interactive` for this batch; the commit point must then keep the
+    /// round-start snapshot.
+    pub approval_strategy_pinned: bool,
+    /// Test-only: the fresh approval facts the commit point would otherwise read
+    /// from the host. `Some` bypasses the control record and configuration reads
+    /// so a test can prove which strategy and provider the commit point uses.
+    #[cfg(test)]
+    pub fresh_approval_facts: Option<FreshApprovalFacts>,
+}
+
+/// Test-only carrier for the facts a permission commit point reads from the host.
+#[cfg(test)]
+#[derive(Clone)]
+pub struct FreshApprovalFacts {
+    pub strategy: PermissionApprovalStrategy,
+    pub provider: Option<Arc<dyn openbitfun_runtime_ports::PermissionDecisionPort>>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for FreshApprovalFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FreshApprovalFacts")
+            .field("strategy", &self.strategy)
+            .field("has_provider", &self.provider.is_some())
+            .finish()
+    }
+}
+
+/// The host facts a permission commit point needs to decide whether workspace
+/// intelligence is on for one workspace.
+///
+/// The decision itself stays with the workspace-intelligence owner; this struct
+/// only carries the stable workspace id and the executing host's paths so the
+/// commit point can ask that owner. It never carries a path-derived identity.
+#[derive(Debug, Clone)]
+pub struct WorkspaceIntelligenceCommitContext {
+    /// Stable workspace id, never a filesystem path.
+    pub workspace_id: String,
+    /// The executing host's path manager.
+    pub paths: Arc<PathManager>,
 }
 
 impl Default for ToolExecutionOptions {
@@ -66,6 +115,11 @@ impl Default for ToolExecutionOptions {
             current_user_message: None,
             permission_user_input_available: true,
             parent_cancellation_token: None,
+            workspace_intelligence: None,
+            approval_context_vars: HashMap::new(),
+            approval_strategy_pinned: false,
+            #[cfg(test)]
+            fresh_approval_facts: None,
         }
     }
 }

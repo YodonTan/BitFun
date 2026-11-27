@@ -795,6 +795,247 @@ fn native_hook_session_facts<'a>(
     }
 }
 
+/// Resolves the approval strategy the permission commit point must use.
+///
+/// Resolves the approval strategy the permission commit point must use.
+///
+/// The round-start snapshot stays authoritative unless workspace intelligence is
+/// on for this workspace, the fresh configuration is readable, and nothing
+/// pinned the strategy already. A failure at any layer keeps the snapshot: it
+/// never rejects the request and never falls back to another workspace's
+/// decision. A freshly bound model provider replaces `provider` in place; a
+/// failed binding leaves the round-start provider untouched.
+///
+/// Two sources pin the strategy and neither may be overridden by a later
+/// configuration read: an invocation that ran `--auto`, and a hook that
+/// explicitly asked for user confirmation. Both decided what this batch must do,
+/// so re-reading would silently loosen (or tighten) that decision.
+///
+/// Each registered group is its own approval batch and therefore re-reads. A
+/// configuration change between groups is then visible as a strategy difference
+/// between groups, instead of changing a group that is already waiting.
+///
+/// Only the decision is re-read. `timeout_ms`, `on_ask` and `on_error` stay the
+/// round-start values: they bound approvals this round is already waiting for, so
+/// changing them mid-round would change how long a pending request waits.
+async fn reread_commit_point_strategy(
+    options: &ToolExecutionOptions,
+    dialog_turn_id: &str,
+    round_start_strategy: PermissionApprovalStrategy,
+    provider: &mut Option<Arc<dyn PermissionDecisionPort>>,
+) -> PermissionApprovalStrategy {
+    let Some(commit) = options.workspace_intelligence.as_ref() else {
+        return round_start_strategy;
+    };
+    let pinned = options.auto_approve_ask || options.approval_strategy_pinned;
+    #[cfg(test)]
+    {
+        // Injected facts skip the host reads; a pinned batch still wins.
+        if let Some(fresh) = options.fresh_approval_facts.as_ref().filter(|_| !pinned) {
+            if matches!(fresh.strategy, PermissionApprovalStrategy::Model) {
+                if let Some(fresh_provider) = fresh.provider.clone() {
+                    *provider = Some(fresh_provider);
+                }
+            }
+            return fresh.strategy;
+        }
+    }
+    #[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+    {
+        // A pinned batch never reads the host: its decision is already final.
+        let scoped_permits = if pinned {
+            false
+        } else {
+            let scoped =
+                crate::service::workspace_intelligence::scoped_read_io::resolve_scoped_memory_context(
+                    &commit.paths,
+                    &commit.workspace_id,
+                )
+                .await;
+            let permits = scoped
+                .as_ref()
+                .is_some_and(|context| context.permits_scoped_read());
+            if !permits {
+                debug!(
+                    "Permission commit point keeps the round-start decision: workspace_id={} reason=scoped_read_not_permitted",
+                    commit.workspace_id
+                );
+            }
+            permits
+        };
+        let fresh = if scoped_permits {
+            match crate::agentic::permission_policy::load_global_config().await {
+                Ok(config) => Some(config),
+                Err(error) => {
+                    debug!(
+                        "Permission commit point re-read failed: workspace_id={} reason=config_unavailable error={}",
+                        commit.workspace_id, error
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let fresh_strategy = crate::agentic::permission_policy::commit_point_approval_strategy(
+            scoped_permits,
+            pinned,
+            fresh.as_ref(),
+            &options.approval_context_vars,
+            round_start_strategy,
+        );
+        if matches!(fresh_strategy, PermissionApprovalStrategy::Model) {
+            if let Some(config) = fresh.as_ref() {
+                if let Some(fresh_provider) =
+                    build_permission_decision_provider(config, dialog_turn_id, None, None).await
+                {
+                    *provider = Some(fresh_provider);
+                }
+            }
+        }
+        debug!(
+            "Permission commit point resolved the approval decision: workspace_id={} strategy={:?}",
+            commit.workspace_id, fresh_strategy
+        );
+        fresh_strategy
+    }
+    #[cfg(not(all(feature = "workspace-intelligence-host", feature = "agent-runtime")))]
+    {
+        // Without the host feature there is nothing to re-read: the snapshot,
+        // pinned or not, is the whole answer.
+        let _ = (commit, dialog_turn_id, provider, pinned);
+        round_start_strategy
+    }
+}
+
+/// Builds the host-side model approval provider from the current configuration.
+///
+/// The round start and the permission commit point bind the provider through
+/// this one function, so a strategy selected at either point resolves to the
+/// same provider kind, model and timeout. A missing or invalid configuration
+/// yields `None`: the caller then keeps its existing binding, or applies the
+/// configured fail-closed fallback, but never widens the request.
+///
+/// `current_model_config_id` and `current_model_client` are the round's own
+/// model facts when the caller has them. Supplying both lets a chat approval
+/// model that is already loaded be reused instead of resolved again; a caller
+/// without them (the commit point) resolves strictly through the factory.
+pub(crate) async fn build_permission_decision_provider(
+    global_config: &crate::service::config::types::GlobalConfig,
+    log_id: &str,
+    current_model_config_id: Option<&str>,
+    current_model_client: Option<Arc<crate::infrastructure::ai::AIClient>>,
+) -> Option<Arc<dyn PermissionDecisionPort>> {
+    let chat_model_id = global_config
+        .tool_permissions
+        .approval
+        .chat_model_id
+        .trim()
+        .to_string();
+    match global_config.tool_permissions.approval.model_kind {
+        openbitfun_runtime_ports::PermissionApprovalModelKind::Chat
+            if !chat_model_id.is_empty() =>
+        {
+            debug!(
+                "Binding chat permission approval provider: log_id={}, model_id={}",
+                log_id, chat_model_id
+            );
+            let approval_client: Option<Arc<crate::infrastructure::ai::AIClient>> =
+                if current_model_config_id
+                    .is_some_and(|model_config_id| chat_model_id == model_config_id)
+                {
+                    current_model_client
+                } else {
+                    match crate::infrastructure::ai::AIClientFactory::get_global().await {
+                        Ok(factory) => match factory.get_client_resolved(&chat_model_id).await {
+                            Ok(client) => Some(client),
+                            Err(error) => {
+                                warn!("Approval model is unavailable on the execution host: {error}");
+                                None
+                            }
+                        },
+                        Err(error) => {
+                            warn!("Approval model factory is unavailable on the execution host: {error}");
+                            None
+                        }
+                    }
+                };
+            approval_client.map(|client| {
+                Arc::new(
+                    openbitfun_ai_adapters::permission::ChatPermissionDecisionProvider::new(
+                        client,
+                        Duration::from_millis(global_config.tool_permissions.approval.timeout_ms),
+                    ),
+                ) as Arc<dyn PermissionDecisionPort>
+            })
+        }
+        #[cfg(feature = "decision-model-credentials")]
+        openbitfun_runtime_ports::PermissionApprovalModelKind::Decision
+            if !global_config.ai.decision_model.model_name.trim().is_empty() =>
+        {
+            debug!(
+                "Binding decision permission approval provider: log_id={}, model_name={}",
+                log_id,
+                global_config.ai.decision_model.model_name.trim()
+            );
+            let endpoint = global_config.ai.decision_model.endpoint.trim();
+            let api_key = crate::service::decision_model::get_api_key().await;
+            match (endpoint, api_key) {
+                (endpoint, Ok(Some(api_key)))
+                    if !endpoint.is_empty() && !api_key.trim().is_empty() =>
+                {
+                    openbitfun_ai_adapters::permission::JevPermissionDecisionProvider::new(
+                        openbitfun_ai_adapters::permission::JevPermissionDecisionConfig {
+                            endpoint: endpoint.to_string(),
+                            api_key,
+                            model: global_config.ai.decision_model.model_name.trim().to_string(),
+                            timeout: Duration::from_millis(
+                                global_config.tool_permissions.approval.timeout_ms,
+                            ),
+                        },
+                    )
+                    .map(|provider| {
+                        Arc::new(provider) as Arc<dyn PermissionDecisionPort>
+                    })
+                    .map_err(|error| {
+                        warn!("Jev approval provider is unavailable on the execution host: {error}");
+                        error
+                    })
+                    .ok()
+                }
+                (endpoint, Ok(Some(_))) if endpoint.is_empty() => {
+                    warn!("Jev approval provider is unavailable: decision-model endpoint is not configured");
+                    None
+                }
+                (_, Ok(Some(_))) => {
+                    warn!("Jev approval provider is unavailable: decision-model API key is empty");
+                    None
+                }
+                (_, Ok(None)) => {
+                    warn!("Jev approval provider is unavailable: decision-model API key is not configured");
+                    None
+                }
+                (_, Err(error)) => {
+                    warn!("Jev approval provider credential lookup failed: {error}");
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "decision-model-credentials"))]
+        openbitfun_runtime_ports::PermissionApprovalModelKind::Decision => {
+            warn!("Decision-model approval is unavailable because decision-model credentials are not enabled");
+            None
+        }
+        _ => {
+            warn!(
+                "Permission approval model binding is missing or invalid: log_id={}",
+                log_id
+            );
+            None
+        }
+    }
+}
+
 /// Tool pipeline
 #[derive(Clone)]
 pub struct ToolPipeline {
@@ -1181,11 +1422,23 @@ impl ToolPipeline {
         })?;
 
         let mut decisions = vec![None; requests.len()];
-        let strategy = if options.auto_approve_ask {
+        // The round-start snapshot: the invocation-scoped `--auto` flag and the
+        // strategy resolved before this round's model call.
+        let round_start_strategy = if options.auto_approve_ask {
             PermissionApprovalStrategy::ImmediateAllow
         } else {
             options.permission_approval_strategy
         };
+        // The permission commit point may re-read the decision for an enabled
+        // workspace. Without a commit context the snapshot below is used verbatim.
+        let mut provider = self.permission_decision_provider.clone();
+        let strategy = reread_commit_point_strategy(
+            options,
+            dialog_turn_id,
+            round_start_strategy,
+            &mut provider,
+        )
+        .await;
         debug!(
             "Starting permission approval: dialog_turn_id={}, request_count={}, strategy={:?}, user_input_available={}",
             dialog_turn_id,
@@ -1194,7 +1447,7 @@ impl ToolPipeline {
             options.permission_user_input_available
         );
         if matches!(strategy, PermissionApprovalStrategy::Model) {
-            if let Some(provider) = self.permission_decision_provider.as_ref() {
+            if let Some(provider) = provider.as_ref() {
                 let approval_started_at = Instant::now();
                 debug!(
                     "Calling permission approval provider: dialog_turn_id={}, request_count={}",
@@ -1861,6 +2114,9 @@ impl ToolPipeline {
                 if auto_approve && !approve {
                     options.auto_approve_ask = false;
                     options.permission_approval_strategy = PermissionApprovalStrategy::Interactive;
+                    // A hook's explicit ask outranks any later configuration
+                    // re-read, so the commit point must keep this snapshot.
+                    options.approval_strategy_pinned = true;
                 }
                 match self
                     .register_permission_requests(
@@ -2104,22 +2360,19 @@ impl ToolPipeline {
             }
             PermissionPlanDraft::Requests(requests) => {
                 let mut approval_options = task.options.clone();
-                if !approval_options.auto_approve_ask
-                    || self
-                        .hook_asks
-                        .lock()
-                        .await
-                        .contains_key(&task.tool_call.tool_id)
-                {
+                // A hook's explicit ask must survive bypass mode and must not be
+                // replaced by a commit-point configuration re-read.
+                let hook_forced = self
+                    .hook_asks
+                    .lock()
+                    .await
+                    .contains_key(&task.tool_call.tool_id);
+                if !approval_options.auto_approve_ask || hook_forced {
                     approval_options.auto_approve_ask = false;
-                    if self
-                        .hook_asks
-                        .lock()
-                        .await
-                        .contains_key(&task.tool_call.tool_id)
-                    {
+                    if hook_forced {
                         approval_options.permission_approval_strategy =
                             PermissionApprovalStrategy::Interactive;
+                        approval_options.approval_strategy_pinned = true;
                     }
                 }
                 PermissionExecutionPlan::Awaiting(
@@ -3658,11 +3911,7 @@ impl ToolPipeline {
             .find(|request| {
                 request.tool_call_id.as_deref() == Some(tool_id) || request.request_id == tool_id
             })
-            .ok_or_else(|| {
-                OpenBitFunError::NotFound(format!(
-                    "Permission request not found for tool: {tool_id}"
-                ))
-            })?;
+            .ok_or_else(|| Self::permission_request_not_found(tool_id))?;
         if let PermissionReply::OnceWithInput { updated_input } = &reply {
             let task = request
                 .tool_call_id
@@ -3680,7 +3929,30 @@ impl ToolPipeline {
             .reply(&request.request_id, reply, PermissionReplySource::User)
             .await
             .map(|_| ())
-            .map_err(|error| OpenBitFunError::service(error.to_string()))
+            .map_err(|error| Self::map_permission_reply_error(tool_id, error))
+    }
+
+    /// The one "this request is not pending" error for a tool id.
+    fn permission_request_not_found(tool_id: &str) -> OpenBitFunError {
+        OpenBitFunError::NotFound(format!("Permission request not found for tool: {tool_id}"))
+    }
+
+    /// Projects a permission-manager reply failure onto the pipeline error shape.
+    ///
+    /// A request that is gone by the time the reply lands lost the race with
+    /// another terminal reply or with cancellation. That is the same "not
+    /// pending" outcome as a request that never existed, so both report
+    /// `NotFound`; every other manager failure stays a service error.
+    fn map_permission_reply_error(
+        tool_id: &str,
+        error: openbitfun_agent_runtime::permission::PermissionRequestManagerError,
+    ) -> OpenBitFunError {
+        match error {
+            openbitfun_agent_runtime::permission::PermissionRequestManagerError::RequestNotFound(
+                _,
+            ) => Self::permission_request_not_found(tool_id),
+            other => OpenBitFunError::service(other.to_string()),
+        }
     }
 
     /// Cancel all tools for a dialog turn
@@ -7312,5 +7584,366 @@ mod tests {
     fn task_tool_manages_its_own_execution_timeout() {
         let task_tool = AgentExecutionTool::new();
         assert!(task_tool.manages_own_execution_timeout());
+    }
+
+    // -----------------------------------------------------------------------
+    // Permission commit point
+    // -----------------------------------------------------------------------
+
+    /// Records every model decision call so a test can prove the model was or
+    /// was not consulted.
+    #[derive(Default)]
+    struct RecordingPermissionDecisionProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl PermissionDecisionPort for RecordingPermissionDecisionProvider {
+        async fn evaluate(
+            &self,
+            batch: Vec<PermissionDecisionInput>,
+            _cancellation: CancellationToken,
+        ) -> Result<Vec<PermissionDecision>, openbitfun_runtime_ports::PortError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(batch
+                .into_iter()
+                .map(|input| PermissionDecision {
+                    request_id: input.request_id,
+                    outcome: PermissionDecisionOutcome::Allow,
+                    probability: None,
+                    risk_class: None,
+                    reason_code: None,
+                })
+                .collect())
+        }
+    }
+
+    /// A commit context whose workspace has no workspace-intelligence control
+    /// record at all, so the scoped read does not permit re-reading.
+    #[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+    fn off_tier_commit_context() -> (
+        WorkspaceIntelligenceCommitContext,
+        Arc<crate::infrastructure::PathManager>,
+        tempfile::TempDir,
+    ) {
+        let root = tempfile::tempdir().expect("temporary root");
+        let paths = Arc::new(crate::infrastructure::PathManager::with_user_root_for_tests(
+            root.path().join("user"),
+        ));
+        (
+            WorkspaceIntelligenceCommitContext {
+                workspace_id: "workspace-commit-point".to_string(),
+                paths: Arc::clone(&paths),
+            },
+            paths,
+            root,
+        )
+    }
+
+    async fn execute_one_write(
+        pipeline: &ToolPipeline,
+        options: ToolExecutionOptions,
+    ) -> Vec<ToolExecutionResult> {
+        pipeline
+            .execute_tools(
+                vec![test_tool_call("commit-point-tool", "Write")],
+                permission_test_context(),
+                options,
+            )
+            .await
+            .expect("the tool must still execute")
+    }
+
+    #[tokio::test]
+    async fn an_off_round_keeps_the_round_start_strategy() {
+        let store = Arc::new(MemoryPermissionStore::default());
+        let manager = permission_test_manager(Arc::clone(&store));
+        let provider = Arc::new(RecordingPermissionDecisionProvider::default());
+        let pipeline = test_tool_pipeline()
+            .with_permission_request_manager(Arc::clone(&manager))
+            .with_permission_decision_provider(provider.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        register_v2_file_test_tool(
+            &pipeline,
+            vec![PermissionIntent::new(
+                "edit",
+                vec!["src/main.rs".to_string()],
+            )],
+            Arc::clone(&calls),
+        )
+        .await;
+
+        let mut options = ToolExecutionOptions::default();
+        options.permission_approval_strategy = PermissionApprovalStrategy::Model;
+        // No workspace-intelligence commit context: the OFF path.
+        assert!(options.workspace_intelligence.is_none());
+
+        let results = execute_one_write(&pipeline, options).await;
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "the round-start model decision must still be used"
+        );
+        assert!(manager.pending_requests().is_empty());
+        assert!(!results[0].result.is_error);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+    #[tokio::test]
+    async fn an_on_round_without_an_enabled_tier_keeps_the_snapshot() {
+        let store = Arc::new(MemoryPermissionStore::default());
+        let manager = permission_test_manager(Arc::clone(&store));
+        let provider = Arc::new(RecordingPermissionDecisionProvider::default());
+        let pipeline = test_tool_pipeline()
+            .with_permission_request_manager(Arc::clone(&manager))
+            .with_permission_decision_provider(provider.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        register_v2_file_test_tool(
+            &pipeline,
+            vec![PermissionIntent::new(
+                "edit",
+                vec!["src/main.rs".to_string()],
+            )],
+            Arc::clone(&calls),
+        )
+        .await;
+
+        let (commit_context, paths, _root) = off_tier_commit_context();
+        let mut options = ToolExecutionOptions::default();
+        options.permission_approval_strategy = PermissionApprovalStrategy::Model;
+        options.workspace_intelligence = Some(commit_context);
+
+        let results = execute_one_write(&pipeline, options).await;
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "a workspace without an enabled tier keeps the round-start decision"
+        );
+        assert!(manager.pending_requests().is_empty());
+        assert!(!results[0].result.is_error);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !paths.workspace_intelligence_control_dir().exists(),
+            "resolving the commit point must not create a control record"
+        );
+    }
+
+    #[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+    #[tokio::test]
+    async fn an_invocation_pinned_strategy_is_never_reread() {
+        let store = Arc::new(MemoryPermissionStore::default());
+        let manager = permission_test_manager(Arc::clone(&store));
+        let provider = Arc::new(RecordingPermissionDecisionProvider::default());
+        let pipeline = test_tool_pipeline()
+            .with_permission_request_manager(Arc::clone(&manager))
+            .with_permission_decision_provider(provider.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        register_v2_file_test_tool(
+            &pipeline,
+            vec![PermissionIntent::new(
+                "edit",
+                vec!["src/main.rs".to_string()],
+            )],
+            Arc::clone(&calls),
+        )
+        .await;
+
+        let (commit_context, _paths, _root) = off_tier_commit_context();
+        let mut options = ToolExecutionOptions::default();
+        options.permission_approval_strategy = PermissionApprovalStrategy::Interactive;
+        // An invocation-scoped `--auto` run decided before the round began.
+        options.auto_approve_ask = true;
+        options.workspace_intelligence = Some(commit_context);
+
+        let results = execute_one_write(&pipeline, options).await;
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "an invocation-scoped strategy must not reach a model decision"
+        );
+        assert!(manager.pending_requests().is_empty());
+        assert!(!results[0].result.is_error);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A hook's explicit ask outranks the commit point: the batch keeps the
+    /// round-start decision even when the fresh facts would select model
+    /// approval, so the user is still asked.
+    #[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+    #[tokio::test]
+    async fn a_hook_forced_ask_is_never_reread() {
+        let store = Arc::new(MemoryPermissionStore::default());
+        let manager = permission_test_manager(Arc::clone(&store));
+        let fresh_provider = Arc::new(RecordingPermissionDecisionProvider::default());
+        let pipeline = test_tool_pipeline().with_permission_request_manager(Arc::clone(&manager));
+        let calls = Arc::new(AtomicUsize::new(0));
+        register_v2_file_test_tool(
+            &pipeline,
+            vec![PermissionIntent::new(
+                "edit",
+                vec!["src/main.rs".to_string()],
+            )],
+            Arc::clone(&calls),
+        )
+        .await;
+        // The hook spoke for this tool call before the batch was authorized.
+        pipeline
+            .hook_asks
+            .lock()
+            .await
+            .insert("hook-forced".to_string(), "review this call".to_string());
+
+        let (commit_context, _paths, _root) = off_tier_commit_context();
+        let mut options = ToolExecutionOptions::default();
+        // A bypass round would auto-approve every ask; the hook's ask must
+        // override that, and the commit point must not undo the override.
+        options.auto_approve_ask = true;
+        options.permission_approval_strategy = PermissionApprovalStrategy::Interactive;
+        options.workspace_intelligence = Some(commit_context);
+        options.fresh_approval_facts = Some(FreshApprovalFacts {
+            strategy: PermissionApprovalStrategy::Model,
+            provider: Some(fresh_provider.clone()),
+        });
+
+        let running = pipeline.clone();
+        let execution = tokio::spawn(async move {
+            running
+                .execute_tools(
+                    vec![test_tool_call("hook-forced", "Write")],
+                    permission_test_context(),
+                    options,
+                )
+                .await
+        });
+
+        // The forced ask reached the user instead of a model decision.
+        let request = wait_for_permission_request(&manager).await;
+        assert_eq!(fresh_provider.calls.load(Ordering::SeqCst), 0);
+        pipeline
+            .reply_to_tool(&request.request_id, PermissionReply::Once)
+            .await
+            .expect("the forced ask must accept a user reply");
+        let results = execution.await.expect("execution joins").expect("tool executes");
+        assert!(!results[0].result.is_error);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(manager.pending_requests().is_empty());
+    }
+
+    /// An enabled round re-reads a model decision and the re-read provider is the
+    /// one that answers; the round itself bound no provider.
+    #[tokio::test]
+    async fn an_on_round_uses_the_reread_provider_for_model_approval() {
+        let store = Arc::new(MemoryPermissionStore::default());
+        let manager = permission_test_manager(Arc::clone(&store));
+        let fresh_provider = Arc::new(RecordingPermissionDecisionProvider::default());
+        let pipeline = test_tool_pipeline().with_permission_request_manager(Arc::clone(&manager));
+        let calls = Arc::new(AtomicUsize::new(0));
+        register_v2_file_test_tool(
+            &pipeline,
+            vec![PermissionIntent::new(
+                "edit",
+                vec!["src/main.rs".to_string()],
+            )],
+            Arc::clone(&calls),
+        )
+        .await;
+
+        // The host read cannot succeed in this fixture, so the round start would
+        // ask a human; only the injected fresh facts can select model approval.
+        let root = tempfile::tempdir().expect("temporary root");
+        let commit_context = WorkspaceIntelligenceCommitContext {
+            workspace_id: "workspace-commit-point".to_string(),
+            paths: Arc::new(crate::infrastructure::PathManager::with_user_root_for_tests(
+                root.path().join("user"),
+            )),
+        };
+        let mut options = ToolExecutionOptions::default();
+        options.permission_approval_strategy = PermissionApprovalStrategy::Interactive;
+        options.workspace_intelligence = Some(commit_context);
+        options.fresh_approval_facts = Some(FreshApprovalFacts {
+            strategy: PermissionApprovalStrategy::Model,
+            provider: Some(fresh_provider.clone()),
+        });
+
+        let results = execute_one_write(&pipeline, options).await;
+
+        assert_eq!(
+            fresh_provider.calls.load(Ordering::SeqCst),
+            1,
+            "the re-read provider must answer the request"
+        );
+        assert!(
+            manager.pending_requests().is_empty(),
+            "a model decision must not wait for a human"
+        );
+        assert!(!results[0].result.is_error);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let sources = store
+            .audit
+            .lock()
+            .expect("permission audit lock")
+            .iter()
+            .filter_map(|record| match &record.event {
+                PermissionAuditEvent::Replied { source, .. } => Some(*source),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sources,
+            vec![PermissionReplySource::Model],
+            "the adopted decision must be audited as a model reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_for_a_request_that_is_not_pending_reports_not_found() {
+        let store = Arc::new(MemoryPermissionStore::default());
+        let manager = permission_test_manager(store);
+        let pipeline = test_tool_pipeline().with_permission_request_manager(manager);
+
+        let error = pipeline
+            .reply_to_tool("never-registered", PermissionReply::Once)
+            .await
+            .expect_err("a reply without a pending request must fail");
+
+        assert!(
+            matches!(error, OpenBitFunError::NotFound(_)),
+            "a late reply must report not-found, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_manager_not_found_reply_error_maps_to_not_found() {
+        let not_found = ToolPipeline::map_permission_reply_error(
+            "tool-1",
+            openbitfun_agent_runtime::permission::PermissionRequestManagerError::RequestNotFound(
+                "request-1".to_string(),
+            ),
+        );
+        assert!(
+            matches!(
+                not_found,
+                OpenBitFunError::NotFound(ref message) if message.contains("tool-1")
+            ),
+            "the lost race must report not-found, got {not_found:?}"
+        );
+        let other = ToolPipeline::map_permission_reply_error(
+            "tool-1",
+            openbitfun_agent_runtime::permission::PermissionRequestManagerError::InvalidReply(
+                "bad".to_string(),
+            ),
+        );
+        assert!(
+            !matches!(other, OpenBitFunError::NotFound(_)),
+            "an unrelated manager failure keeps its own error class, got {other:?}"
+        );
+        assert!(
+            matches!(other, OpenBitFunError::Service(_)),
+            "an unrelated manager failure stays a service error, got {other:?}"
+        );
     }
 }

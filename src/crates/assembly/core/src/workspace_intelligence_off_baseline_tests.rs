@@ -806,3 +806,98 @@ fn off_baseline_permission_approval_defaults_stay_interactive() {
         .expect("a record without the approval section must stay readable");
     assert_eq!(restored, PermissionApprovalConfig::default());
 }
+
+// ---------------------------------------------------------------------------
+// Layered approval-strategy resolution
+// ---------------------------------------------------------------------------
+
+/// Baseline for the four-layer approval-strategy resolution.
+///
+/// Owner: `agentic/permission_policy.rs::resolve_approval_strategy`, the single
+/// resolver the round executor and the workspace-intelligence permission commit
+/// point both call. Before this test the four layers lived inline in the round
+/// executor and had no coverage.
+///
+/// Off means: the same four layers in the same order, so a turn keeps the
+/// approval strategy it started with and workspace intelligence adds no layer.
+#[test]
+fn off_baseline_approval_strategy_resolution_is_pinned() {
+    fn resolve(
+        global: &crate::service::config::types::GlobalConfig,
+        context: &[(&str, &str)],
+    ) -> PermissionApprovalStrategy {
+        let context_vars = context
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect::<HashMap<String, String>>();
+        crate::agentic::permission_policy::resolve_approval_strategy(global, &context_vars)
+    }
+
+    let strategy_key =
+        openbitfun_agent_runtime::permission::PERMISSION_APPROVAL_STRATEGY_CONTEXT_KEY;
+    let mode_key = openbitfun_agent_runtime::permission::PERMISSION_MODE_CONTEXT_KEY;
+
+    // The stored configuration alone asks for model approval.
+    let mut stored_model = crate::service::config::types::GlobalConfig::default();
+    stored_model.tool_permissions.approval.strategy = PermissionApprovalStrategy::Model;
+    stored_model.tool_permissions.interaction.auto_approve_ask = false;
+
+    // (a) The submission's own strategy outranks the stored model strategy.
+    assert_eq!(
+        resolve(&stored_model, &[(strategy_key, "interactive")]),
+        PermissionApprovalStrategy::Interactive
+    );
+    // (b) The immediate-allow layer is reachable from the same key.
+    assert_eq!(
+        resolve(&stored_model, &[(strategy_key, "immediate_allow")]),
+        PermissionApprovalStrategy::ImmediateAllow
+    );
+    // (c) An explicit model selection is kept verbatim, including case and padding.
+    assert_eq!(
+        resolve(&stored_model, &[(strategy_key, "  MODEL ")]),
+        PermissionApprovalStrategy::Model
+    );
+
+    // (d) An AutoApprove permission mode resolves to model approval.
+    let mut interactive = crate::service::config::types::GlobalConfig::default();
+    interactive.tool_permissions.approval.strategy = PermissionApprovalStrategy::Interactive;
+    interactive.tool_permissions.interaction.auto_approve_ask = false;
+    assert_eq!(
+        resolve(&interactive, &[(mode_key, PermissionMode::AutoApprove.as_str())]),
+        PermissionApprovalStrategy::Model
+    );
+    // A non-AutoApprove mode keeps the stored strategy.
+    assert_eq!(
+        resolve(&interactive, &[(mode_key, PermissionMode::Ask.as_str())]),
+        PermissionApprovalStrategy::Interactive
+    );
+
+    // (e) The legacy persisted auto-approve flag still resolves to model approval.
+    let mut legacy = interactive.clone();
+    legacy.tool_permissions.interaction.auto_approve_ask = true;
+    assert_eq!(
+        resolve(&legacy, &[]),
+        PermissionApprovalStrategy::Model
+    );
+
+    // (f) Without any override the stored configuration decides.
+    assert_eq!(
+        resolve(&stored_model, &[]),
+        PermissionApprovalStrategy::Model
+    );
+
+    // (g) The empty default resolves to the unchanged interactive default.
+    assert_eq!(
+        resolve(
+            &crate::service::config::types::GlobalConfig::default(),
+            &[]
+        ),
+        PermissionApprovalStrategy::Interactive
+    );
+
+    // An unknown strategy value never selects a strategy; it falls through.
+    assert_eq!(
+        resolve(&interactive, &[(strategy_key, "unheard_of")]),
+        PermissionApprovalStrategy::Interactive
+    );
+}

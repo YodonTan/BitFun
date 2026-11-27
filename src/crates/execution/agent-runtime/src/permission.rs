@@ -978,4 +978,132 @@ mod tests {
         ));
         assert_eq!(store.audit.lock().unwrap().len(), 2);
     }
+
+    /// A request reaches exactly one terminal outcome: the first reply wins and
+    /// every later reply is refused instead of overwriting the tool's answer.
+    #[tokio::test]
+    async fn a_second_reply_to_the_same_request_is_refused() {
+        let store = Arc::new(MemoryPermissionStore::default());
+        let manager = PermissionRequestManager::new(store.clone(), store, Arc::new(FixedClock));
+        let pending = manager.register(request()).await.expect("register request");
+
+        manager
+            .reply(
+                "request-1",
+                PermissionReply::Once,
+                PermissionReplySource::User,
+            )
+            .await
+            .expect("first reply");
+
+        let refused = manager
+            .reply(
+                "request-1",
+                PermissionReply::Reject { feedback: None },
+                PermissionReplySource::ModelDeny,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionRequestManagerError::RequestNotFound(ref request_id))
+                    if request_id == "request-1"
+            ),
+            "a resolved request must refuse a second reply, got {refused:?}"
+        );
+        assert_eq!(
+            pending.wait().await,
+            PermissionWaitOutcome::Replied(PermissionReply::Once),
+            "only the first reply may reach the tool"
+        );
+        assert!(manager.pending_requests().is_empty());
+    }
+
+    /// Cancellation is a terminal outcome too, so a reply that arrives afterwards
+    /// cannot resurrect the request.
+    #[tokio::test]
+    async fn a_reply_after_cancellation_is_refused() {
+        let store = Arc::new(MemoryPermissionStore::default());
+        let manager = PermissionRequestManager::new(store.clone(), store, Arc::new(FixedClock));
+        let pending = manager.register(request()).await.expect("register request");
+
+        manager
+            .cancel_request("request-1", "turn cancelled")
+            .await
+            .expect("cancel request");
+
+        let refused = manager
+            .reply(
+                "request-1",
+                PermissionReply::Once,
+                PermissionReplySource::User,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionRequestManagerError::RequestNotFound(ref request_id))
+                    if request_id == "request-1"
+            ),
+            "a cancelled request must refuse a late reply, got {refused:?}"
+        );
+        assert_eq!(
+            pending.wait().await,
+            PermissionWaitOutcome::Cancelled {
+                reason: "turn cancelled".to_string()
+            }
+        );
+        assert!(manager.pending_requests().is_empty());
+    }
+
+    /// Two replies racing for one request serialize on the manager's operation
+    /// lock: exactly one wins and the tool observes exactly that outcome.
+    #[tokio::test]
+    async fn two_concurrent_replies_land_exactly_one_outcome() {
+        let store = Arc::new(MemoryPermissionStore::default());
+        let manager = PermissionRequestManager::new(store.clone(), store, Arc::new(FixedClock));
+        let pending = manager.register(request()).await.expect("register request");
+        let allow = manager.clone();
+        let deny = manager.clone();
+
+        // `join!` interleaves both replies inside one task: this exercises the
+        // manager's operation lock serializing them, not cross-thread scheduling.
+        let (allow_result, deny_result) = tokio::join!(
+            async move {
+                allow
+                    .reply(
+                        "request-1",
+                        PermissionReply::Once,
+                        PermissionReplySource::User,
+                    )
+                    .await
+            },
+            async move {
+                deny.reply(
+                    "request-1",
+                    PermissionReply::Reject { feedback: None },
+                    PermissionReplySource::ModelDeny,
+                )
+                .await
+            },
+        );
+
+        assert_eq!(
+            usize::from(allow_result.is_ok()) + usize::from(deny_result.is_ok()),
+            1,
+            "exactly one reply may win: allow={allow_result:?} deny={deny_result:?}"
+        );
+        let outcome = pending.wait().await;
+        let PermissionWaitOutcome::Replied(reply) = outcome else {
+            panic!("the winning reply must reach the tool, got {outcome:?}");
+        };
+        assert_eq!(
+            reply == PermissionReply::Once,
+            allow_result.is_ok(),
+            "the tool must observe the winning reply, got {reply:?}"
+        );
+        assert!(manager.pending_requests().is_empty());
+    }
 }

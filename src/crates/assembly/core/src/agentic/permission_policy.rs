@@ -6,8 +6,8 @@ use openbitfun_agent_runtime::permission::{
 };
 use openbitfun_runtime_ports::{
     resolve_child_permission_policy, resolve_permission_policy, ChildPermissionPolicyLayers,
-    PermissionConstraintLayer, PermissionEffect, PermissionMode, PermissionPolicyLayers,
-    PermissionRule, PermissionRuntimeCeiling, ResolvedPermissionPolicy,
+    PermissionApprovalStrategy, PermissionConstraintLayer, PermissionEffect, PermissionMode,
+    PermissionPolicyLayers, PermissionRule, PermissionRuntimeCeiling, ResolvedPermissionPolicy,
 };
 
 /// Reads the effective mode a submission carried into tool execution.
@@ -39,6 +39,94 @@ pub(crate) fn permission_mode_from_context(
         Some(false) if default_mode == PermissionMode::AutoApprove => PermissionMode::Ask,
         _ => default_mode,
     }
+}
+
+/// Reads the approval strategy a submission explicitly carried into tool
+/// execution.
+///
+/// This is the top layer of the approval resolution: a turn that selected a
+/// strategy writes it to the execution context, so a present value outranks
+/// every configuration layer below it. An unknown or absent value yields `None`
+/// and the lower layers decide.
+pub(crate) fn context_approval_strategy(
+    context_vars: &std::collections::HashMap<String, String>,
+) -> Option<PermissionApprovalStrategy> {
+    context_vars
+        .get(openbitfun_agent_runtime::permission::PERMISSION_APPROVAL_STRATEGY_CONTEXT_KEY)
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "interactive" => Some(PermissionApprovalStrategy::Interactive),
+            "immediate_allow" => Some(PermissionApprovalStrategy::ImmediateAllow),
+            "model" => Some(PermissionApprovalStrategy::Model),
+            _ => None,
+        })
+}
+
+/// Resolves one round's approval strategy from the four existing layers.
+///
+/// Order, unchanged from the round executor that used to inline it: the
+/// strategy the submission carried, then an `AutoApprove` permission mode, then
+/// the legacy persisted `auto_approve_ask` flag, then the stored approval
+/// configuration. It reads no clock, no storage and no workspace intelligence
+/// fact, so the OFF path resolves exactly as it always did.
+pub(crate) fn resolve_approval_strategy(
+    global: &GlobalConfig,
+    context_vars: &std::collections::HashMap<String, String>,
+) -> PermissionApprovalStrategy {
+    let legacy_auto_approval = global.tool_permissions.interaction.auto_approve_ask;
+    context_approval_strategy(context_vars)
+        .or_else(|| {
+            context_vars
+                .get(openbitfun_agent_runtime::permission::PERMISSION_MODE_CONTEXT_KEY)
+                .and_then(|value| PermissionMode::parse(value))
+                .and_then(|mode| {
+                    (mode == PermissionMode::AutoApprove)
+                        .then_some(PermissionApprovalStrategy::Model)
+                })
+        })
+        .or_else(|| legacy_auto_approval.then_some(PermissionApprovalStrategy::Model))
+        .unwrap_or(global.tool_permissions.approval.strategy)
+}
+
+/// Resolves the strategy the permission commit point must use.
+///
+/// The round-start snapshot stays authoritative unless every condition holds:
+/// workspace intelligence is on for this workspace (`scoped_permits`), the fresh
+/// configuration was readable (`fresh`), and nothing pinned the strategy already
+/// (`pinned`, i.e. a CLI `--auto` run or a hook that explicitly asked for user
+/// confirmation). A failure at any of those layers keeps the snapshot; none of
+/// them rejects the request.
+#[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+pub(crate) fn commit_point_approval_strategy(
+    scoped_permits: bool,
+    pinned: bool,
+    fresh: Option<&GlobalConfig>,
+    context_vars: &std::collections::HashMap<String, String>,
+    snapshot: PermissionApprovalStrategy,
+) -> PermissionApprovalStrategy {
+    if !scoped_permits || pinned {
+        return snapshot;
+    }
+    match fresh {
+        Some(global) => resolve_approval_strategy(global, context_vars),
+        None => snapshot,
+    }
+}
+
+/// Loads the current global configuration, or reports why it is unavailable.
+///
+/// The permission commit point re-reads the same configuration the round start
+/// read, through the same service, so the two cannot disagree about where the
+/// configuration lives.
+///
+/// The failure policy deliberately differs from the round start's: the round
+/// start falls back to `GlobalConfig::default()`, while a commit-point failure
+/// keeps the round-start snapshot. A round that could not read its configuration
+/// already decided with the default, and a later read must not silently replace
+/// that decision with a different default.
+#[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+pub(crate) async fn load_global_config() -> OpenBitFunResult<GlobalConfig> {
+    let service = GlobalConfigManager::get_service().await?;
+    service.get_config(None).await
 }
 
 pub(crate) fn derive_parent_permission_runtime_ceiling(
@@ -328,6 +416,96 @@ mod tests {
         assert_eq!(
             evaluator.evaluate_policy_resource("external_directory", "C:/outside", &resolved),
             PermissionEffect::Ask
+        );
+    }
+
+    #[test]
+    fn the_layered_approval_resolution_keeps_its_four_layers() {
+        let mut global = GlobalConfig::default();
+        let mut context_vars = std::collections::HashMap::new();
+        let strategy_key =
+            openbitfun_agent_runtime::permission::PERMISSION_APPROVAL_STRATEGY_CONTEXT_KEY;
+
+        // Layer one: the strategy the submission itself carried.
+        context_vars.insert(strategy_key.to_string(), "immediate_allow".to_string());
+        global.tool_permissions.interaction.auto_approve_ask = true;
+        global.tool_permissions.approval.strategy = PermissionApprovalStrategy::Interactive;
+        assert_eq!(
+            resolve_approval_strategy(&global, &context_vars),
+            PermissionApprovalStrategy::ImmediateAllow
+        );
+
+        // Layer two: an AutoApprove permission mode resolves to model approval.
+        context_vars.clear();
+        global.tool_permissions.interaction.auto_approve_ask = false;
+        context_vars.insert(
+            PERMISSION_MODE_CONTEXT_KEY.to_string(),
+            PermissionMode::AutoApprove.as_str().to_string(),
+        );
+        assert_eq!(
+            resolve_approval_strategy(&global, &context_vars),
+            PermissionApprovalStrategy::Model
+        );
+
+        // Layer three: the legacy persisted flag still resolves to model approval.
+        context_vars.clear();
+        global.tool_permissions.interaction.auto_approve_ask = true;
+        assert_eq!(
+            resolve_approval_strategy(&global, &context_vars),
+            PermissionApprovalStrategy::Model
+        );
+
+        // Layer four: the stored configuration decides when nothing else does.
+        global.tool_permissions.interaction.auto_approve_ask = false;
+        global.tool_permissions.approval.strategy = PermissionApprovalStrategy::ImmediateAllow;
+        assert_eq!(
+            resolve_approval_strategy(&global, &context_vars),
+            PermissionApprovalStrategy::ImmediateAllow
+        );
+    }
+
+    #[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+    #[test]
+    fn the_commit_point_keeps_the_snapshot_unless_the_workspace_is_on() {
+        let mut fresh = GlobalConfig::default();
+        fresh.tool_permissions.approval.strategy = PermissionApprovalStrategy::Model;
+        let context_vars = std::collections::HashMap::new();
+        let snapshot = PermissionApprovalStrategy::Interactive;
+
+        // OFF: workspace intelligence is not on for this workspace.
+        assert_eq!(
+            commit_point_approval_strategy(false, false, Some(&fresh), &context_vars, snapshot),
+            snapshot
+        );
+        // An unreadable configuration keeps the snapshot instead of failing the request.
+        assert_eq!(
+            commit_point_approval_strategy(true, false, None, &context_vars, snapshot),
+            snapshot
+        );
+        // An invocation-scoped strategy (`--auto`) is never re-read.
+        assert_eq!(
+            commit_point_approval_strategy(true, true, Some(&fresh), &context_vars, snapshot),
+            snapshot
+        );
+        // ON: the fresh layered resolution decides.
+        assert_eq!(
+            commit_point_approval_strategy(true, false, Some(&fresh), &context_vars, snapshot),
+            PermissionApprovalStrategy::Model
+        );
+        // ON still honors the submission layer inside the fresh resolution.
+        let mut overridden = std::collections::HashMap::new();
+        let strategy_key =
+            openbitfun_agent_runtime::permission::PERMISSION_APPROVAL_STRATEGY_CONTEXT_KEY;
+        overridden.insert(strategy_key.to_string(), "interactive".to_string());
+        assert_eq!(
+            commit_point_approval_strategy(
+                true,
+                false,
+                Some(&fresh),
+                &overridden,
+                PermissionApprovalStrategy::Model
+            ),
+            PermissionApprovalStrategy::Interactive
         );
     }
 }
