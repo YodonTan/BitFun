@@ -70,6 +70,31 @@ fn due_scheduled_trigger_creates_pending_run_when_idle() {
 }
 
 #[test]
+fn the_same_scheduled_instant_never_enqueues_twice() {
+    let mut state = ScheduledJobRuntimeState {
+        next_run_at_ms: Some(1_000),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        state.apply_due_scheduled_trigger(1_000, Some(2_000)),
+        ScheduledJobTriggerAction::Pending
+    );
+    assert_eq!(state.pending_trigger_at_ms, Some(1_000));
+    assert_eq!(state.coalesced_run_count, 0);
+
+    // The same occurrence delivered a second time must coalesce into the run
+    // that is already pending instead of queueing another one.
+    assert_eq!(
+        state.apply_due_scheduled_trigger(1_000, Some(2_000)),
+        ScheduledJobTriggerAction::Coalesced
+    );
+    assert_eq!(state.pending_trigger_at_ms, Some(1_000));
+    assert_eq!(state.coalesced_run_count, 1);
+    assert_eq!(state.last_trigger_at_ms, Some(1_000));
+}
+
+#[test]
 fn pending_wakeup_prefers_retry_time_when_present() {
     let mut state = ScheduledJobRuntimeState {
         next_run_at_ms: Some(1_000),

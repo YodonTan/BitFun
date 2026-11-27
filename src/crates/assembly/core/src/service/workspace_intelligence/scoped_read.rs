@@ -6,9 +6,10 @@
 //!
 //! # What this module is
 //!
-//! It owns four facts and no behavior beyond them: whether a tier permits the
+//! It owns five facts and no behavior beyond them: whether a tier permits the
 //! read, the narrow entry shape a read would return, the typed diagnostics of a
-//! read that returned nothing, and the rendering of a non-empty entry list.
+//! read that returned nothing, the typed reasons a record outside the reader's
+//! partition is refused, and the rendering of a non-empty entry list.
 //!
 //! It performs no IO, reads no clock, writes no log line, and touches no store.
 //! The IO half lives in `scoped_read_io`, which resolves the persisted host anchor
@@ -29,6 +30,14 @@
 //! tier is necessary but not sufficient, and this contract never overrides the
 //! user's global switch.
 //!
+//! # Cross-partition reads
+//!
+//! This phase has no cross-partition read path. [`explain_visibility`] answers
+//! with the reason a record outside the reader's partition, or a share without
+//! owner authorization, is refused, so a caller that must answer "unsupported"
+//! gets a typed code instead of an empty list that could be mistaken for "there is
+//! nothing here".
+//!
 //! # Remote scenarios
 //!
 //! This contract is workspace-local. A remote workspace is out of scope here, and
@@ -36,7 +45,7 @@
 //! directory: the remote decision is made by the existing remote-execution gate,
 //! not by this module.
 
-use super::cognition::{CognitionKind, CognitionRevision};
+use super::cognition::{CognitionKind, CognitionRevision, CognitionVisibility};
 use super::entries_contract::kind_code;
 use super::mode::{tier_permits_scoped_read, WorkspaceIntelligenceTier};
 
@@ -108,6 +117,59 @@ impl ScopedReadDiagnostic {
             Self::NoEligibleEntries => "no_eligible_entries",
             Self::ScopeUnavailable => "scope_unavailable",
             Self::PartitionUnavailable => "partition_unavailable",
+        }
+    }
+}
+
+/// Why a cognition record is not readable from a partition.
+///
+/// Stable codes only: a refusal never echoes a stored value, a scope, a path or a
+/// record id, so it is safe to log and safe to hand to a caller that must answer
+/// "unsupported" without leaking what it could not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum WorkspaceIntelligenceScopeRefusal {
+    /// The record belongs to another partition and no cross-partition read path
+    /// exists in this phase.
+    CrossPartitionRead,
+    /// The record declares an explicit shared scope, but no owner authorization
+    /// entry exists yet, so the share is not honored.
+    ExplicitSharedNotAuthorized,
+}
+
+impl WorkspaceIntelligenceScopeRefusal {
+    /// Stable machine-readable code for logs and diagnostics.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::CrossPartitionRead => "cross_partition_read",
+            Self::ExplicitSharedNotAuthorized => "explicit_shared_not_authorized",
+        }
+    }
+}
+
+/// Explains visibility the way [`super::cognition::visible_in`] decides it, but
+/// returns the reason instead of a bare boolean.
+///
+/// A read inside the record's own partition is the only allowed case, and it is
+/// allowed for both visibilities: a record the owner shared explicitly is still a
+/// record of this partition. Everything from another partition is a refusal, and
+/// the reason distinguishes "this phase has no cross-partition read path" from
+/// "the declared share carries no owner authorization". Because this phase adds no
+/// cross-partition read path, a refusal is the only outcome a cross-partition
+/// reader can get.
+pub(crate) fn explain_visibility(
+    visibility: &CognitionVisibility,
+    reader_partition: &str,
+    record_partition: &str,
+) -> Result<(), WorkspaceIntelligenceScopeRefusal> {
+    if reader_partition == record_partition {
+        return Ok(());
+    }
+    match visibility {
+        CognitionVisibility::Partition => {
+            Err(WorkspaceIntelligenceScopeRefusal::CrossPartitionRead)
+        }
+        CognitionVisibility::ExplicitShared { .. } => {
+            Err(WorkspaceIntelligenceScopeRefusal::ExplicitSharedNotAuthorized)
         }
     }
 }
@@ -237,5 +299,67 @@ mod tests {
             ScopedReadDiagnostic::PartitionUnavailable.as_str(),
             "partition_unavailable"
         );
+    }
+
+    #[test]
+    fn a_same_partition_read_is_allowed_for_every_visibility() {
+        let shared = CognitionVisibility::ExplicitShared {
+            scope: "team".to_string(),
+            authorization_source: "owner".to_string(),
+        };
+
+        assert_eq!(
+            explain_visibility(&CognitionVisibility::Partition, "p1", "p1"),
+            Ok(())
+        );
+        assert_eq!(explain_visibility(&shared, "p1", "p1"), Ok(()));
+    }
+
+    #[test]
+    fn a_cross_partition_read_is_refused_with_a_typed_reason() {
+        let shared = CognitionVisibility::ExplicitShared {
+            scope: "team".to_string(),
+            authorization_source: "owner".to_string(),
+        };
+
+        assert_eq!(
+            explain_visibility(&CognitionVisibility::Partition, "p2", "p1"),
+            Err(WorkspaceIntelligenceScopeRefusal::CrossPartitionRead)
+        );
+        // A declared share is still not honored without owner authorization.
+        assert_eq!(
+            explain_visibility(&shared, "p2", "p1"),
+            Err(WorkspaceIntelligenceScopeRefusal::ExplicitSharedNotAuthorized)
+        );
+    }
+
+    #[test]
+    fn scope_refusal_codes_are_stable() {
+        assert_eq!(
+            WorkspaceIntelligenceScopeRefusal::CrossPartitionRead.as_str(),
+            "cross_partition_read"
+        );
+        assert_eq!(
+            WorkspaceIntelligenceScopeRefusal::ExplicitSharedNotAuthorized.as_str(),
+            "explicit_shared_not_authorized"
+        );
+    }
+
+    #[test]
+    fn explain_visibility_agrees_with_the_boolean_visibility_rule() {
+        let shared = CognitionVisibility::ExplicitShared {
+            scope: "team".to_string(),
+            authorization_source: "owner".to_string(),
+        };
+        for visibility in [CognitionVisibility::Partition, shared] {
+            for (reader, record) in [("p1", "p1"), ("p1", "p2"), ("p2", "p1")] {
+                let allowed = explain_visibility(&visibility, reader, record).is_ok();
+                let visible = super::super::cognition::visible_in(&visibility, reader, record);
+                assert_eq!(
+                    allowed, visible,
+                    "explanation must agree with visible_in for reader={reader} record={record}"
+                );
+            }
+        }
     }
 }

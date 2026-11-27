@@ -619,7 +619,7 @@ impl CronService {
                     ))
                 })?;
 
-                let turn_id = format!("cronjob_{}_{}", job.id, pending_trigger_at_ms);
+                let turn_id = cron_turn_id(&job.id, pending_trigger_at_ms);
                 scheduled_at_ms = Some(pending_trigger_at_ms);
                 let (user_input, prepended_messages) =
                     format_scheduled_job_user_input(&job.payload.text, current_ms);
@@ -1306,6 +1306,16 @@ fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
+/// Stable identity of one scheduled occurrence: the job plus the instant it was
+/// due.
+///
+/// Every later delivery attempt for the same occurrence derives the same id,
+/// which is what makes an already-settled turn reject the duplicate instead of
+/// opening a second run for the same instant.
+pub(crate) fn cron_turn_id(job_id: &str, scheduled_at_ms: i64) -> String {
+    format!("cronjob_{job_id}_{scheduled_at_ms}")
+}
+
 fn generate_cron_job_id(jobs: &HashMap<String, CronJob>) -> String {
     loop {
         let uuid = Uuid::new_v4().simple().to_string();
@@ -1387,6 +1397,30 @@ mod tests {
             state: CronJobState::default(),
             report_policy: Default::default(),
         }
+    }
+
+    #[test]
+    fn cron_turn_id_is_the_job_and_the_scheduled_instant() {
+        // One scheduled instant of one job has exactly one pinned identity.
+        assert_eq!(cron_turn_id("cron_test", 1000), "cronjob_cron_test_1000");
+
+        // That identity is the one the settled-turn classifier matches, which is
+        // how a second delivery of the same occurrence is rejected instead of
+        // opening another run.
+        assert!(cron_enqueue_error_is_turn_already_settled(&format!(
+            "{}: session_id=session_1, turn_id={}",
+            DIALOG_TURN_ID_ALREADY_SETTLED_MESSAGE,
+            cron_turn_id("cron_test", 1000)
+        )));
+
+        // A different instant is a different occurrence.
+        assert_ne!(cron_turn_id("cron_test", 1000), cron_turn_id("cron_test", 2000));
+        // A different job is a different occurrence even at the same instant.
+        assert_ne!(cron_turn_id("cron_test", 1000), cron_turn_id("cron_other", 1000));
+
+        // The boundary timestamp stays representable and distinct.
+        assert_eq!(cron_turn_id("cron_test", -1), "cronjob_cron_test_-1");
+        assert_ne!(cron_turn_id("cron_test", -1), cron_turn_id("cron_test", 1));
     }
 
     #[test]
