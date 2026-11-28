@@ -228,6 +228,12 @@ pub(crate) mod scoped_read_io;
 #[allow(dead_code)] // Internal to the WP2.3 preview; consumed only by its integration test.
 #[cfg(all(feature = "workspace-intelligence-cognition", feature = "agent-runtime"))]
 pub(crate) mod legacy_preview;
+// WP2.3 migration decision: the durable record of what a user assigned to which
+// workspace, its payload identity and its replay rule. Pure like `cognition` and
+// `cursor`, so it stays feature-free; only the two items that project the legacy
+// preview fingerprint carry that preview's own gate.
+#[allow(dead_code)]
+pub(crate) mod migration;
 // Test-only, and behind both features: it publishes an enabled scope for a test
 // that must have one, while the production enable gate stays outside this tree.
 // Nothing a `test-support` build produces is part of a product assembly.

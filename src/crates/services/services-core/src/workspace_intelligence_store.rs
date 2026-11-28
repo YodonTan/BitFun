@@ -32,6 +32,13 @@
 //!   and never interprets it. A policy owner that must keep unknown payload
 //!   content merges it itself into a fresh raw read and then commits with
 //!   `Exactly(generation)`. There is no merge framework here.
+//! - `migration` is one opaque whole value owned by the caller, stored and
+//!   replaced the same way as `policy`. The one exception to "opaque" is its
+//!   outer shape: a stored `migration` that is not a JSON object, and a patch that
+//!   would store one, are explicit structural errors instead of preserved raw
+//!   content, because a decision the owning caller cannot decode must never read
+//!   as "no decision yet". The field set inside it stays the caller's contract.
+//!   An absent key means no decision was recorded; it is not a default decision.
 //! - Corrupt JSON, an unsupported schema version and structurally invalid fields
 //!   are explicit errors. Stored bytes are never reset, deleted or replaced by a
 //!   fallback.
@@ -130,6 +137,8 @@ pub enum ControlRecordFault {
     EnabledMalformed,
     /// `model_ref` is present but is not a non-blank string.
     ModelRefMalformed,
+    /// `migration` is present but is not a JSON object.
+    MigrationShapeInvalid,
 }
 
 impl ControlRecordFault {
@@ -142,6 +151,7 @@ impl ControlRecordFault {
             Self::ControlGenerationZero => "control_generation_zero",
             Self::EnabledMalformed => "enabled_malformed",
             Self::ModelRefMalformed => "model_ref_malformed",
+            Self::MigrationShapeInvalid => "migration_shape_invalid",
         }
     }
 }
@@ -214,6 +224,12 @@ pub struct WorkspaceIntelligenceControlPatch {
     /// a policy owner that must retain unknown payload content merges it into a
     /// fresh raw read and only then commits here with `Exactly(generation)`.
     pub policy: ControlFieldUpdate<Value>,
+    /// Opaque caller-owned migration decision payload, replaced as a whole.
+    ///
+    /// It must be a JSON object: the outer shape is the only part the store
+    /// checks, and a non-object `Set` is rejected before any write instead of
+    /// publishing a record every reader has to reject.
+    pub migration: ControlFieldUpdate<Value>,
 }
 
 /// Decoded authoritative control record.
@@ -231,8 +247,19 @@ pub struct WorkspaceIntelligenceControlRecord {
     pub model_ref: Option<String>,
     /// Opaque caller-owned policy payload.
     pub policy: Option<Value>,
+    /// Caller-owned migration decision payload.
+    ///
+    /// `None` means the key is absent, which reads as "no decision recorded". The
+    /// store guarantees only that a present value is a JSON object; its fields are
+    /// the caller's contract.
+    pub migration: Option<Value>,
     /// The complete decoded document, including fields this module does not
     /// model. JSON `Value` semantics, not stored bytes.
+    ///
+    /// The modeled fields are in here too, `migration` included, because this value
+    /// is the document every rewrite starts from: a patch is applied to it and the
+    /// result replaces the file. Stripping a modeled field out of it would make any
+    /// unrelated patch silently drop that field from the stored record.
     pub raw: Value,
 }
 
@@ -463,8 +490,11 @@ impl WorkspaceIntelligenceStore {
         expectation: ControlGenerationExpectation,
         patch: WorkspaceIntelligenceControlPatch,
     ) -> Result<WorkspaceIntelligenceControlWrite, WorkspaceIntelligenceStoreError> {
+        // Deriving the target path performs no IO; validating against it keeps both
+        // rejections attributable to the record the write would have published.
+        let path = self.record_path(scope)?;
         // Reject invalid write input before touching the root or the lock file.
-        validate_patch(&patch)?;
+        validate_patch(&path, &patch)?;
         // Once accepted, finish the transaction even if the caller stops awaiting
         // it. The owned task holds the JSON transaction lock until every
         // underlying file write and the strict replacement have completed.
@@ -723,12 +753,22 @@ impl WorkspaceIntelligenceStore {
             Some(_) => return Err(invalid(ControlRecordFault::ModelRefMalformed)),
         };
 
+        // The decision payload is opaque except for its outer shape: a decision the
+        // owning caller cannot decode must not read as "no decision yet", so a
+        // present non-object is a structural fault instead of preserved raw content.
+        let migration = match fields.get("migration") {
+            None => None,
+            Some(value @ Value::Object(_)) => Some(value.clone()),
+            Some(_) => return Err(invalid(ControlRecordFault::MigrationShapeInvalid)),
+        };
+
         Ok(WorkspaceIntelligenceControlRecord {
             schema_version,
             control_generation,
             enabled,
             model_ref,
             policy: fields.get("policy").cloned(),
+            migration,
             raw: document,
         })
     }
@@ -752,11 +792,23 @@ fn is_unreadable_observation(error: &WorkspaceIntelligenceStoreError) -> bool {
 /// Validates write input that would otherwise publish a record every reader has
 /// to reject, before the transaction creates its root or lock file.
 fn validate_patch(
+    path: &Path,
     patch: &WorkspaceIntelligenceControlPatch,
 ) -> Result<(), WorkspaceIntelligenceStoreError> {
     if let ControlFieldUpdate::Set(model_ref) = &patch.model_ref {
         if model_ref.trim().is_empty() {
             return Err(WorkspaceIntelligenceStoreError::BlankModelReference);
+        }
+    }
+    // The record projection rejects a non-object decision, so storing one would
+    // publish a record no reader can decode. Reported against the target path,
+    // which is derived from the opaque scope and carries no identity.
+    if let ControlFieldUpdate::Set(migration) = &patch.migration {
+        if !migration.is_object() {
+            return Err(WorkspaceIntelligenceStoreError::InvalidRecord {
+                path: path.to_path_buf(),
+                fault: ControlRecordFault::MigrationShapeInvalid,
+            });
         }
     }
     Ok(())
@@ -800,6 +852,24 @@ fn apply_patch(
         }
         ControlFieldUpdate::Clear => {
             document.remove("policy");
+        }
+    }
+
+    match &patch.migration {
+        ControlFieldUpdate::Keep => {}
+        ControlFieldUpdate::Set(migration) => {
+            // Same structural rule as the record projection: a non-object decision
+            // would publish a record no reader can decode.
+            if !migration.is_object() {
+                return Err(WorkspaceIntelligenceStoreError::InvalidRecord {
+                    path: PathBuf::new(),
+                    fault: ControlRecordFault::MigrationShapeInvalid,
+                });
+            }
+            document.insert("migration".to_string(), migration.clone());
+        }
+        ControlFieldUpdate::Clear => {
+            document.remove("migration");
         }
     }
 
@@ -1135,6 +1205,32 @@ mod tests {
         let store = store(&root);
         let scope = "workspace-a@host-1";
 
+        // Invalid write input is rejected before the root or a lock file exists. A
+        // non-object decision would publish a record no reader can decode, so it is
+        // refused here rather than stored and rejected on every later read.
+        let error = store
+            .update(
+                scope,
+                ControlGenerationExpectation::Absent,
+                WorkspaceIntelligenceControlPatch {
+                    migration: ControlFieldUpdate::Set(json!(null)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WorkspaceIntelligenceStoreError::InvalidRecord {
+                    fault: ControlRecordFault::MigrationShapeInvalid,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(!root.exists(), "a rejected decision created the sidecar root");
+
         // A compare-and-swap against a record that does not exist is rejected
         // from the lock-free precheck, so not even a lock file appears.
         for expectation in [
@@ -1349,6 +1445,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_migration_patch_replaces_the_whole_value_and_leaves_other_fields_alone() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("sidecar");
+        let store = store(&root);
+        let scope = "workspace-a@host-1";
+        let first = json!({
+            "idempotency_key": "decision-1",
+            "source": { "row_count": 0, "db_present": true },
+            "assignments": [],
+        });
+
+        // A record created without the key has no decision at all; the field is
+        // absent, which is not the same as a default decision.
+        store
+            .update(scope, ControlGenerationExpectation::Absent, enabled(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.read(scope).await.unwrap().unwrap().migration,
+            None,
+            "an absent key must decode as no decision"
+        );
+
+        let write = store
+            .update(
+                scope,
+                ControlGenerationExpectation::Exactly(1),
+                WorkspaceIntelligenceControlPatch {
+                    migration: ControlFieldUpdate::Set(first.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(write.is_applied());
+        let record = write.record().clone();
+        assert_eq!(record.control_generation, 2);
+        assert_eq!(record.migration, Some(first.clone()));
+        assert_eq!(record.raw["migration"], first);
+        assert_eq!(record.enabled, Some(true), "a migration patch keeps the switch");
+
+        // `Keep` leaves the decision alone, including an unrelated field change.
+        let write = store
+            .update(
+                scope,
+                ControlGenerationExpectation::Exactly(2),
+                enabled(false),
+            )
+            .await
+            .unwrap();
+        assert!(write.is_applied());
+        let record = write.record().clone();
+        assert_eq!(record.control_generation, 3);
+        assert_eq!(
+            record.migration,
+            Some(first),
+            "an unrelated patch must not drop the decision"
+        );
+
+        // `Set` is a whole-value replacement.
+        let write = store
+            .update(
+                scope,
+                ControlGenerationExpectation::Exactly(3),
+                WorkspaceIntelligenceControlPatch {
+                    migration: ControlFieldUpdate::Set(json!({ "idempotency_key": "decision-2" })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(write.is_applied());
+        assert_eq!(
+            write.record().migration,
+            Some(json!({ "idempotency_key": "decision-2" }))
+        );
+
+        // `Clear` removes the key instead of storing null.
+        let write = store
+            .update(
+                scope,
+                ControlGenerationExpectation::Exactly(4),
+                WorkspaceIntelligenceControlPatch {
+                    migration: ControlFieldUpdate::Clear,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(write.is_applied());
+        let record = write.record().clone();
+        assert_eq!(record.control_generation, 5);
+        assert_eq!(record.migration, None);
+        assert!(
+            !record.raw.as_object().unwrap().contains_key("migration"),
+            "clear removes the key instead of storing null"
+        );
+        assert_eq!(record.enabled, Some(false));
+    }
+
+    #[tokio::test]
+    async fn a_non_object_migration_patch_is_rejected_before_any_write() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("sidecar");
+        let store = store(&root);
+        let scope = "workspace-a@host-1";
+        let record_path = store.record_path(scope).unwrap();
+
+        store
+            .update(
+                scope,
+                ControlGenerationExpectation::Absent,
+                WorkspaceIntelligenceControlPatch {
+                    migration: ControlFieldUpdate::Set(json!({ "idempotency_key": "decision-1" })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let stored = bytes(&record_path).await;
+
+        for payload in [json!("decision"), json!([1, 2]), json!(null), json!(7)] {
+            let error = store
+                .update(
+                    scope,
+                    ControlGenerationExpectation::Exactly(1),
+                    WorkspaceIntelligenceControlPatch {
+                        migration: ControlFieldUpdate::Set(payload.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    WorkspaceIntelligenceStoreError::InvalidRecord {
+                        fault: ControlRecordFault::MigrationShapeInvalid,
+                        ..
+                    }
+                ),
+                "{payload}: {error:?}"
+            );
+            assert_eq!(bytes(&record_path).await, stored, "{payload}");
+        }
+    }
+
+    #[tokio::test]
     async fn unsupported_and_invalid_documents_error_without_touching_bytes() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join("sidecar");
@@ -1414,6 +1658,21 @@ mod tests {
                 br#"{"model_ref":42}"#,
                 Case::Fault(ControlRecordFault::ModelRefMalformed),
                 "numeric reference",
+            ),
+            (
+                br#"{"migration":"decision"}"#,
+                Case::Fault(ControlRecordFault::MigrationShapeInvalid),
+                "string decision",
+            ),
+            (
+                br#"{"migration":[{"kind":"keep_shared"}]}"#,
+                Case::Fault(ControlRecordFault::MigrationShapeInvalid),
+                "array decision",
+            ),
+            (
+                br#"{"migration":null}"#,
+                Case::Fault(ControlRecordFault::MigrationShapeInvalid),
+                "null decision",
             ),
         ];
 
@@ -1721,6 +1980,7 @@ mod tests {
                     enabled: ControlFieldUpdate::Set(true),
                     model_ref: ControlFieldUpdate::Set("workspace-model-a".to_string()),
                     policy: ControlFieldUpdate::Set(json!({ "keep": [1, 2] })),
+                    migration: ControlFieldUpdate::Keep,
                 },
             )
             .await
@@ -1735,6 +1995,7 @@ mod tests {
                     enabled: ControlFieldUpdate::Set(true),
                     model_ref: ControlFieldUpdate::Set("workspace-model-a".to_string()),
                     policy: ControlFieldUpdate::Set(json!({ "keep": [1, 2] })),
+                    migration: ControlFieldUpdate::Keep,
                 },
             )
             .await

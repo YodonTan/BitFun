@@ -9,10 +9,14 @@
 //! - which legacy rows can be attributed to a local workspace root, and which
 //!   cannot;
 //! - which hand-written notes exist and why none of them is attributable;
-//! - a stable fingerprint of the exact source the preview was built from — the row
-//!   count, every projected row field, the projected column shape and both file
-//!   trees — so a later pass can tell that the source moved and the preview is
-//!   stale.
+//! - a stable fingerprint of the source the preview was built from — the row
+//!   count, every projected row field, the projected column shape, both file trees
+//!   and whether the database existed — so a later pass can tell that the source
+//!   moved and the preview is stale. The fingerprint proves "the source is still
+//!   one this build can read the same way", not "the source is readable": an
+//!   unsupported or unreadable database projects no rows and therefore matches an
+//!   equivalent empty one, so a consumer that must not act on it reads the
+//!   diagnostics instead.
 //!
 //! It is read-only in the strict sense: it never creates a file or a directory,
 //! never repairs or recreates a schema, never drops a table, never runs a
@@ -83,19 +87,29 @@ const MAX_TREE_DEPTH: usize = 8;
 
 /// One stable fingerprint of the legacy source a preview was built from.
 ///
-/// The five parts cover the five ways the source can move, so a preview is called
-/// stale exactly when something the preview projected changed:
+/// It covers the row set, the column shape this build expects, both file trees and
+/// whether the database exists at all, so a preview is called stale exactly when
+/// something the preview projected changed:
 ///
 /// - `row_count` covers a row being added or removed;
 /// - `rows_digest` covers any projected field of an existing row being edited:
 ///   the row identifier, its raw workspace path, its source timestamp and its body;
 /// - `schema_shape` covers the projected column list changing;
 /// - `derived_tree_hash` covers the L3 derived files changing;
-/// - `notes_tree_hash` covers the L2 note files changing.
+/// - `notes_tree_hash` covers the L2 note files changing;
+/// - `db_present` covers the database itself appearing or disappearing: an absent
+///   database and an equivalent empty one project the same rows, shape and trees,
+///   so without this part they would produce the same fingerprint.
 ///
-/// Two fingerprints compare equal only when all five are equal, so an unrelated
-/// file elsewhere in the Memory root, or a path that merely looks similar, cannot
-/// make a preview look stale.
+/// `schema_shape` is a read-side constant, not an observation: it is the column
+/// list this build expects. A source whose shape is unsupported or unreadable
+/// projects no rows and therefore produces the same fingerprint as an equivalent
+/// usable empty database, so those changes are outside the fingerprint. A consumer
+/// that must not act on such a source re-reads `preview.diagnostics` before acting.
+///
+/// Two fingerprints compare equal only when all six parts are equal, so an
+/// unrelated file elsewhere in the Memory root, or a path that merely looks
+/// similar, cannot make a preview look stale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LegacySourceFingerprint {
     /// Number of L1 rows the preview saw, or zero when the database was absent
@@ -119,6 +133,13 @@ pub(crate) struct LegacySourceFingerprint {
     pub(crate) derived_tree_hash: String,
     /// Hash over the L2 note files.
     pub(crate) notes_tree_hash: String,
+    /// Whether the database file existed, whatever its content or shape.
+    ///
+    /// [`read_legacy_preview`] sets it from the `DbAbsent` diagnostic alone: a
+    /// database that exists but is unsupported or unreadable still counts as
+    /// present, because the file is what the fingerprint records, not its
+    /// readability.
+    pub(crate) db_present: bool,
 }
 
 impl LegacySourceFingerprint {
@@ -127,13 +148,19 @@ impl LegacySourceFingerprint {
     /// `rows_digest` is left empty on purpose: it is derived from the rows
     /// themselves, and [`project_preview`] is its single owner. A fingerprint built
     /// here is only observed as an argument to that function.
-    fn of_source(row_count: u64, derived_tree_hash: String, notes_tree_hash: String) -> Self {
+    fn of_source(
+        row_count: u64,
+        db_present: bool,
+        derived_tree_hash: String,
+        notes_tree_hash: String,
+    ) -> Self {
         Self {
             row_count,
             rows_digest: String::new(),
             schema_shape: EXPECTED_STAGE1_COLUMNS.join(","),
             derived_tree_hash,
             notes_tree_hash,
+            db_present,
         }
     }
 }
@@ -326,8 +353,12 @@ pub(crate) fn read_legacy_preview(db_path: &Path, memory_root: &Path) -> LegacyP
     let rows = read_rows(db_path, &mut diagnostics);
     let notes = read_notes(memory_root, &mut diagnostics);
 
+    // Only `DbAbsent` says the file was not there. An unsupported or unreadable
+    // database is a present file, which is what the fingerprint records.
+    let db_present = !diagnostics.contains(&PreviewDiagnostic::DbAbsent);
     let fingerprint = LegacySourceFingerprint::of_source(
         rows.len() as u64,
+        db_present,
         derived_tree_hash(memory_root),
         notes_tree_hash(memory_root),
     );
@@ -603,6 +634,7 @@ mod tests {
             schema_shape: EXPECTED_STAGE1_COLUMNS.join(","),
             derived_tree_hash: seed.to_string(),
             notes_tree_hash: seed.to_string(),
+            db_present: true,
         }
     }
 
@@ -784,6 +816,10 @@ mod tests {
         }));
         assert!(preview.is_stale(&LegacySourceFingerprint {
             schema_shape: "stage1_outputs".to_string(),
+            ..current.clone()
+        }));
+        assert!(preview.is_stale(&LegacySourceFingerprint {
+            db_present: !current.db_present,
             ..current
         }));
     }

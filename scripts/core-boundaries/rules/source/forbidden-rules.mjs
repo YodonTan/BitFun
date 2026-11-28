@@ -31,6 +31,7 @@ export const forbiddenContentRules = [
     'host_binding.rs',
     'host_standby.rs',
     'host_fixture.rs',
+    'migration.rs',
   ].map((file) => ({
     path: `src/crates/assembly/core/src/service/workspace_intelligence/${file}`,
     patterns: [{

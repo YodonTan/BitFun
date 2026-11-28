@@ -38,6 +38,7 @@ use serde_json::Value;
 
 use crate::infrastructure::PathManager;
 
+use super::migration::{decode_migration, MigrationDecodeError};
 use super::mode::is_idle as tier_is_idle;
 use super::{mode::*, policy::*, read_contract::*};
 
@@ -212,7 +213,9 @@ impl WorkspaceIntelligenceControl {
     ///
     /// A patch only ever names the field the mutation changes: closing the switch
     /// never clears the model reference or the policy, and opening it never
-    /// synthesizes a model reference.
+    /// synthesizes a model reference. [`ControlMutation::EnableWithMigration`] is
+    /// the one composite: it names the switch and the decision together and still
+    /// leaves the reference and the policy alone.
     pub(crate) async fn apply(
         &self,
         scope: &WorkspaceControlScope,
@@ -405,6 +408,24 @@ fn plan_mutation(
                 })),
             }
         }
+        // The payload is decoded here, not by the store: the shape contract belongs
+        // to `migration`, and a payload that is not a decision must fail as a typed
+        // control error before any record is written. Decoding does not re-run
+        // validation — validating before encoding is the confirmation surface's
+        // step, and a historical payload is not held to this build's write rules.
+        //
+        // No no-op is planned here: the decision payload is opaque to this module,
+        // so the store's own document comparison decides whether the record already
+        // holds exactly this switch and this decision.
+        ControlMutation::EnableWithMigration { migration } => {
+            decode_migration(migration)
+                .map_err(|fault| ControlError::MigrationShapeInvalid { fault })?;
+            Ok(Some(WorkspaceIntelligenceControlPatch {
+                enabled: ControlFieldUpdate::Set(true),
+                migration: ControlFieldUpdate::Set(migration.clone()),
+                ..Default::default()
+            }))
+        }
     }
 }
 
@@ -553,6 +574,19 @@ impl ControlObservation {
             && self.policy.is_closed()
             && self.policy.diagnostics().is_empty()
     }
+
+    /// The stored migration decision payload of the record this observation read.
+    ///
+    /// `None` means no record was observed, the record was unreadable, or it carries
+    /// no `migration` key — the three cases an unobserved projection already
+    /// collapses into "no decision". A present payload always is a JSON object: the
+    /// store refuses to decode one that is not. This is the same snapshot as
+    /// [`Self::mode`] and [`Self::policy`], so it must not be combined with a
+    /// generation from a different read. Its fields stay
+    /// [`super::migration`]'s contract, not this module's.
+    pub(crate) fn migration_payload(&self) -> Option<&Value> {
+        self.read.preserved.get("migration")
+    }
 }
 
 /// One typed control change.
@@ -564,6 +598,21 @@ pub(crate) enum ControlMutation {
     SetModelRef(ModelRefUpdate),
     /// Change the policy payload.
     SetPolicy(PolicyUpdate),
+    /// Open the switch and store the migration decision in one record change.
+    ///
+    /// This is one mutation, not two: a caller that enables a workspace only
+    /// because a migration decision was confirmed must not be able to publish the
+    /// switch without the decision, or the decision without the switch. The
+    /// payload is the already-encoded decision value
+    /// ([`super::migration::encode_migration`]); [`plan_mutation`] decodes it and
+    /// rejects a payload that is not a decision before anything is written, so the
+    /// call fails with [`ControlError::MigrationShapeInvalid`] instead of storing an
+    /// unreadable value. The model reference and the policy are deliberately
+    /// untouched.
+    EnableWithMigration {
+        /// Encoded migration decision, stored as the record's `migration` value.
+        migration: Value,
+    },
 }
 
 /// Explicit model-reference update.
@@ -618,6 +667,16 @@ pub(crate) enum ControlError {
     /// A blank workspace model reference is not a binding.
     #[error("workspace model reference must not be empty or blank")]
     BlankModelReference,
+    /// The migration decision payload is not a decision this build understands.
+    ///
+    /// Reported before any write: a payload that cannot be decoded must never be
+    /// stored, because a stored one would make every later read reject the record.
+    /// Only the stable fault code travels, never the offending value.
+    #[error("migration decision payload is not a readable decision: {}", .fault.as_str())]
+    MigrationShapeInvalid {
+        /// Shape fault reported by the decision decoder.
+        fault: MigrationDecodeError,
+    },
     /// The stored policy payload cannot be merged.
     #[error(transparent)]
     UnmergeablePolicy(#[from] PolicyMergeError),
@@ -630,7 +689,28 @@ pub(crate) enum ControlError {
 /// control-vs-control.
 #[cfg(test)]
 mod tests {
+    use super::super::migration::{
+        decode_migration, encode_migration, MigrationDecision, MigrationSourceFingerprint,
+    };
     use super::*;
+
+    /// One encoded migration decision, as the confirmation surface would hand it
+    /// over: an already-encoded object, not a typed value.
+    fn encoded_decision(idempotency_key: &str) -> Value {
+        encode_migration(&MigrationDecision {
+            idempotency_key: idempotency_key.to_string(),
+            decided_at_unix_ms: 1_700_000_000_000,
+            source: MigrationSourceFingerprint {
+                row_count: 2,
+                rows_digest: "rows-digest".to_string(),
+                schema_shape: "thread_id,workspace_path".to_string(),
+                derived_tree_hash: "derived".to_string(),
+                notes_tree_hash: "notes".to_string(),
+                db_present: true,
+            },
+            assignments: Vec::new(),
+        })
+    }
 
     fn host(host_id: &str, execution_domain: &str) -> HostExecutionDomainKey {
         HostExecutionDomainKey::new(host_id, execution_domain)
@@ -1034,6 +1114,7 @@ mod tests {
                     enabled: ControlFieldUpdate::Set(true),
                     model_ref: ControlFieldUpdate::Keep,
                     policy: ControlFieldUpdate::Set(stored_policy.clone()),
+                    migration: ControlFieldUpdate::Keep,
                 },
             )
             .await
@@ -1234,6 +1315,249 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enabling_with_a_migration_records_the_decision_and_keeps_the_reference() {
+        let fixture = tempfile::tempdir().expect("temp dir");
+        let root = fixture.path().join("control");
+        let host = host("host-1", "local");
+        let scope = scope_of(&host, "workspace-a");
+        let control = handle(&root, host);
+
+        // One record change carries the switch and the decision together.
+        let outcome = control
+            .apply(
+                &scope,
+                ControlGenerationExpectation::Absent,
+                ControlMutation::EnableWithMigration {
+                    migration: encoded_decision("decision-1"),
+                },
+            )
+            .await
+            .expect("creating the record with a decision must succeed");
+        let ControlMutationOutcome::Applied(snapshot) = outcome else {
+            panic!("a real creation must be applied: {outcome:?}");
+        };
+        assert_eq!(snapshot.generation, 1);
+        assert_eq!(snapshot.schema_version, Some(CONTROL_SCHEMA_VERSION));
+        assert_eq!(
+            snapshot.read.enabled,
+            Some(true),
+            "the composite must open the switch"
+        );
+        assert_eq!(snapshot.read.model_ref, None);
+        assert_eq!(
+            decode_migration(&snapshot.raw()["migration"]),
+            Ok(MigrationDecision {
+                idempotency_key: "decision-1".to_string(),
+                decided_at_unix_ms: 1_700_000_000_000,
+                source: MigrationSourceFingerprint {
+                    row_count: 2,
+                    rows_digest: "rows-digest".to_string(),
+                    schema_shape: "thread_id,workspace_path".to_string(),
+                    derived_tree_hash: "derived".to_string(),
+                    notes_tree_hash: "notes".to_string(),
+                    db_present: true,
+                },
+                assignments: Vec::new(),
+            }),
+            "the stored decision must decode back to the one that was confirmed"
+        );
+
+        // The composite never touches the workspace model reference.
+        control
+            .apply(
+                &scope,
+                ControlGenerationExpectation::Exactly(1),
+                ControlMutation::SetModelRef(ModelRefUpdate::Set("workspace-model-a".to_string())),
+            )
+            .await
+            .expect("setting the reference must succeed");
+        let outcome = control
+            .apply(
+                &scope,
+                ControlGenerationExpectation::Exactly(2),
+                ControlMutation::EnableWithMigration {
+                    migration: encoded_decision("decision-2"),
+                },
+            )
+            .await
+            .expect("replacing the decision must succeed");
+        let ControlMutationOutcome::Applied(snapshot) = outcome else {
+            panic!("a changed decision must be applied: {outcome:?}");
+        };
+        assert_eq!(snapshot.generation, 3);
+        assert_eq!(
+            snapshot.read.model_ref.as_ref().map(WorkspaceModelRef::as_str),
+            Some("workspace-model-a"),
+            "the composite must leave the reference alone"
+        );
+        assert_eq!(
+            snapshot.raw()["migration"]["idempotency_key"],
+            Value::String("decision-2".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn two_handles_enabling_with_a_migration_accept_exactly_one_decision() {
+        let fixture = tempfile::tempdir().expect("temp dir");
+        let root = fixture.path().join("control");
+        let host = host("host-1", "local");
+        let scope = scope_of(&host, "workspace-a");
+        let setup = handle(&root, host.clone());
+
+        setup
+            .apply(
+                &scope,
+                ControlGenerationExpectation::Absent,
+                ControlMutation::SetEnabled(true),
+            )
+            .await
+            .expect("creating the record must succeed");
+
+        let first = handle(&root, host.clone());
+        let second = handle(&root, host.clone());
+        let (first, second) = tokio::join!(
+            first.apply(
+                &scope,
+                ControlGenerationExpectation::Exactly(1),
+                ControlMutation::EnableWithMigration {
+                    migration: encoded_decision("decision-1"),
+                },
+            ),
+            second.apply(
+                &scope,
+                ControlGenerationExpectation::Exactly(1),
+                ControlMutation::EnableWithMigration {
+                    migration: encoded_decision("decision-2"),
+                },
+            ),
+        );
+
+        let mut applied = 0;
+        let mut winner = String::new();
+        let mut stale = 0;
+        for result in [first, second] {
+            match result {
+                Ok(ControlMutationOutcome::Applied(snapshot)) => {
+                    applied += 1;
+                    assert_eq!(snapshot.generation, 2);
+                    winner = snapshot.raw()["migration"]["idempotency_key"]
+                        .as_str()
+                        .expect("the applied decision carries its key")
+                        .to_string();
+                }
+                Err(ControlError::StaleGeneration { expected, actual }) => {
+                    stale += 1;
+                    assert_eq!(expected, ControlGenerationExpectation::Exactly(1));
+                    assert_eq!(actual, ControlGenerationExpectation::Exactly(2));
+                }
+                other => panic!("unexpected control result: {other:?}"),
+            }
+        }
+        assert_eq!((applied, stale), (1, 1));
+
+        // Exactly one decision was published, and the losing decision is nowhere in
+        // the record: a competing confirmation is never merged.
+        let observation = setup
+            .observe(&scope, CapabilityDelivery::Delivered, panic_resolver)
+            .await
+            .expect("the record must be observable");
+        assert_eq!(observation.mode.tier, WorkspaceIntelligenceTier::Baseline);
+        assert_eq!(observation.read.enabled, Some(true));
+        assert_eq!(
+            observation.read.preserved["migration"]["idempotency_key"],
+            Value::String(winner)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_migration_payload_is_refused_before_any_write() {
+        let fixture = tempfile::tempdir().expect("temp dir");
+        let root = fixture.path().join("control");
+        let host = host("host-1", "local");
+        let control = handle(&root, host.clone());
+        let scope = scope_of(&host, "workspace-a");
+
+        let cases = [
+            // Not an object at all.
+            (serde_json::json!("decision"), "wrong_type"),
+            // An object that carries none of the decision fields.
+            (serde_json::json!({ "idempotency_key": "decision-1" }), "missing_field"),
+        ];
+        for (payload, expected) in cases {
+            let error = control
+                .apply(
+                    &scope,
+                    ControlGenerationExpectation::Absent,
+                    ControlMutation::EnableWithMigration {
+                        migration: payload.clone(),
+                    },
+                )
+                .await
+                .expect_err("an undecodable payload must be refused");
+            let ControlError::MigrationShapeInvalid { fault } = error else {
+                panic!("{payload}: a shape fault must be typed as one: {error}");
+            };
+            assert_eq!(fault.as_str(), expected, "{payload}");
+            assert!(
+                !root.exists(),
+                "{payload}: a refused decision must not create the control root"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_identical_migration_replay_is_unchanged() {
+        let fixture = tempfile::tempdir().expect("temp dir");
+        let root = fixture.path().join("control");
+        let host = host("host-1", "local");
+        let control = handle(&root, host.clone());
+        let scope = scope_of(&host, "workspace-a");
+        let mutation = ControlMutation::EnableWithMigration {
+            migration: encoded_decision("decision-1"),
+        };
+
+        let outcome = control
+            .apply(
+                &scope,
+                ControlGenerationExpectation::Absent,
+                mutation.clone(),
+            )
+            .await
+            .expect("the first confirmation must be applied");
+        let ControlMutationOutcome::Applied(snapshot) = outcome else {
+            panic!("a real creation must be applied: {outcome:?}");
+        };
+        assert_eq!(snapshot.generation, 1);
+        let record_path = single_record_path(&root);
+        let stored = std::fs::read(&record_path).expect("the record bytes must be readable");
+
+        // Replaying the same decision — the same key, the same payload — must not
+        // rewrite the record and must not advance the generation.
+        let outcome = control
+            .apply(
+                &scope,
+                ControlGenerationExpectation::Exactly(1),
+                mutation,
+            )
+            .await
+            .expect("a replay must be answered, not rejected");
+        let ControlMutationOutcome::Unchanged { observed } = outcome else {
+            panic!("an identical decision must be unchanged: {outcome:?}");
+        };
+        let observed = observed.expect("the stored record must be part of the answer");
+        assert_eq!(observed.generation, 1);
+        assert_eq!(
+            observed.raw()["migration"]["idempotency_key"],
+            Value::String("decision-1".to_string())
+        );
+        assert_eq!(
+            std::fs::read(&record_path).expect("the record bytes must still be readable"),
+            stored,
+            "an unchanged replay must leave the stored bytes identical"
+        );
+    }
+
+    #[tokio::test]
     async fn a_stale_expectation_conflicts_even_when_the_desired_state_is_current() {
         let fixture = tempfile::tempdir().expect("temp dir");
         let root = fixture.path().join("control");
@@ -1400,6 +1724,7 @@ mod tests {
                             "collaboration": { "enabled": false },
                         },
                     })),
+                    migration: ControlFieldUpdate::Keep,
                 },
             )
             .await
@@ -1432,6 +1757,7 @@ mod tests {
                     enabled: ControlFieldUpdate::Set(true),
                     model_ref: ControlFieldUpdate::Set("workspace-model-a".to_string()),
                     policy: ControlFieldUpdate::Set(policy),
+                    migration: ControlFieldUpdate::Keep,
                 },
             )
             .await
@@ -1569,6 +1895,7 @@ mod tests {
                     enabled: ControlFieldUpdate::Set(true),
                     model_ref: ControlFieldUpdate::Keep,
                     policy: ControlFieldUpdate::Set(closed_policy()),
+                    migration: ControlFieldUpdate::Keep,
                 },
             )
             .await

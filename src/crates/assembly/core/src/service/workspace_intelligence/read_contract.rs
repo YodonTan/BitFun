@@ -73,6 +73,11 @@ pub(crate) struct ControlRecordRead {
     /// and fields of an unrecognized schema version stay present and unrewritten
     /// in this in-memory projection, so `preserved == raw`.
     ///
+    /// The stored migration decision payload is consumed from here as well: a
+    /// typed observation reads it through
+    /// `ControlObservation::migration_payload`, which is the same snapshot as the
+    /// rest of this projection.
+    ///
     /// This is not byte-level preservation and proves nothing about stored bytes
     /// or a full store round trip; the authoritative record store in a later
     /// phase owns those.

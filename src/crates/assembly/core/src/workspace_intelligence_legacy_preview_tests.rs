@@ -170,9 +170,53 @@ fn an_absent_database_is_reported_and_never_created() {
     assert!(preview.attributed.is_empty());
     assert!(preview.unattributed.is_empty());
     assert_eq!(preview.source.row_count, 0);
+    assert!(!preview.source.db_present);
     assert!(!db_path.exists());
     assert!(!memory_root.exists());
     assert!(!ad_hoc_notes_dir(&memory_root).exists());
+}
+
+/// An absent database and an equivalent empty one project the same rows, shape and
+/// trees, so only the presence bit can tell them apart — and it must.
+#[test]
+fn an_absent_database_is_distinguishable_from_an_equivalent_empty_one() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let absent_db = root.path().join("absent-memories.sqlite");
+    let present_db = root.path().join("present-memories.sqlite");
+    let memory_root = root.path().join("memories");
+
+    let empty = create_memory_db(&present_db);
+    let present_rows: i64 = empty
+        .query_row("SELECT COUNT(*) FROM stage1_outputs", [], |row| row.get(0))
+        .expect("count the fixture rows");
+    assert_eq!(present_rows, 0, "the fixture must be an empty database");
+    drop(empty);
+
+    let absent = read_legacy_preview(&absent_db, &memory_root);
+    let present = read_legacy_preview(&present_db, &memory_root);
+
+    assert!(absent.diagnostics.contains(&PreviewDiagnostic::DbAbsent));
+    assert!(!present
+        .diagnostics
+        .contains(&PreviewDiagnostic::DbAbsent));
+
+    // Everything except the presence bit matches.
+    assert_eq!(absent.source.row_count, present.source.row_count);
+    assert_eq!(absent.source.rows_digest, present.source.rows_digest);
+    assert_eq!(absent.source.schema_shape, present.source.schema_shape);
+    assert_eq!(
+        absent.source.derived_tree_hash,
+        present.source.derived_tree_hash
+    );
+    assert_eq!(absent.source.notes_tree_hash, present.source.notes_tree_hash);
+    assert!(!absent.source.db_present);
+    assert!(present.source.db_present);
+    assert_ne!(absent.source, present.source);
+
+    // A preview taken on the missing database recognizes that the source moved
+    // once the database exists, even though it is still empty.
+    assert!(absent.is_stale(&present.source));
+    assert!(!present.is_stale(&present.source));
 }
 
 #[test]
@@ -206,6 +250,8 @@ fn an_unsupported_schema_is_reported_without_repair_or_drop() {
     assert!(preview.attributed.is_empty());
     assert!(preview.unattributed.is_empty());
     assert_eq!(preview.source.row_count, 0);
+    // The file exists; it is only its shape that is unsupported.
+    assert!(preview.source.db_present);
 
     let connection = Connection::open(&db_path).expect("reopen the memory database");
     let tables: i64 = connection
