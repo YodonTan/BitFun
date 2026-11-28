@@ -130,11 +130,19 @@
 //! redacted Debug. The lease lives in the caller's future, not inside the
 //! control-read blocking task, so cancelling the future releases tenure and the
 //! detached blocking work can only observe or release, never write. There is
-//! deliberately no public way to take the lease out: a later promotion consumes
-//! this handle inside this crate, so the same lease is moved between steps instead
-//! of being dropped and re-acquired, which is what keeps "never enable while
-//! waiting" intact. Promote - the OFF-to-ON write that would reuse this lease - is
-//! deliberately NOT implemented here.
+//! deliberately no public way to take the lease out: the promotion consumes this
+//! handle, so the same lease is moved between steps instead of being dropped and
+//! re-acquired, which is what keeps "never enable while waiting" intact.
+//!
+//! Promotion. [`InitialEnableReservation::promote`] is the OFF-to-ON write that
+//! reuses this lease, and it is the only write this module performs. It is
+//! reachable only from a handle [`InitialEnableReservation::reserve`] returned, so
+//! no caller can reach the enabling write without the pre-held tenure and the
+//! verified snapshot that reservation took. It writes the switch and the caller's
+//! opaque decision payload in ONE compare-and-swap against the generation this
+//! handle itself verified, then advances the incarnation under the same lease
+//! through the normal governed fence. It has no other entry point, takes no
+//! `allow_off`-style switch, and never stores a tenure marker of its own.
 
 use crate::exclusive_file_lease::{ExclusiveFileLease, ExclusiveFileLeaseError};
 use crate::workspace_intelligence_cognition::scope_digest;
@@ -143,6 +151,7 @@ use crate::workspace_intelligence_commit::{
     WorkspaceIntelligenceCommitError, WorkspaceIntelligenceCommitGate,
 };
 use crate::workspace_intelligence_store::{
+    ControlFieldUpdate, ControlGenerationExpectation, WorkspaceIntelligenceControlPatch,
     WorkspaceIntelligenceControlRecord, WorkspaceIntelligenceStore, WorkspaceIntelligenceStoreError,
 };
 use std::path::PathBuf;
@@ -637,6 +646,64 @@ pub(crate) enum VerifiedInitialAuthority {
     Present(GovernedCommitAuthority),
 }
 
+/// Outcome of one promotion of a held reservation.
+///
+/// `Promoted` carries live tenure, so dropping it releases the scope lease exactly
+/// like dropping a [`GovernedClaim`]. The manual `Debug` withholds it: a log line
+/// must not turn a promotion result into a path or scope handle.
+pub enum PromotionOutcome {
+    /// The switch and the decision are stored and the incarnation advanced under
+    /// the same lease this reservation held.
+    Promoted(GovernedClaim),
+    /// Typed refusal. The lease is released when this value is returned, so a
+    /// refused promotion leaves no tenure behind.
+    Refused(PromotionRefusal),
+}
+
+impl std::fmt::Debug for PromotionOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Promoted(_) => f.debug_tuple("Promoted").field(&"<redacted>").finish(),
+            Self::Refused(refusal) => f.debug_tuple("Refused").field(refusal).finish(),
+        }
+    }
+}
+
+/// Why one promotion was refused. Stable codes only; no variant carries a path,
+/// a scope or a stored value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotionRefusal {
+    /// The patch is not exactly `Set(true)` on the switch with the reference and the
+    /// policy kept, or the caller's generation belief is not the one this handle
+    /// verified. Decided with no IO.
+    NotAnEnable,
+    /// The record already reads enabled, so this promotion is a stale replay.
+    AlreadyEnabled,
+    /// The record is no longer the generation-and-policy snapshot this handle
+    /// verified, including a compare-and-swap lost to another writer.
+    AuthorityChanged,
+    /// The switch was stored, and the governed fence then refused to advance the
+    /// incarnation. Not an error and not a rollback: the write is durable, and the
+    /// caller decides by variant. `StaleIncarnation` is the transient one — the
+    /// incarnation simply moved, so the normal ON path re-claims the scope — while
+    /// every other refusal means the record the fence observed is no longer the one
+    /// this promotion wrote, which a caller must treat as an authority change rather
+    /// than as a completed enable.
+    Fence(GovernedClaimRefusal),
+}
+
+impl PromotionRefusal {
+    /// Stable machine-readable code for logs and diagnostics.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotAnEnable => "not_an_enable",
+            Self::AlreadyEnabled => "already_enabled",
+            Self::AuthorityChanged => "authority_changed",
+            Self::Fence(refusal) => refusal.code(),
+        }
+    }
+}
+
 /// Sealed single-purpose pre-held lease for one initial-enable preparation.
 ///
 /// Fields are private, there is no public constructor, no Clone and no
@@ -833,6 +900,174 @@ impl InitialEnableReservation {
             InitialEnableExpectation::Present { control_generation: expected, policy: expected_policy } => {
                 control_generation == *expected && policy == expected_policy.as_ref()
             }
+        }
+    }
+
+    /// The one OFF-to-ON write of this module, taken from a held reservation.
+    ///
+    /// Fixed order, in this sequence and no other:
+    ///
+    /// 1. `patch.enabled` must be exactly `Set(true)`. Anything else is
+    ///    [`PromotionRefusal::NotAnEnable`], decided with no IO at all; the handle
+    ///    is then simply dropped, which releases the lease.
+    /// 2. The caller's `expectation` must describe what this handle itself
+    ///    verified: `Absent` only against an absent observation, `Exactly(g)` only
+    ///    against the generation `g` this handle observed and re-checked. A caller
+    ///    therefore cannot use this tenure to write a generation it never
+    ///    verified.
+    /// 3. The namespace. The lease path is re-derived from the passed lease root and
+    ///    compared with the leased inode this handle holds, and the control root is
+    ///    compared with the one it verified. Both are decided from facts this handle
+    ///    already owns, so a caller that passes other roots is refused before
+    ///    anything is written: that is a call-site error, not a lost race, so it is
+    ///    an error rather than a refusal.
+    /// 4. One lock-free read refuses a record that already reads enabled
+    ///    ([`PromotionRefusal::AlreadyEnabled`]), and a record whose five-field
+    ///    projection is no longer the one this handle verified
+    ///    ([`PromotionRefusal::AuthorityChanged`]).
+    /// 5. The compare-and-swap. A lost race is the same `AuthorityChanged`,
+    ///    because the generation this handle verified is gone; every other store
+    ///    error is propagated unchanged.
+    /// 6. The governed fence advances the incarnation under the SAME lease, with
+    ///    the binding rebuilt from these roots, this scope and this lease path. A
+    ///    fence refusal leaves the control record ON and is reported as
+    ///    [`PromotionRefusal::Fence`]; the scope is then re-claimed by the normal ON
+    ///    path, so that refusal is an outcome, not an error.
+    ///
+    /// The control write is taken strictly outside the control record's guard:
+    /// `WorkspaceIntelligenceStore::update` owns its own cross-process lock and its
+    /// own task, so holding that guard across it would wait on the very lock the
+    /// promotion needs. Nothing in this function holds the guard.
+    ///
+    /// The roots are passed in because this handle deliberately stores no lease
+    /// root and no cognition root. Steps 1 to 3 are pure, which is what makes
+    /// "nothing is written unless this tenure belongs to these roots" true rather
+    /// than merely intended.
+    pub async fn promote(
+        self,
+        control: &WorkspaceIntelligenceStore,
+        cognition_root: PathBuf,
+        lease_root: PathBuf,
+        expectation: ControlGenerationExpectation,
+        patch: WorkspaceIntelligenceControlPatch,
+    ) -> Result<PromotionOutcome, WorkspaceIntelligenceClaimError> {
+        if patch.enabled != ControlFieldUpdate::Set(true) {
+            return Ok(PromotionOutcome::Refused(PromotionRefusal::NotAnEnable));
+        }
+        // `EnableWithMigration` is exactly "open the switch, keep the rest": a caller
+        // that also replaces the reference or the policy is not asking for this
+        // transition at all, and is refused before the roots are even inspected.
+        if patch.model_ref != ControlFieldUpdate::Keep || patch.policy != ControlFieldUpdate::Keep {
+            return Ok(PromotionOutcome::Refused(PromotionRefusal::NotAnEnable));
+        }
+        if !self.expectation_is_the_verified_one(&expectation) {
+            return Ok(PromotionOutcome::Refused(PromotionRefusal::NotAnEnable));
+        }
+        let digest =
+            scope_digest(&self.scope).map_err(WorkspaceIntelligenceCommitError::Cognition)?;
+        let lease_path = lease_root.join(format!("{digest}.lock"));
+        if lease_path.as_os_str() != self.lease.lock_path().as_os_str() {
+            return Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
+                operation: "promote_lease_path",
+            });
+        }
+        if control.control_root().as_os_str() != self.control_root.as_os_str() {
+            return Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
+                operation: "promote_control_root",
+            });
+        }
+        let observed = control.read(&self.scope).await?;
+        if observed.as_ref().is_some_and(|record| record.enabled == Some(true)) {
+            return Ok(PromotionOutcome::Refused(PromotionRefusal::AlreadyEnabled));
+        }
+        let observed_projection = observed.map(GovernedCommitAuthority::project);
+        if observed_projection.as_ref() != self.verified_present() {
+            return Ok(PromotionOutcome::Refused(PromotionRefusal::AuthorityChanged));
+        }
+        match control.update(&self.scope, expectation, patch).await {
+            Ok(_written) => {}
+            Err(WorkspaceIntelligenceStoreError::ControlGenerationConflict { .. }) => {
+                return Ok(PromotionOutcome::Refused(PromotionRefusal::AuthorityChanged));
+            }
+            Err(error) => return Err(WorkspaceIntelligenceClaimError::Control(error)),
+        }
+        #[cfg(test)]
+        if let Some(pause) = tests::after_promote_update_pause(control.control_root()) {
+            tests::wait_reservation_pause(&pause).await;
+        }
+        let gate = WorkspaceIntelligenceCommitGate::new(control.clone(), cognition_root);
+        #[cfg(test)]
+        let gate = tests::install_claim_pauses(gate);
+        let Some(snapshot) = gate.observe(&self.scope).await? else {
+            return Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
+                operation: "promote_observe",
+            });
+        };
+        // Defensive: step 4 just stored the switch, so a record that does not read
+        // enabled here means the write was already replaced by another writer.
+        if snapshot.authority().enabled() != Some(true) {
+            return Ok(PromotionOutcome::Refused(PromotionRefusal::AuthorityChanged));
+        }
+        let control_root = self.control_root;
+        let binding = ClaimLeaseBinding::bind(
+            Arc::new(self.lease),
+            control_root,
+            gate.cognition_root().to_path_buf(),
+            self.scope.clone(),
+            lease_path,
+        );
+        match gate
+            .commit_governed(&snapshot, GovernedFenceOperation::AdvanceIncarnation, &binding)
+            .await?
+        {
+            GovernedFenceOutcome::Advanced(advance) => {
+                let ticket = OriginTicket {
+                    scope: self.scope.clone(),
+                    control_root: gate.control_root().to_path_buf(),
+                    cognition_root: gate.cognition_root().to_path_buf(),
+                    lease_path: binding.lease_path().to_path_buf(),
+                    token: advance.token.clone(),
+                };
+                Ok(PromotionOutcome::Promoted(GovernedClaim {
+                    gate,
+                    binding,
+                    scope: self.scope,
+                    token: advance.token,
+                    ticket,
+                }))
+            }
+            GovernedFenceOutcome::Refused(refusal) => {
+                Ok(PromotionOutcome::Refused(PromotionRefusal::Fence(refusal)))
+            }
+            // Only the incarnation advance was requested, so every other outcome is
+            // named here instead of being folded into a wildcard.
+            GovernedFenceOutcome::Verified { .. }
+            | GovernedFenceOutcome::CursorAdvanced(_)
+            | GovernedFenceOutcome::CursorConflict => {
+                Err(WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
+                    operation: "promote_advance_incarnation",
+                })
+            }
+        }
+    }
+
+    /// The projection this handle verified, or `None` for a verified absence.
+    fn verified_present(&self) -> Option<&GovernedCommitAuthority> {
+        match &self.authority {
+            VerifiedInitialAuthority::Absent => None,
+            VerifiedInitialAuthority::Present(authority) => Some(authority),
+        }
+    }
+
+    /// True when the caller's stated generation is the one this handle verified.
+    fn expectation_is_the_verified_one(&self, expectation: &ControlGenerationExpectation) -> bool {
+        match (&self.authority, expectation) {
+            (VerifiedInitialAuthority::Absent, ControlGenerationExpectation::Absent) => true,
+            (
+                VerifiedInitialAuthority::Present(authority),
+                ControlGenerationExpectation::Exactly(expected),
+            ) => *expected == authority.control_generation(),
+            _ => false,
         }
     }
 }
@@ -1833,6 +2068,12 @@ mod tests {
             other => panic!("expected a reservation: {other:?}"),
         }
     }
+
+    /// A handle verified against an absent record, which is what the first
+    /// confirmation starts from.
+    async fn reserved_absent(base: &Path) -> InitialEnableReservation {
+        reserved(reserve(base, SCOPE, InitialEnableExpectation::Absent).await)
+    }
     fn refused_reservation(outcome: InitialEnableAttempt, reason: InitialEnableRefusal) {
         assert!(matches!(outcome, InitialEnableAttempt::Refused(actual) if actual == reason), "{outcome:?}");
     }
@@ -1907,10 +2148,51 @@ mod tests {
         }
     }
 
+    // The same registry for the window a promotion has already written the record
+    // and has not reached its fence yet. That window is the only place a control
+    // write from another writer can land between the promotion's own write and the
+    // fence's observation, so the fence's refusal for an already-replaced record is
+    // only reachable through this hook.
+    static AFTER_PROMOTE_UPDATE_PAUSES: std::sync::Mutex<
+        Vec<(PathBuf, crate::workspace_intelligence_commit::TestPause)>,
+    > = std::sync::Mutex::new(Vec::new());
+    struct AfterPromoteUpdatePauseRegistration(PathBuf);
+    impl Drop for AfterPromoteUpdatePauseRegistration {
+        fn drop(&mut self) {
+            AFTER_PROMOTE_UPDATE_PAUSES
+                .lock()
+                .unwrap()
+                .retain(|entry| entry.0.as_os_str() != self.0.as_os_str());
+        }
+    }
+    fn register_after_promote_update_pause(base: &Path) -> (
+        AfterPromoteUpdatePauseRegistration,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        ReleasePause,
+    ) {
+        let root = base.join("control");
+        let (hook, receiver, release) = pause();
+        AFTER_PROMOTE_UPDATE_PAUSES
+            .lock()
+            .unwrap()
+            .push((root.clone(), hook));
+        (AfterPromoteUpdatePauseRegistration(root), receiver, release)
+    }
+    pub(super) fn after_promote_update_pause(
+        control_root: &Path,
+    ) -> Option<crate::workspace_intelligence_commit::TestPause> {
+        AFTER_PROMOTE_UPDATE_PAUSES
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|entry| entry.0.as_os_str() == control_root.as_os_str())
+            .map(|entry| entry.1.clone())
+    }
+
     #[tokio::test]
     async fn a_truly_absent_scope_is_reserved_without_a_control_record_or_partition() {
         let tmp = tempfile::tempdir().unwrap();
-        let reservation = reserved(reserve(tmp.path(), SCOPE, InitialEnableExpectation::Absent).await);
+        let reservation = reserved_absent(tmp.path()).await;
         assert_eq!(reservation.scope(), SCOPE);
         // The tenure is the exact inode the claim lifecycle derives for the scope.
         assert_eq!(reservation.lease_path(), lease_path(tmp.path()));
@@ -1936,7 +2218,7 @@ mod tests {
     #[tokio::test]
     async fn reserving_before_the_anchor_leaves_a_control_lock_the_mint_counts() {
         let tmp = tempfile::tempdir().unwrap();
-        let reservation = reserved(reserve(tmp.path(), SCOPE, InitialEnableExpectation::Absent).await);
+        let reservation = reserved_absent(tmp.path()).await;
         let control_root = tmp.path().join("control");
         let entries: Vec<String> = std::fs::read_dir(&control_root).unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -2046,7 +2328,7 @@ mod tests {
         assert!(!tmp.path().join("control").exists());
         assert!(!tmp.path().join("cognition").exists());
         drop(holder);
-        let reservation = reserved(reserve(tmp.path(), SCOPE, InitialEnableExpectation::Absent).await);
+        let reservation = reserved_absent(tmp.path()).await;
         drop(reservation);
         assert!(!control_path(tmp.path()).exists());
         assert_no_partition(tmp.path());
@@ -2229,7 +2511,7 @@ mod tests {
     #[tokio::test]
     async fn reservation_debug_is_fully_redacted() {
         let tmp = tempfile::tempdir().unwrap();
-        let reservation = reserved(reserve(tmp.path(), SCOPE, InitialEnableExpectation::Absent).await);
+        let reservation = reserved_absent(tmp.path()).await;
         let digest = scope_digest(SCOPE).unwrap();
         let debug = format!("{reservation:?}");
         assert_eq!(debug, "InitialEnableReservation { tenure: \"<redacted>\", .. }");
@@ -2267,8 +2549,7 @@ mod tests {
             "pub fn authority",
             "pub fn snapshot",
             "pub fn verified",
-            // The later OFF-to-ON step is not this slice's, in any spelling.
-            "fn promote",
+            // No second enabling entry point, in any spelling.
             "fn enable(",
             "fn activate(",
         ] {
@@ -2295,19 +2576,46 @@ mod tests {
         // `ClaimLeaseBinding`'s crate-internal accessor is a different type.
         assert_eq!(production.matches("#[cfg(test)]\n    fn lease_path(&self)").count(), 1);
         assert!(production.contains("#[cfg(test)]\n    fn lease_path(&self)"));
-        // The reservation path can never write control, cognition or tenure state.
+        // The write surface is exactly one function, and it is the last item of
+        // this handle: everything ABOVE it, from the struct to the verified-snapshot
+        // helpers, still cannot write control, cognition or tenure state.
+        let mut parts = section.split("pub async fn promote(");
+        let before = parts.next().unwrap();
+        let promote = parts.next().expect("the promotion entry point must exist");
+        assert!(parts.next().is_none(), "exactly one promotion entry point");
         for forbidden in [".update(", "commit_governed", "advance_incarnation", "advance_cursor", "initialize(", "ControlFieldUpdate"] {
-            assert!(!section.contains(forbidden), "the reservation must not write: {forbidden}");
+            assert!(!before.contains(forbidden), "the reservation must not write: {forbidden}");
         }
+        // Inside the promotion the allowed writes are named exactly once each, and
+        // the two that must never appear here at all stay out.
+        assert_eq!(promote.matches("control.update(").count(), 1);
+        assert_eq!(promote.matches("commit_governed(").count(), 1);
+        assert_eq!(promote.matches("AdvanceIncarnation").count(), 1);
+        assert!(!promote.contains("advance_cursor"));
+        assert!(!promote.contains("initialize("));
+        // Consumption only: the promotion takes the handle by value, so no caller
+        // can promote twice with one lease.
+        assert!(
+            production.contains("pub async fn promote(\n        self,"),
+            "promote must consume the handle"
+        );
+        assert!(!production.contains("pub async fn promote(&self"));
+        assert!(!production.contains("pub async fn promote(self: &"));
         // The hard gate on the normal lifecycle is untouched: both claim entry
-        // points still require an observed enabled-true authority.
-        assert_eq!(production.matches("if snapshot.authority().enabled() != Some(true)").count(), 2);
+        // points still require an observed enabled-true authority, and the
+        // promotion re-checks the same fact after its own write.
+        assert_eq!(
+            production
+                .matches("if snapshot.authority().enabled() != Some(true)")
+                .count(),
+            3
+        );
     }
 
     #[tokio::test]
     async fn the_handle_carries_the_absent_snapshot_it_verified() {
         let tmp = tempfile::tempdir().unwrap();
-        let reservation = reserved(reserve(tmp.path(), SCOPE, InitialEnableExpectation::Absent).await);
+        let reservation = reserved_absent(tmp.path()).await;
         // Same-call provenance: scope, control root, lease and snapshot all come
         // from this one `reserve` call.
         assert_eq!(reservation.scope(), SCOPE);
@@ -2457,8 +2765,338 @@ mod tests {
         ));
         assert_eq!(
             production.matches("GovernedFenceOutcome::CursorConflict").count(),
-            5,
-            "four impossible-case arms plus the one real cursor-conflict arm"
+            6,
+            "four impossible-case arms, the one real cursor-conflict arm, and the promote arm"
+        );
+    }
+
+    // Promotion: the one OFF-to-ON write, taken from a held reservation.
+
+    /// The roots a promotion is handed. They are the same namespaces `attempt`,
+    /// `reserve` and `db` use, so a test cannot accidentally promote into another
+    /// namespace.
+    fn cognition(base: &Path) -> PathBuf { base.join("cognition") }
+    fn leases(base: &Path) -> PathBuf { base.join("leases") }
+
+    fn promote_patch() -> WorkspaceIntelligenceControlPatch {
+        WorkspaceIntelligenceControlPatch {
+            enabled: ControlFieldUpdate::Set(true),
+            migration: ControlFieldUpdate::Set(promote_decision()),
+            ..Default::default()
+        }
+    }
+
+    fn promote_decision() -> serde_json::Value {
+        serde_json::json!({"idempotency_key": "decision-1"})
+    }
+
+    async fn promote(
+        base: &Path, reservation: InitialEnableReservation,
+        expectation: ControlGenerationExpectation, patch: WorkspaceIntelligenceControlPatch,
+    ) -> Result<PromotionOutcome, WorkspaceIntelligenceClaimError> {
+        reservation
+            .promote(&control(base), cognition(base), leases(base), expectation, patch)
+            .await
+    }
+
+    fn promoted(outcome: PromotionOutcome) -> GovernedClaim {
+        match outcome {
+            PromotionOutcome::Promoted(claim) => claim,
+            other => panic!("expected a promotion: {other:?}"),
+        }
+    }
+
+    fn refused_promotion(outcome: PromotionOutcome, reason: PromotionRefusal) {
+        assert!(
+            matches!(outcome, PromotionOutcome::Refused(actual) if actual == reason),
+            "{outcome:?}"
+        );
+    }
+
+    /// The scope lease is free again, observed through the real OS lock instead of
+    /// a sleep.
+    async fn assert_lease_free(base: &Path) {
+        let path = lease_path(base);
+        wait_until_free(&path).await;
+    }
+
+    #[tokio::test]
+    async fn promoting_an_absent_scope_turns_it_on_and_advances_the_incarnation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reservation = reserved_absent(tmp.path()).await;
+        let held = reservation.lease_path().to_path_buf();
+        let claim = promoted(
+            promote(tmp.path(), reservation, ControlGenerationExpectation::Absent, promote_patch())
+                .await
+                .unwrap(),
+        );
+        // The same lease is carried forward, never re-acquired.
+        assert_eq!(claim.binding.lease_path(), held);
+        let record = control(tmp.path())
+            .read(SCOPE)
+            .await
+            .unwrap()
+            .expect("the switch must now be stored");
+        assert_eq!(record.enabled, Some(true));
+        assert_eq!(record.control_generation, 1);
+        assert_eq!(record.migration, Some(promote_decision()));
+        // The incarnation was minted under that same lease, so this claim's token is
+        // the stored one.
+        assert!(!claim.token.is_empty());
+        assert_eq!(stored(tmp.path(), SCOPE), claim.token);
+        // The promotion consumed the reservation: another handle is standby.
+        assert!(matches!(attempt(tmp.path(), SCOPE).await, ClaimAttempt::Standby));
+        drop(claim);
+        assert_lease_free(tmp.path()).await;
+    }
+
+    #[tokio::test]
+    async fn promoting_a_disabled_present_record_advances_its_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_disabled(tmp.path(), SCOPE, None).await;
+        let reservation = reserved(reserve(tmp.path(), SCOPE, present(1, None)).await);
+        let claim = promoted(
+            promote(
+                tmp.path(),
+                reservation,
+                ControlGenerationExpectation::Exactly(1),
+                promote_patch(),
+            )
+                .await
+                .unwrap(),
+        );
+        let record = control(tmp.path()).read(SCOPE).await.unwrap().expect("record");
+        assert_eq!(record.enabled, Some(true));
+        assert_eq!(record.control_generation, 2);
+        assert!(record.migration.is_some());
+        drop(claim);
+        assert_lease_free(tmp.path()).await;
+    }
+
+    #[tokio::test]
+    async fn a_patch_that_is_not_an_enable_is_refused_before_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_disabled(tmp.path(), SCOPE, None).await;
+        let before = control_bytes(tmp.path());
+        let reservation = reserved(reserve(tmp.path(), SCOPE, present(1, None)).await);
+        refused_promotion(
+            promote(tmp.path(), reservation, ControlGenerationExpectation::Exactly(1), patch(false))
+                .await
+                .unwrap(),
+            PromotionRefusal::NotAnEnable,
+        );
+        assert_eq!(control_bytes(tmp.path()), before, "a refused promotion writes nothing");
+        assert_no_partition(tmp.path());
+        // The refusal still released the tenure: the reservation was consumed.
+        assert_lease_free(tmp.path()).await;
+    }
+
+    #[tokio::test]
+    async fn an_expectation_the_handle_did_not_verify_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_disabled(tmp.path(), SCOPE, None).await;
+        // Verified generation is 1; the caller states 2 and absence.
+        let mismatched = [
+            ControlGenerationExpectation::Exactly(2),
+            ControlGenerationExpectation::Absent,
+        ];
+        for stated in mismatched {
+            let reservation = reserved(reserve(tmp.path(), SCOPE, present(1, None)).await);
+            refused_promotion(
+                promote(tmp.path(), reservation, stated, promote_patch()).await.unwrap(),
+                PromotionRefusal::NotAnEnable,
+            );
+            assert_lease_free(tmp.path()).await;
+        }
+        assert!(!control(tmp.path()).read(SCOPE).await.unwrap().unwrap().enabled.unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn a_record_enabled_by_another_writer_before_the_promotion_is_already_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_disabled(tmp.path(), SCOPE, None).await;
+        let reservation = reserved(reserve(tmp.path(), SCOPE, present(1, None)).await);
+        // Another writer opens the switch after the reservation decided.
+        control(tmp.path()).update(SCOPE, ControlGenerationExpectation::Exactly(1), patch(true))
+            .await.unwrap();
+        let after_other_writer = control_bytes(tmp.path());
+        refused_promotion(
+            promote(
+                tmp.path(),
+                reservation,
+                ControlGenerationExpectation::Exactly(1),
+                promote_patch(),
+            )
+                .await
+                .unwrap(),
+            PromotionRefusal::AlreadyEnabled,
+        );
+        assert_eq!(
+            control_bytes(tmp.path()),
+            after_other_writer,
+            "the promotion must not rewrite it"
+        );
+        assert_no_partition(tmp.path());
+        assert_lease_free(tmp.path()).await;
+    }
+
+    #[tokio::test]
+    async fn a_generation_moved_by_another_writer_before_the_promotion_is_authority_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_disabled(tmp.path(), SCOPE, None).await;
+        let reservation = reserved(reserve(tmp.path(), SCOPE, present(1, None)).await);
+        // A same-switch mutation still advances the generation, which is exactly the
+        // authority this handle verified.
+        control(tmp.path()).update(SCOPE, ControlGenerationExpectation::Exactly(1),
+            WorkspaceIntelligenceControlPatch {
+                model_ref: ControlFieldUpdate::Set("model-x".to_owned()), ..Default::default()
+            }).await.unwrap();
+        refused_promotion(
+            promote(
+                tmp.path(),
+                reservation,
+                ControlGenerationExpectation::Exactly(1),
+                promote_patch(),
+            )
+                .await
+                .unwrap(),
+            PromotionRefusal::AuthorityChanged,
+        );
+        let record = control(tmp.path()).read(SCOPE).await.unwrap().unwrap();
+        assert_eq!(record.enabled, Some(false), "the refused promotion must not open the switch");
+        assert_eq!(record.control_generation, 2);
+        assert!(record.migration.is_none());
+        assert_no_partition(tmp.path());
+        assert_lease_free(tmp.path()).await;
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_lease_root_is_refused_before_the_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        seed_disabled(tmp.path(), SCOPE, None).await;
+        let before = control_bytes(tmp.path());
+        let reservation = reserved(reserve(tmp.path(), SCOPE, present(1, None)).await);
+        // The handle holds this scope's lease under `tmp`, so a promotion pointed at
+        // another lease root cannot be carrying this tenure.
+        let error = reservation
+            .promote(
+                &control(tmp.path()),
+                cognition(tmp.path()),
+                elsewhere.path().join("leases"),
+                ControlGenerationExpectation::Exactly(1),
+                promote_patch(),
+            )
+            .await
+            .expect_err("another lease root is a call-site error");
+        assert!(matches!(
+            error,
+            WorkspaceIntelligenceClaimError::UnexpectedFenceOutcome {
+                operation: "promote_lease_path"
+            }
+        ));
+        // The pure check ran before any write: the record is byte identical and no
+        // partition was created.
+        assert_eq!(control_bytes(tmp.path()), before);
+        assert_no_partition(tmp.path());
+        assert_lease_free(tmp.path()).await;
+    }
+
+    #[tokio::test]
+    async fn a_record_disabled_after_the_promotion_write_is_refused_as_an_authority_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_disabled(tmp.path(), SCOPE, None).await;
+        let reservation = reserved(reserve(tmp.path(), SCOPE, present(1, None)).await);
+        let (registration, mut entered_update, release) =
+            register_after_promote_update_pause(tmp.path());
+        let base = tmp.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            promote(
+                &base,
+                reservation,
+                ControlGenerationExpectation::Exactly(1),
+                promote_patch(),
+            )
+            .await
+        });
+        entered(&mut entered_update).await;
+        // The switch the promotion just stored is taken away again before the fence
+        // looks at it. The promotion cannot retract its own write, so it must not
+        // report a promotion: its own closing observation reads the replaced record
+        // and refuses with the authority change, exactly like any other writer that
+        // moved the authority after the handle was verified.
+        control(tmp.path())
+            .update(SCOPE, ControlGenerationExpectation::Exactly(2), patch(false))
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+        drop(registration);
+        refused_promotion(
+            task.await.unwrap().unwrap(),
+            PromotionRefusal::AuthorityChanged,
+        );
+        let record = control(tmp.path()).read(SCOPE).await.unwrap().unwrap();
+        assert_eq!(record.enabled, Some(false), "the later write must stay in force");
+        assert_eq!(record.control_generation, 3);
+        assert_no_partition(tmp.path());
+        assert_lease_free(tmp.path()).await;
+    }
+
+    #[tokio::test]
+    async fn the_promotion_keeps_the_leased_inode_and_releases_it_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reservation = reserved_absent(tmp.path()).await;
+        let held = reservation.lease_path().to_path_buf();
+        let claim = promoted(
+            promote(tmp.path(), reservation, ControlGenerationExpectation::Absent, promote_patch())
+                .await
+                .unwrap(),
+        );
+        // One lease root, one inode: the promotion did not create a second one.
+        assert_eq!(lock_files(&leases(tmp.path())), vec![held.clone()]);
+        assert_eq!(claim.binding.lease_path(), held);
+        // Released only when the claim is dropped, never by the promotion.
+        assert!(matches!(attempt(tmp.path(), SCOPE).await, ClaimAttempt::Standby));
+        drop(claim);
+        assert_lease_free(tmp.path()).await;
+    }
+
+    #[tokio::test]
+    async fn promotion_debug_withholds_tenure_and_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reservation = reserved_absent(tmp.path()).await;
+        let refused = promote(
+            tmp.path(),
+            reservation,
+            ControlGenerationExpectation::Absent,
+            patch(false),
+        )
+            .await.unwrap();
+        let debug = format!("{refused:?}");
+        assert!(!debug.contains(SCOPE), "{debug}");
+        assert!(!debug.contains(&scope_digest(SCOPE).unwrap()), "{debug}");
+        assert!(!debug.contains("leases"), "{debug}");
+        assert!(!debug.contains("control"), "{debug}");
+        assert_eq!(debug, "Refused(NotAnEnable)");
+        // A promoted outcome withholds the claim entirely.
+        let reservation = reserved_absent(tmp.path()).await;
+        let claim = promoted(
+            promote(tmp.path(), reservation, ControlGenerationExpectation::Absent, promote_patch())
+                .await
+                .unwrap(),
+        );
+        let debug = format!("{:?}", PromotionOutcome::Promoted(claim));
+        assert_eq!(debug, "Promoted(\"<redacted>\")");
+    }
+
+    #[test]
+    fn promotion_refusal_codes_are_stable() {
+        assert_eq!(PromotionRefusal::NotAnEnable.code(), "not_an_enable");
+        assert_eq!(PromotionRefusal::AlreadyEnabled.code(), "already_enabled");
+        assert_eq!(PromotionRefusal::AuthorityChanged.code(), "authority_changed");
+        assert_eq!(
+            PromotionRefusal::Fence(GovernedClaimRefusal::NotEnabled).code(),
+            "not_enabled"
         );
     }
 }

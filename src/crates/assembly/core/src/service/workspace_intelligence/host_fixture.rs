@@ -363,6 +363,127 @@ pub async fn enable_workspace(
     })
 }
 
+/// Explicitly disables one already-seeded local workspace.
+///
+/// This is the OFF half of [`enable_workspace`] with the same write shape, and the
+/// state a confirmed initial enable starts from: it mints the anchor only if absent
+/// (so the scope key can be derived at all), stores `enabled = false` and, when
+/// `model_ref` is given, that reference, and never touches the migration payload.
+/// No execution binding is merged: an OFF record is admitted by the preparation
+/// through `BindingState::Absent`, so a binding would only describe facts no
+/// disabled record has yet.
+pub async fn disable_workspace(
+    paths: &PathManager,
+    workspace_id: &str,
+    model_ref: Option<&str>,
+) -> Result<SeededWorkspace, SeedError> {
+    let catalog = catalog_readonly::read_persisted_catalog(paths)
+        .await
+        .map_err(|error| SeedError::CatalogRead(error.code()))?;
+    if catalog.workspace(workspace_id).is_none() {
+        return Err(SeedError::CatalogUnsupported);
+    }
+    let anchor = HostAnchorStore::new(paths.workspace_intelligence_dir())
+        .ensure()
+        .await
+        .map_err(|error| SeedError::Anchor(error.code()))?;
+    let host_id = match anchor {
+        HostAnchorEnsure::Created(anchor) | HostAnchorEnsure::Existing(anchor) => {
+            anchor.host_id().to_owned()
+        }
+    };
+    let key = HostExecutionDomainKey::new(&host_id, LOCAL_EXECUTION_DOMAIN)
+        .ok_or(SeedError::InvalidInput)?;
+    let scope = WorkspaceControlScope::new(&key, workspace_id).ok_or(SeedError::InvalidInput)?;
+    let store = control_store(paths);
+    let stored = store
+        .read(&scope.as_str())
+        .await
+        .map_err(|_| SeedError::ControlRead("control_read_failed"))?;
+    let expectation = match &stored {
+        Some(record) => ControlGenerationExpectation::Exactly(record.control_generation),
+        None => ControlGenerationExpectation::Absent,
+    };
+    let write = store
+        .update(
+            &scope.as_str(),
+            expectation,
+            WorkspaceIntelligenceControlPatch {
+                enabled: ControlFieldUpdate::Set(false),
+                model_ref: model_ref
+                    .map(|value| ControlFieldUpdate::Set(value.to_owned()))
+                    .unwrap_or_default(),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| {
+            SeedError::ControlWrite(if error.is_conflict() {
+                "control_generation_conflict"
+            } else {
+                "control_write_failed"
+            })
+        })?;
+    let expected_ref = model_ref.map(str::to_owned);
+    match store.read(&scope.as_str()).await {
+        Ok(Some(record)) if record.enabled == Some(false) && record.model_ref == expected_ref => {}
+        _ => return Err(SeedError::ControlWrite("readback_mismatch")),
+    }
+    Ok(SeededWorkspace {
+        workspace_id: workspace_id.to_owned(),
+        generation: write.record().control_generation,
+    })
+}
+
+/// Seeds one legacy Memory source at the paths the preview reads.
+///
+/// The database is created through the memory owner's own initializer, so the
+/// fixture cannot drift from the production schema, and then `rows` ordinary L1
+/// rows are inserted. One derived file is written under the Memory root so the
+/// fingerprint has real tree content instead of an empty hash. Nothing here reads,
+/// migrates or repairs the legacy source: only the preview owner does that, and a
+/// confirmed enable compares its fingerprint.
+#[cfg(feature = "agent-runtime")]
+pub async fn seed_legacy_memory_rows(
+    paths: &Arc<PathManager>,
+    rows: usize,
+) -> Result<(), SeedError> {
+    use crate::agentic::memories::db::MemoryDatabase;
+
+    let database = MemoryDatabase::new(Arc::clone(paths));
+    database.initialize().await.map_err(|_| SeedError::CatalogWrite)?;
+    let db_path = paths.memories_database_file();
+    let connection = rusqlite::Connection::open(&db_path).map_err(|_| SeedError::CatalogWrite)?;
+    for index in 0..rows {
+        let thread_id = format!("legacy-thread-{index}");
+        connection
+            .execute(
+                "INSERT INTO stage1_outputs (thread_id, workspace_path, rollout_path, \
+                 source_updated_at, raw_memory, rollout_summary, generated_at, \
+                 selected_for_phase2) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+                rusqlite::params![
+                    thread_id,
+                    format!("/legacy/workspace-{index}"),
+                    format!("/legacy/rollout-{index}"),
+                    index as i64,
+                    format!("raw memory {index}"),
+                    format!("summary {index}"),
+                    index as i64,
+                ],
+            )
+            .map_err(|_| SeedError::CatalogWrite)?;
+    }
+    drop(connection);
+    let memory_root = paths.memories_root_dir();
+    std::fs::create_dir_all(&memory_root).map_err(|_| SeedError::CatalogWrite)?;
+    std::fs::write(
+        memory_root.join(crate::agentic::memories::workspace::MEMORY_SUMMARY_FILE_NAME),
+        "summary",
+    )
+    .map_err(|_| SeedError::CatalogWrite)?;
+    Ok(())
+}
+
 /// The authoritative control store over this host's own control root.
 fn control_store(paths: &PathManager) -> WorkspaceIntelligenceStore {
     WorkspaceIntelligenceStore::new(

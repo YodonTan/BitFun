@@ -82,6 +82,13 @@ mod workspace_intelligence_legacy_preview_tests;
     feature = "agent-runtime"
 ))]
 mod workspace_intelligence_migration_tests;
+#[cfg(all(
+    test,
+    feature = "test-support",
+    feature = "workspace-intelligence-host",
+    feature = "agent-runtime"
+))]
+mod workspace_intelligence_confirm_tests;
 
 #[cfg(feature = "remote-connect")]
 pub use openbitfun_services_integrations::remote_connect::{

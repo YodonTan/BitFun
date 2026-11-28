@@ -213,6 +213,14 @@ pub(crate) mod entries_contract;
 #[allow(dead_code)] // Consumed by its own tests and the scoped read end-to-end tests.
 #[cfg(all(feature = "workspace-intelligence-commit", feature = "agent-runtime"))]
 pub(crate) mod entries;
+// WP2.4b confirmation surface: the pure half of the one confirmed initial enable
+// (recorded-decision reconciliation and the legacy source verdict). It performs no
+// IO, so it is tested without a host; the host owns the reservation, the promotion
+// and the partition. Gated with the host owner that consumes it, and on
+// `agent-runtime` for the same reason `scoped_read_io` is.
+#[allow(dead_code)] // Consumed by the host confirm path and its integration test.
+#[cfg(all(feature = "workspace-intelligence-host", feature = "agent-runtime"))]
+pub(crate) mod confirm;
 // WP2.1 scoped read IO: it resolves the persisted host anchor and reads this host's
 // cognition partition. It needs the host slice for the anchor and the control owner,
 // so it is gated on `workspace-intelligence-host`, which already implies the

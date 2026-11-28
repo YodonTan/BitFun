@@ -716,6 +716,10 @@ mod compiled {
     use openbitfun_services_core::workspace_intelligence_store::{
         WorkspaceIntelligenceStore, WorkspaceIntelligenceStoreError,
     };
+    #[cfg(feature = "agent-runtime")]
+    use openbitfun_services_core::workspace_intelligence_store::{
+        ControlFieldUpdate, ControlGenerationExpectation, WorkspaceIntelligenceControlPatch,
+    };
     use tokio::sync::{watch, Mutex};
 
     use crate::infrastructure::PathManager;
@@ -723,6 +727,8 @@ mod compiled {
         self, PersistedCatalog, PersistedCatalogEntry, PersistedCatalogUnsupported,
         PersistedWorkspace,
     };
+    #[cfg(feature = "agent-runtime")]
+    use crate::service::workspace_intelligence::confirm::{self, ConfirmOutcome, ConfirmRefusal};
     use crate::service::workspace_intelligence::cursor::SourceId;
     use crate::service::workspace_intelligence::cursor_consumer::{
         self, ConsumerAction, SESSION_SNAPSHOT_SOURCE,
@@ -740,6 +746,12 @@ mod compiled {
     use crate::service::workspace_intelligence::policy::{ControlPolicyView, CONTROL_SCHEMA_VERSION};
     use crate::service::workspace_intelligence::scope::{
         HostExecutionDomainKey, WorkspaceControlScope,
+    };
+    #[cfg(feature = "agent-runtime")]
+    use crate::service::workspace_intelligence::legacy_preview;
+    #[cfg(feature = "agent-runtime")]
+    use crate::service::workspace_intelligence::migration::{
+        decode_migration, encode_migration, is_stale, validate_migration, MigrationDecision,
     };
 
     use super::{
@@ -832,7 +844,6 @@ mod compiled {
 
     /// One read-only observation for the future confirmed preparation owner.
     /// No `Debug`: the observations carry private identity, paths and raw policy.
-    #[allow(dead_code, reason = "only the future confirmed enable owner consumes these facts")]
     pub(super) enum InitialEnableAdmission {
         NeedsAnchor {
             workspace: PersistedWorkspace,
@@ -853,7 +864,6 @@ mod compiled {
     /// key pass as "the same record". No `Debug`: this carries private storage
     /// content verbatim.
     #[derive(PartialEq)]
-    #[allow(dead_code, reason = "only the future confirmed enable owner consumes this snapshot")]
     pub(super) struct InitialEnableRecordSnapshot {
         schema_version: Option<u32>,
         control_generation: u64,
@@ -874,7 +884,6 @@ mod compiled {
         }
     }
 
-    #[allow(dead_code, reason = "only the future confirmed enable owner consumes this snapshot")]
     #[derive(PartialEq)]
     pub(super) enum InitialEnableControl {
         /// No record was observed for this scope.
@@ -891,7 +900,6 @@ mod compiled {
         /// The candidate carries the workspace the future confirm owner selected
         /// from this host's own persisted catalog; no caller supplies a namespace,
         /// a host id or an anchor value here.
-        #[allow(dead_code, reason = "only the future confirmed enable owner consumes it")]
         pub(super) fn workspace_id(&self) -> &str {
             match self {
                 Self::NeedsAnchor { workspace } => workspace.id(),
@@ -1061,14 +1069,20 @@ mod compiled {
         reservation: Option<InitialEnableReservation>,
         /// What this preparation observed and reserved against.
         ///
-        /// Kept for the future confirmed-enable owner, which must compare a fresh
-        /// complete observation against exactly this one and never only against the
-        /// generation-plus-policy projection the reservation itself carries. It has no
-        /// accessor, crosses no boundary, authorizes nothing and is dropped with the
+        /// A confirmation compares a fresh complete observation against exactly this
+        /// one, never only against the generation-plus-policy projection the
+        /// reservation itself carries, which is why the whole record is kept. It
+        /// crosses no boundary, authorizes nothing by itself and is dropped with the
         /// slot.
-        #[allow(
-            dead_code,
-            reason = "only the future confirmed enable owner consumes this observation"
+        ///
+        /// A build without `agent-runtime` has no confirmation to compare it with, so
+        /// there it is carried and never read.
+        #[cfg_attr(
+            not(feature = "agent-runtime"),
+            allow(
+                dead_code,
+                reason = "consumed by the confirmation, which requires agent-runtime"
+            )
         )]
         observed: Option<InitialEnableObservation>,
     }
@@ -1077,9 +1091,12 @@ mod compiled {
     ///
     /// Deliberately not `Debug`: the target holds private identity and paths, and the
     /// control value holds the raw persisted document.
-    #[allow(
-        dead_code,
-        reason = "only the future confirmed enable owner consumes this observation"
+    #[cfg_attr(
+        not(feature = "agent-runtime"),
+        allow(
+            dead_code,
+            reason = "consumed by the confirmation, which requires agent-runtime"
+        )
     )]
     struct InitialEnableObservation {
         target: AdmittedTarget,
@@ -1117,6 +1134,35 @@ mod compiled {
             self.state().reservation.take()
         }
 
+        /// Takes the reservation and the observation this preparation closed against,
+        /// in one hold of the slot mutex.
+        ///
+        /// Both halves leave together or neither does: the confirmation must never pair
+        /// a reservation with somebody else's observation, and two confirmations of
+        /// the same scope race on this one critical section, so exactly one of them
+        /// walks away with a complete pair and the other reads `None` and refuses
+        /// without any IO. A revoked slot hands out nothing. The observation owns no
+        /// resource: dropping it releases nothing.
+        ///
+        /// Gated like its only caller: a build without `agent-runtime` never confirms.
+        #[cfg(feature = "agent-runtime")]
+        fn take_confirmation(
+            &self,
+        ) -> Option<(InitialEnableReservation, InitialEnableObservation)> {
+            let mut state = self.state();
+            match (state.reservation.take(), state.observed.take()) {
+                (Some(reservation), Some(observed)) => Some((reservation, observed)),
+                // A slot holding one half only is not a state any producer writes.
+                // The half that was taken is put back, so the ordinary revoke and
+                // drain paths release it; the confirmation refuses.
+                (reservation, observed) => {
+                    state.reservation = reservation;
+                    state.observed = observed;
+                    None
+                }
+            }
+        }
+
         /// Enters this host's in-flight account for one physical release.
         ///
         /// Called while this slot's mutex is held and strictly before the reservation
@@ -1125,6 +1171,12 @@ mod compiled {
         /// take, when nothing has been released yet, or after it, when the count stays
         /// up until the lease itself is gone. A slot whose host is already gone
         /// accounts for nothing.
+        ///
+        /// [`Self::revoke`] is one caller; [`TakenReservation::drop`] is the other. The
+        /// latter holds the guard without this slot's mutex, because the guard it needs
+        /// is taken at the take site and not at the release site: the confirmation's own
+        /// `_in_flight` covers the whole call, so the count stays up for the entire time
+        /// between the take and the physical release as well.
         fn release_guard(&self) -> Option<InFlight> {
             Some(InFlight::enter(self.core.upgrade()?))
         }
@@ -1183,6 +1235,42 @@ mod compiled {
     impl Drop for AbandonOnDrop {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Releases a reservation that was taken out of its slot but not consumed.
+    ///
+    /// Every early return after [`InitialEnablePendingSlot::take_reservation`] must
+    /// put the lease back on the release path, and a caller that stops awaiting the
+    /// confirmation must too: this guard makes "taken" and "released" one decision,
+    /// so no refusal and no cancellation can leave tenure behind. A consumed
+    /// reservation leaves `None` here, because the promotion owns it from then on
+    /// and drops the lease itself.
+    ///
+    /// The release is accounted exactly like [`InitialEnablePendingSlot::revoke`]:
+    /// the in-flight count is entered before the lease is physically dropped, so a
+    /// drain never observes an empty queue with a lease still open.
+    ///
+    /// The observation the preparation closed against travels with the guard, so a
+    /// cancellation drops it together with the tenure. It owns no resource, so
+    /// dropping it is not part of the release path; it is carried only because both
+    /// halves were taken out of the same slot.
+    #[cfg(feature = "agent-runtime")]
+    struct TakenReservation {
+        slot: Arc<InitialEnablePendingSlot>,
+        reservation: Option<InitialEnableReservation>,
+        observed: Option<InitialEnableObservation>,
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    impl Drop for TakenReservation {
+        fn drop(&mut self) {
+            let Some(reservation) = self.reservation.take() else {
+                return;
+            };
+            let guard = self.slot.release_guard();
+            drop(reservation);
+            drop(guard);
         }
     }
 
@@ -2814,6 +2902,49 @@ mod compiled {
         }
     }
 
+    /// Maps one host admission refusal to the confirmation vocabulary.
+    ///
+    /// Only a stable code crosses this boundary: the underlying reasons never carry
+    /// a path, a payload or anchor content, and the two states a confirmation can
+    /// act on (already enabled, authority changed) keep their own variants instead
+    /// of being flattened into a code.
+    #[cfg(feature = "agent-runtime")]
+    fn confirm_refusal_of(refusal: &InitialEnableRefusal) -> ConfirmRefusal {
+        match refusal {
+            InitialEnableRefusal::Stopping => ConfirmRefusal::Stopping,
+            InitialEnableRefusal::AlreadyEnabled => ConfirmRefusal::AlreadyEnabled,
+            InitialEnableRefusal::ControlChanged => ConfirmRefusal::ControlChanged,
+            InitialEnableRefusal::Host(reason) => ConfirmRefusal::Host(reason.code()),
+            InitialEnableRefusal::UnsupportedScope(scope) => ConfirmRefusal::Host(scope.code()),
+            InitialEnableRefusal::ReserveRefused(reason) => match reason {
+                // Both reservation refusals are already-decided facts about the
+                // record, not a storage fault.
+                ReservationRefusal::AlreadyEnabled => ConfirmRefusal::AlreadyEnabled,
+                ReservationRefusal::AuthorityChanged => ConfirmRefusal::ControlChanged,
+            },
+            InitialEnableRefusal::WorkspaceNotFound => ConfirmRefusal::Host("workspace_not_found"),
+            InitialEnableRefusal::UnrenderableWorktreeMainPath => {
+                ConfirmRefusal::Host("unrenderable_worktree_main_path")
+            }
+            InitialEnableRefusal::AnchorChanged => ConfirmRefusal::Host("anchor_changed"),
+            InitialEnableRefusal::ControlSchemaUnsupported => {
+                ConfirmRefusal::Host("control_schema_unsupported")
+            }
+            InitialEnableRefusal::ControlPolicyUnreadable => {
+                ConfirmRefusal::Host("control_policy_unreadable")
+            }
+            InitialEnableRefusal::AnchorPreparationFailed => {
+                ConfirmRefusal::Host("anchor_preparation_failed")
+            }
+            InitialEnableRefusal::AnchorNamespaceBusy => {
+                ConfirmRefusal::Host("anchor_namespace_busy")
+            }
+            InitialEnableRefusal::ReserveBusy => ConfirmRefusal::Host("reserve_busy"),
+            InitialEnableRefusal::ReserveFailed => ConfirmRefusal::Host("reserve_failed"),
+            InitialEnableRefusal::Abandoned => ConfirmRefusal::Host("abandoned"),
+        }
+    }
+
     fn unscoped_unsupported(
         reason: PersistedCatalogUnsupported,
     ) -> WorkspaceIntelligenceHostUnsupportedScope {
@@ -3151,7 +3282,6 @@ mod compiled {
         /// Preflight for the sole confirmed initial-enable preparation owner.
         /// This does not mint, adopt, reserve or authorize anything. Preparation
         /// must revalidate the live facts and stop state at its own commit gate.
-        #[allow(dead_code, reason = "the confirmed enable preparation owner is not wired yet")]
         pub(super) async fn initial_enable_admission(
             &self,
             workspace_id: &str,
@@ -3183,7 +3313,6 @@ mod compiled {
         /// schedules no background wake-up and never enables a scope. The enable
         /// order is fixed: anchor, then lease/claim, then the governed enable under
         /// the same guard as its claim; this entry point never writes an ON record.
-        #[allow(dead_code, reason = "the confirmed enable preparation owner is not wired yet")]
         pub(super) async fn prepare_initial_enable_anchor(
             &self,
             admitted: InitialEnableAdmission,
@@ -3437,7 +3566,7 @@ mod compiled {
         /// The returned permit is a queued tenure, not a grant: it proves only that
         /// this one scope is prepared, it authorizes no write, and a later consume
         /// must re-admit the workspace and re-check its authority under the lease.
-        #[allow(dead_code, reason = "the confirmed enable preparation owner is not wired yet")]
+        #[allow(dead_code, reason = "the app-facing preparation command is a later slice")]
         pub(super) async fn prepare_initial_enable(
             &self,
             workspace_id: &str,
@@ -3458,6 +3587,256 @@ mod compiled {
             match job.await {
                 Ok(result) => result,
                 Err(_) => Err(InitialEnableRefusal::AnchorPreparationFailed),
+            }
+        }
+
+        /// The one confirmed OFF-to-ON transition of one scope.
+        ///
+        /// This is the crate-internal entry point of the confirmed enable owner. It
+        /// consumes the reservation [`Self::prepare_initial_enable`] queued, so the
+        /// whole order this module documents is preserved: anchor, then reservation,
+        /// then one same-lease promotion. Nothing the caller supplies is trusted as
+        /// storage identity: the workspace id names one entry of this host's own
+        /// persisted catalog, and everything else (scope, anchor, roots, lease) is
+        /// re-derived from it.
+        ///
+        /// The confirmation re-reads before it writes, in this order:
+        ///
+        /// 1. the in-flight account, so a drain cannot declare itself complete while
+        ///    this is outstanding;
+        /// 2. the admission, so a target that is already enabled, unsupported, or
+        ///    anchored to other facts refuses here;
+        /// 3. the queued reservation, which is taken out of its slot exactly once —
+        ///    from that point every early return and every cancellation releases the
+        ///    lease through [`TakenReservation`];
+        /// 4. the observation that preparation closed against, compared with the
+        ///    admission just read: a target or a record that moved after the
+        ///    preparation refuses as [`ConfirmRefusal::ControlChanged`] instead of
+        ///    enabling the scope from stale facts;
+        /// 5. the decision itself ([`validate_migration`]);
+        /// 6. the legacy source, twice: the fingerprint the decision recorded must
+        ///    still be current, and the preview must not report a source this build
+        ///    cannot read;
+        /// 7. the control record, so a stored decision with the same idempotency key
+        ///    but a different payload refuses, while an identical decision replays;
+        /// 8. the promotion, which is the only write.
+        ///
+        /// The tenure is deliberately not kept: a successful promotion drops the
+        /// claim it returns, so the next evaluation pass claims the scope through the
+        /// normal ON path. A fence refusal leaves the control record ON and never rolls
+        /// back; which answer it produces is decided by
+        /// [`super::confirm::fence_outcome`] — a moved incarnation waits for the next
+        /// pass ([`ConfirmOutcome::EnabledPartitionPending`]) while a fence that
+        /// reports the record itself changed is [`ConfirmRefusal::ControlChanged`].
+        #[cfg(feature = "agent-runtime")]
+        #[allow(dead_code, reason = "the app-facing confirm command is a later slice")]
+        pub(crate) async fn confirm_initial_enable(
+            &self,
+            workspace_id: &str,
+            decision: MigrationDecision,
+        ) -> Result<ConfirmOutcome, ConfirmRefusal> {
+            use openbitfun_services_core::workspace_intelligence_claim::{
+                PromotionOutcome, PromotionRefusal,
+            };
+            use InitialEnableAdmission as Admission;
+
+            // Step 1: in flight from the same Book lock the drain transition is
+            // written under. The admission below reads storage, so it must not run
+            // outside this account.
+            let _in_flight = self
+                .core
+                .begin_anchor_preparation()
+                .await
+                .map_err(|refusal| confirm_refusal_of(&refusal))?;
+
+            // Step 2: the admission. A target that still needs an anchor was never
+            // prepared, because preparation always mints or adopts one.
+            let admitted = self
+                .initial_enable_admission(workspace_id)
+                .await
+                .map_err(|refusal| confirm_refusal_of(&refusal))?;
+            let Admission::Anchored { scope, control, .. } = &admitted else {
+                return Err(ConfirmRefusal::NotPrepared);
+            };
+            let scope_key = scope.as_str();
+
+            // Step 3: the queued reservation and the observation it closed against.
+            // The slot stays in the book, so a drain still sees this scope, but it no
+            // longer holds tenure: the guard below owns the release from here on.
+            let queued = {
+                let mut book = self.core.book.lock().await;
+                book.clear_released_initial_enable();
+                book.initial_enable.get(&scope_key).cloned()
+            };
+            let Some(slot) = queued else {
+                return Err(ConfirmRefusal::NotPrepared);
+            };
+            if !slot.is_live() {
+                return Err(ConfirmRefusal::NotPrepared);
+            }
+            // Two confirmations of the same scope race on one hold of the slot mutex:
+            // exactly one takes the complete pair, the other reads `None` and refuses
+            // without any IO.
+            let Some((reservation, observed)) = slot.take_confirmation() else {
+                return Err(ConfirmRefusal::NotPrepared);
+            };
+            let mut taken = TakenReservation {
+                slot,
+                reservation: Some(reservation),
+                observed: Some(observed),
+            };
+
+            #[cfg(test)]
+            if let Some(pause) = super::pauses::for_user_root_of(
+                &self.core.paths,
+                super::pauses::PausePoint::AfterConfirmTakeReservation,
+            ) {
+                pause.wait().await;
+            }
+
+            // Step 3b: the facts the preparation closed against. This is the same
+            // comparison the preparation itself makes twice — the whole admitted target,
+            // then the whole observed record — replayed against the queued observation:
+            // a target whose catalog record, root, anchor identity or binding moved, or a
+            // record that is no longer the one the preparation reserved against, refuses
+            // here instead of being enabled from stale facts. Comparing the whole record
+            // is what makes a same-generation edit to a field the generation expectation
+            // does not name refuse as well.
+            let Some(observed) = taken.observed.as_ref() else {
+                // Unreachable: `take_confirmation` hands out both halves or neither.
+                return Err(ConfirmRefusal::NotPrepared);
+            };
+            if !observed.target.holds(&admitted) || &observed.control != control {
+                return Err(ConfirmRefusal::ControlChanged);
+            }
+
+            // Step 4: the decision's own shape. This is the one place that decides
+            // whether a durable decision may be stored at all.
+            validate_migration(&decision)
+                .map_err(|error| ConfirmRefusal::InvalidDecision(error.as_str()))?;
+
+            // Step 5: the legacy source. The preview is blocking IO over SQLite and
+            // two file trees, so it runs off the async worker.
+            let preview = {
+                let database = self.core.paths.memories_database_file();
+                let memory_root = self.core.paths.memories_root_dir();
+                tokio::task::spawn_blocking(move || {
+                    legacy_preview::read_legacy_preview(&database, &memory_root)
+                })
+                .await
+                .map_err(|_| ConfirmRefusal::Internal)?
+            };
+            confirm::source_verdict(is_stale(&decision, &preview.source), &preview.diagnostics)?;
+
+            // Step 6: the record. One read supplies the switch, the stored decision
+            // and the model reference the enable must preserve.
+            let record = self
+                .core
+                .control
+                .read(&scope_key)
+                .await
+                .map_err(|error| ConfirmRefusal::Control(control_error_code(&error)))?;
+            // A stored payload this build cannot decode is never silently replaced:
+            // it is reported as the same conflict an incoming payload mismatch is.
+            let existing = match record
+                .as_ref()
+                .and_then(|record| record.migration.as_ref())
+            {
+                Some(payload) => Some(
+                    decode_migration(payload).map_err(|_| ConfirmRefusal::DecisionConflict)?,
+                ),
+                None => None,
+            };
+            let enabled = record
+                .as_ref()
+                .is_some_and(|record| record.enabled == Some(true));
+            match confirm::decide(existing.as_ref(), &decision, !enabled)? {
+                confirm::Reconcile::AlreadyConfirmed => {
+                    // Releasing the queued tenure is the only action of a replay that
+                    // is already complete.
+                    return Ok(ConfirmOutcome::AlreadyConfirmed);
+                }
+                confirm::Reconcile::Write | confirm::Reconcile::Replay => {}
+            }
+            // `EnableWithMigration` keeps the reference and the policy, so the tier
+            // the enable lands in is decided by the reference that is already stored.
+            let intelligent = record
+                .as_ref()
+                .is_some_and(|record| record.model_ref.is_some());
+            let expectation = match &record {
+                None => ControlGenerationExpectation::Absent,
+                Some(record) => ControlGenerationExpectation::Exactly(record.control_generation),
+            };
+
+            // Step 7: the promotion. The reservation is moved out of the guard first,
+            // because a consumed reservation releases its own lease.
+            let reservation = taken
+                .reservation
+                .take()
+                .expect("the guard holds the reservation until it is consumed");
+            let patch = WorkspaceIntelligenceControlPatch {
+                enabled: ControlFieldUpdate::Set(true),
+                migration: ControlFieldUpdate::Set(encode_migration(&decision)),
+                ..Default::default()
+            };
+            let outcome = reservation
+                .promote(
+                    &self.core.control,
+                    self.core.cognition_root.clone(),
+                    self.core.lease_root.clone(),
+                    expectation,
+                    patch,
+                )
+                .await;
+            match outcome {
+                Ok(PromotionOutcome::Promoted(claim)) => {
+                    // The confirmed enable does not keep the tenure: the next pass
+                    // claims the scope through the ordinary ON path, which also
+                    // initializes the partition. Dropping here releases the lease.
+                    drop(claim);
+                    let generation = match self.core.control.read(&scope_key).await {
+                        Ok(Some(record)) => record.control_generation,
+                        Ok(None) => {
+                            return Err(ConfirmRefusal::Control("control_record_missing"))
+                        }
+                        Err(error) => {
+                            return Err(ConfirmRefusal::Control(control_error_code(&error)))
+                        }
+                    };
+                    // One pass, so the scope the switch just opened is claimed and its
+                    // partition initialized without waiting for the coarse fallback.
+                    self.core.evaluate().await;
+                    Ok(ConfirmOutcome::Enabled {
+                        generation,
+                        intelligent,
+                    })
+                }
+                Ok(PromotionOutcome::Refused(PromotionRefusal::Fence(refusal))) => {
+                    // The switch is already stored, so nothing is rolled back here.
+                    // Only a moved incarnation is transient enough to wait for the
+                    // ordinary pass; a fence that reports a replaced record has to
+                    // reach the caller as a re-read instead of a completed enable.
+                    let decided = confirm::fence_outcome(refusal);
+                    warn!(
+                        "Workspace intelligence host stored the switch of one initial enable \
+                         but the governed fence refused: code={} pending={}",
+                        refusal.code(),
+                        decided.is_ok()
+                    );
+                    self.core.evaluate().await;
+                    decided
+                }
+                Ok(PromotionOutcome::Refused(PromotionRefusal::AlreadyEnabled)) => {
+                    Err(ConfirmRefusal::AlreadyEnabled)
+                }
+                // A fully formed request can only be refused here on a lost
+                // generation, which is the same authority change the record shadow
+                // reports.
+                Ok(PromotionOutcome::Refused(PromotionRefusal::AuthorityChanged))
+                | Ok(PromotionOutcome::Refused(PromotionRefusal::NotAnEnable)) => {
+                    Err(ConfirmRefusal::ControlChanged)
+                }
+                Err(error) => Err(ConfirmRefusal::Control(reserve_error_code(&error))),
             }
         }
 
@@ -3803,6 +4182,109 @@ mod compiled {
         }
     }
 
+    /// Test-only bridge for the crate-root confirmation test.
+    ///
+    /// The production preparation entry point is narrower than the crate, and the
+    /// permit type stays private to this module, so that test drives the pair
+    /// through these two methods instead of naming either. Nothing here is
+    /// reachable from a non-test build.
+    #[cfg(all(test, feature = "test-support", feature = "agent-runtime"))]
+    impl WorkspaceIntelligenceHost {
+        /// Prepares one scope and keeps its queued permit alive for the returned
+        /// holder. Dropping the holder revokes the queued reservation exactly like
+        /// dropping the permit would.
+        pub(crate) async fn prepare_initial_enable_for_tests(
+            &self,
+            workspace_id: &str,
+        ) -> Result<PreparedInitialEnableForTests, ConfirmRefusal> {
+            self.prepare_initial_enable(workspace_id)
+                .await
+                .map(PreparedInitialEnableForTests)
+                .map_err(|refusal| confirm_refusal_of(&refusal))
+        }
+
+        /// One confirmation of the scope prepared above.
+        pub(crate) async fn confirm_initial_enable_for_tests(
+            &self,
+            workspace_id: &str,
+            decision: MigrationDecision,
+        ) -> Result<ConfirmOutcome, ConfirmRefusal> {
+            self.confirm_initial_enable(workspace_id, decision).await
+        }
+    }
+
+    /// Test-only holder of one queued initial-enable permit.
+    ///
+    /// It exists so a crate-root test can keep the queued reservation alive between
+    /// preparation and confirmation without naming the permit type, which stays
+    /// private to this module. The field is held for its `Drop`.
+    #[cfg(all(test, feature = "test-support", feature = "agent-runtime"))]
+    pub(crate) struct PreparedInitialEnableForTests(#[allow(dead_code)] InitialEnablePending);
+
+    /// Test-only handle of one installed confirmation pause.
+    ///
+    /// It exists so a crate-root test can park a confirmation in the window where
+    /// the queued tenure was taken out of its slot and cancel it there, without
+    /// naming the pause registry or the private permit type. Dropping it removes the
+    /// registration, so fixtures cannot leak into each other.
+    #[cfg(all(
+        test,
+        feature = "test-support",
+        feature = "workspace-intelligence-host",
+        feature = "agent-runtime"
+    ))]
+    pub(crate) struct ConfirmPauseForTests {
+        pause: HostPause,
+        entered: tokio::sync::mpsc::UnboundedReceiver<()>,
+        _registration: super::pauses::Registration,
+    }
+
+    #[cfg(all(
+        test,
+        feature = "test-support",
+        feature = "workspace-intelligence-host",
+        feature = "agent-runtime"
+    ))]
+    impl ConfirmPauseForTests {
+        /// Waits until the parked confirmation reached the take window.
+        pub(crate) async fn entered(&mut self) {
+            let _ = self.entered.recv().await;
+        }
+
+        /// Lets a parked confirmation continue past the window.
+        pub(crate) fn release(&self) {
+            self.pause.release();
+        }
+    }
+
+    #[cfg(all(
+        test,
+        feature = "test-support",
+        feature = "workspace-intelligence-host",
+        feature = "agent-runtime"
+    ))]
+    impl WorkspaceIntelligenceHost {
+        /// Installs one pause at the confirmation's take window for `paths`.
+        ///
+        /// The pause is armed before the confirmation runs, so the window is reached
+        /// deterministically instead of by timing.
+        pub(crate) fn install_confirm_take_pause_for_tests(
+            paths: &PathManager,
+        ) -> ConfirmPauseForTests {
+            let (pause, entered) = HostPause::new();
+            let registration = super::pauses::register(
+                paths.user_root_dir(),
+                super::pauses::PausePoint::AfterConfirmTakeReservation,
+                pause.clone(),
+            );
+            ConfirmPauseForTests {
+                pause,
+                entered,
+                _registration: registration,
+            }
+        }
+    }
+
     #[cfg(test)]
     mod timing_defaults {
         use super::HostTiming;
@@ -3887,6 +4369,14 @@ mod pauses {
         /// closing observation, so a fixture can cancel the caller or edit the record
         /// or the catalog after the reservation decided.
         AfterInitialEnableReserve,
+        /// After one confirmation took the queued reservation out of its slot and
+        /// strictly before it reads anything else, so a fixture can cancel the caller
+        /// in exactly the window where the taken tenure must be released by its guard.
+        ///
+        /// Gated like the confirmation itself: a build without `agent-runtime` has no
+        /// confirmation to park, so the point would be a dead variant there.
+        #[cfg(feature = "agent-runtime")]
+        AfterConfirmTakeReservation,
         /// In the drain loop, between the in-flight check and the wait.
         DrainWait,
         /// After the cursor stage of a pass observed both the Session snapshot and the
