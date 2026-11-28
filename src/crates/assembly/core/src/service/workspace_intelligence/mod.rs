@@ -119,11 +119,13 @@
 //! build without either answers nothing here rather than reading a shape it cannot
 //! validate.
 //!
-//! This tree still adds no first enable, no `allow_off`, no pending cursor, no
-//! content mutation, no model run, no Tauri command, no Product Operation
-//! Registry row and no UI, so a real first enable still has to pass the enable
-//! gate this tree does not provide. Nothing here is selected by `default`,
-//! `product-full` or `agent-runtime`.
+//! This tree still adds no first enable of its own accord, no `allow_off`, no pending
+//! cursor, no content mutation, no model run, no Tauri command, no Product Operation
+//! Registry row and no UI. It adds the app-facing facade: one typed status projection and
+//! the five operations a surface drives, all of which still pass the host's own re-read,
+//! re-admission and compare-and-swap. The Tauri commands, the registry rows and the UI are
+//! later slices, so a real first enable still has to pass the enable gate this tree does
+//! not provide. Nothing here is selected by `default`, `product-full` or `agent-runtime`.
 //!
 //! The `test-support`-gated `host_fixture` module is a test-only writer, compiled
 //! only when `test-support` and `workspace-intelligence-host` are selected
@@ -242,6 +244,11 @@ pub(crate) mod legacy_preview;
 // preview fingerprint carry that preview's own gate.
 #[allow(dead_code)]
 pub(crate) mod migration;
+// WP3.1a app-facing facade: one typed projection of the host's own facts plus the five
+// operations a surface drives. Unconditional like `host`, so a build without the host
+// feature can still answer an unavailable status instead of failing to compile; every
+// operation that needs the host is gated on its own.
+pub mod app;
 // Test-only, and behind both features: it publishes an enabled scope for a test
 // that must have one, while the production enable gate stays outside this tree.
 // Nothing a `test-support` build produces is part of a product assembly.
@@ -263,4 +270,14 @@ pub use host::{
     WorkspaceIntelligenceHostShutdown, WorkspaceIntelligenceHostState,
     WorkspaceIntelligenceHostStatus, WorkspaceIntelligenceHostSurface,
     WorkspaceIntelligenceHostUnsupportedProfile, WorkspaceIntelligenceHostUnsupportedScope,
+};
+// The app-facing facade: one status projection and the five operations a surface drives.
+// Every payload here is a stable code, an id the surface already holds, a number or a
+// content hash; scopes, paths, tokens, leases, control/cognition roots and the raw anchor
+// stay crate-internal.
+pub use app::{
+    AppRefusal, AssignmentInput, ConfirmReport, DisableReport, FingerprintDto,
+    LegacyAttributedRow, LegacyPreviewReport, LegacyUnattributedRow, MigrationAssignmentCounts,
+    MigrationDecisionInput, MigrationReport, WorkspaceIntelligenceApp,
+    WorkspaceIntelligenceAppStatus, WorkspaceIntelligenceScopeStatus,
 };

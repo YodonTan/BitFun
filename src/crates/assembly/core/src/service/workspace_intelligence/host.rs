@@ -308,6 +308,51 @@ impl WorkspaceIntelligenceHostUnsupportedProfile {
     }
 }
 
+/// Serializes as the stable code, never as the variant name.
+///
+/// The variant name is a Rust fact; only [`code`](Self::code) is a protocol value, and
+/// a hand-written impl keeps the two from drifting the way a derived one would.
+impl serde::Serialize for WorkspaceIntelligenceHostState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.code())
+    }
+}
+
+/// Serializes as the stable code, never as the variant name.
+impl serde::Serialize for WorkspaceIntelligenceHostUnsupportedProfile {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.code())
+    }
+}
+
+/// Serializes as the stable code, never as the variant name.
+impl serde::Serialize for WorkspaceIntelligenceHostUnsupportedScope {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.code())
+    }
+}
+
+/// Serializes as the stable code, never as the variant name.
+impl serde::Serialize for WorkspaceIntelligenceHostReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.code())
+    }
+}
+
+/// Serializes as the stable code, never as the variant name.
+impl serde::Serialize for WorkspaceIntelligenceHostScopeState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.code())
+    }
+}
+
+/// Serializes as the stable code, never as the variant name.
+impl serde::Serialize for WorkspaceIntelligenceHostBlock {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.code())
+    }
+}
+
 /// Why a persisted workspace record can never hold a governed scope here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceIntelligenceHostUnsupportedScope {
@@ -743,6 +788,13 @@ mod compiled {
     use crate::service::workspace_intelligence::host_standby::{
         StandbyWorker, STANDBY_BASE_DELAY, STANDBY_MAX_DELAY,
     };
+    use crate::service::workspace_intelligence::control::{
+        ControlAuthority, ControlError, ControlMutation, ControlMutationOutcome, ControlObservation,
+        WorkspaceIntelligenceControl,
+    };
+    use crate::service::workspace_intelligence::mode::{
+        CapabilityDelivery, WorkspaceModelRef, WorkspaceModelResolution,
+    };
     use crate::service::workspace_intelligence::policy::{ControlPolicyView, CONTROL_SCHEMA_VERSION};
     use crate::service::workspace_intelligence::scope::{
         HostExecutionDomainKey, WorkspaceControlScope,
@@ -918,7 +970,7 @@ mod compiled {
     /// valid anchor before a later step refused, and those are the documented residue
     /// a refusal is allowed to leave.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) enum InitialEnableRefusal {
+    pub(crate) enum InitialEnableRefusal {
         Stopping,
         Host(WorkspaceIntelligenceHostReason),
         WorkspaceNotFound,
@@ -1019,6 +1071,63 @@ mod compiled {
         }
     }
 
+    /// The scope half of one admission: everything the admission decides before it
+    /// reads the control record.
+    ///
+    /// It exists because two owners need the same scope facts: the admission, which
+    /// then compares the record against the enable rules, and the app-facing status
+    /// projection, which must project an already-enabled record instead of refusing
+    /// it. Splitting here keeps the catalogue read, the anchor read and the tenancy
+    /// comparison in exactly one place, so both callers observe the same facts in the
+    /// same order.
+    enum ScopeLookup {
+        /// No anchor exists, so no scope can be named. The admitted workspace travels
+        /// so the admission can report it as needing an anchor.
+        Unanchored(PersistedWorkspace),
+        /// The anchored scope, the host key it was built for and the binding that
+        /// describes the admitted workspace.
+        Anchored {
+            host: HostExecutionDomainKey,
+            scope: WorkspaceControlScope,
+            binding: ExecutionBinding,
+        },
+    }
+
+    /// What one app-facing OFF mutation of a scope produced.
+    ///
+    /// Every variant is a decision about the record, never a message: a caller can log
+    /// or render it without exposing a path, a scope or a stored payload.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ScopeDisableOutcome {
+        /// No control record exists for the scope, so there is nothing to disable.
+        RecordMissing,
+        /// The record exists, but at a generation other than the one the caller
+        /// expected. Nothing was written.
+        StaleGeneration,
+        /// The record exists but cannot be read, so nothing was written. Carries the
+        /// stable store fault.
+        Unreadable {
+            /// Stable fault code of the unreadable record.
+            fault: &'static str,
+        },
+        /// The switch was stored off and the generation advanced by one.
+        Disabled {
+            /// Generation of the record after the write.
+            generation: u64,
+        },
+        /// The record already read off at the expected generation, so nothing was
+        /// written.
+        AlreadyDisabled {
+            /// Generation of the record that already read off.
+            generation: u64,
+        },
+        /// The store refused the write for another reason. Carries its stable code.
+        Failed {
+            /// Stable control error code.
+            code: &'static str,
+        },
+    }
+
     /// Queued tenure of one prepared initial enable.
     ///
     /// The permit is a queued slot handle, not a grant: it is non-`Clone`,
@@ -1044,7 +1153,9 @@ mod compiled {
         /// an owner lease behind until some later sweep.
         fn drop(&mut self) {
             if let Some(slot) = self.slot.upgrade() {
-                slot.revoke();
+                // A drop cannot report anything: whether this permit or a decider
+                // released the reservation first does not matter here.
+                let _ = slot.revoke();
             }
         }
     }
@@ -1186,7 +1297,12 @@ mod compiled {
         /// The account is entered under the slot mutex and before the take, and it is
         /// left only after the lease was physically dropped. Dropping a lease is
         /// blocking IO, so it happens outside the mutex.
-        fn revoke(&self) {
+        ///
+        /// Answers whether this call is the one that took the reservation, which is the
+        /// only answer a caller can trust: an `is_live` probe followed by a `revoke` can
+        /// race a confirmation that takes the reservation in between, and that caller
+        /// must not report a release it did not perform.
+        fn revoke(&self) -> bool {
             let (guard, reservation) = {
                 let mut state = self.state();
                 let guard = state
@@ -1197,7 +1313,7 @@ mod compiled {
                 (guard, state.reservation.take())
             };
             let Some(reservation) = reservation else {
-                return;
+                return false;
             };
             #[cfg(test)]
             if let Some(pause) = self.release_pause() {
@@ -1206,6 +1322,7 @@ mod compiled {
             }
             drop(reservation);
             drop(guard);
+            true
         }
 
         /// True while this slot still holds a reservation.
@@ -1603,6 +1720,34 @@ mod compiled {
             catalog_readonly::read_persisted_catalog(&self.paths).await
         }
 
+        /// The eligible persisted record of one workspace, without any anchor or
+        /// control read.
+        ///
+        /// This is the catalogue half of [`Self::scope_lookup`] on its own: the
+        /// admission, which continues into the anchor and the record, and the
+        /// app-facing legacy preview, which is a read of the workspace's own Memory
+        /// source and needs no scope at all, must name the same record with the same
+        /// three refusals. Extracting it keeps that classification in one place.
+        async fn catalog_workspace(
+            &self,
+            workspace_id: &str,
+        ) -> Result<PersistedWorkspace, InitialEnableRefusal> {
+            use InitialEnableRefusal as Refusal;
+            use WorkspaceIntelligenceHostReason as Reason;
+
+            let catalog = self
+                .read_catalog()
+                .await
+                .map_err(|_| Refusal::Host(Reason::CatalogUnreadable))?;
+            match catalog.entries().iter().find(|(id, _)| id == workspace_id) {
+                Some((_, PersistedCatalogEntry::Eligible(workspace))) => Ok(workspace.clone()),
+                Some((_, PersistedCatalogEntry::Unsupported(reason))) => {
+                    Err(Refusal::UnsupportedScope(unscoped_unsupported(*reason)))
+                }
+                None => Err(Refusal::WorkspaceNotFound),
+            }
+        }
+
         async fn check_initial_enable_gate(&self) -> Result<(), InitialEnableRefusal> {
             let book = self.book.lock().await;
             if self.shutdown_requested()
@@ -1629,24 +1774,21 @@ mod compiled {
             }
         }
 
-        async fn observe_initial_enable(
+        /// Resolves the scope facts of one admission, before any control record is
+        /// read.
+        ///
+        /// The catalogue read, the anchor read, the tenancy comparison and every
+        /// refusal are the admission's own, unchanged. The one caller that does not
+        /// continue into the record comparison is the app-facing status projection,
+        /// which must project an already-enabled record instead of refusing it.
+        async fn scope_lookup(
             &self,
             workspace_id: &str,
-        ) -> Result<InitialEnableAdmission, InitialEnableRefusal> {
+        ) -> Result<ScopeLookup, InitialEnableRefusal> {
             use InitialEnableRefusal as Refusal;
             use WorkspaceIntelligenceHostReason as Reason;
 
-            let catalog = self
-                .read_catalog()
-                .await
-                .map_err(|_| Refusal::Host(Reason::CatalogUnreadable))?;
-            let workspace = match catalog.entries().iter().find(|(id, _)| id == workspace_id) {
-                Some((_, PersistedCatalogEntry::Eligible(workspace))) => workspace,
-                Some((_, PersistedCatalogEntry::Unsupported(reason))) => {
-                    return Err(Refusal::UnsupportedScope(unscoped_unsupported(*reason)));
-                }
-                None => return Err(Refusal::WorkspaceNotFound),
-            };
+            let workspace = self.catalog_workspace(workspace_id).await?;
             // The legacy reader projects an unrenderable main path as absent for
             // startup comparison. Do not use that lossy fact for a new binding.
             if workspace.worktree_is_main().is_some() && workspace.main_repo_path().is_none() {
@@ -1665,9 +1807,7 @@ mod compiled {
                     if !control_directory_is_vacant(&self.paths).await {
                         return Err(Refusal::Host(Reason::AnchorMissingWithRecords));
                     }
-                    return Ok(InitialEnableAdmission::NeedsAnchor {
-                        workspace: workspace.clone(),
-                    });
+                    return Ok(ScopeLookup::Unanchored(workspace));
                 }
                 HostAnchorState::Present(anchor) => {
                     HostExecutionDomainKey::new(anchor.host_id(), LOCAL_EXECUTION_DOMAIN)
@@ -1680,9 +1820,33 @@ mod compiled {
             // Observing a valid anchor does not adopt it into the running host.
             let scope = WorkspaceControlScope::new(&host, workspace.id())
                 .expect("an eligible workspace id is never blank");
+            let binding = ExecutionBinding::observed(host.host_id(), &workspace);
+            Ok(ScopeLookup::Anchored {
+                host,
+                scope,
+                binding,
+            })
+        }
+
+        /// Re-admits one workspace against fresh persisted facts.
+        ///
+        /// The first half is [`Self::scope_lookup`]; the second reads the control
+        /// record and holds it against the enable rules.
+        async fn observe_initial_enable(
+            &self,
+            workspace_id: &str,
+        ) -> Result<InitialEnableAdmission, InitialEnableRefusal> {
+            use InitialEnableRefusal as Refusal;
+            use WorkspaceIntelligenceHostReason as Reason;
+
+            let (scope, binding) = match self.scope_lookup(workspace_id).await? {
+                ScopeLookup::Unanchored(workspace) => {
+                    return Ok(InitialEnableAdmission::NeedsAnchor { workspace });
+                }
+                ScopeLookup::Anchored { scope, binding, .. } => (scope, binding),
+            };
             // `as_str` renders the storage key; it is not a borrow of the scope.
             let scope_key = scope.as_str();
-            let binding = ExecutionBinding::observed(host.host_id(), workspace);
             let record = self
                 .control
                 .read(&scope_key)
@@ -2839,6 +3003,44 @@ mod compiled {
         }
     }
 
+    /// Delivery fact every app-facing observation of this host reports.
+    ///
+    /// The host runs the pass that owns the control record, so the capability the tier
+    /// needs is delivered. Delivery never changes the tier; it is only projected into
+    /// the readability fact next to it.
+    fn status_delivery() -> CapabilityDelivery {
+        CapabilityDelivery::Delivered
+    }
+
+    /// Model-reference resolver of every app-facing observation of this host.
+    ///
+    /// Core owns no model catalogue in this phase: the workspace model reference is
+    /// opaque here and provider settings keep their own owner, so a configured
+    /// reference is reported as unresolvable — the same fact the scoped-read decision
+    /// already reports. An `Intelligent` workspace is therefore projected as degraded
+    /// until the resolver slice lands. This is not a fallback: no reference is
+    /// rewritten, dropped or replaced by a default model, and the tier itself is
+    /// unaffected.
+    fn status_resolver(_: &WorkspaceModelRef) -> WorkspaceModelResolution {
+        WorkspaceModelResolution::Unresolvable
+    }
+
+    /// Stable machine-readable code of one control-handle failure.
+    ///
+    /// The `Display` form of the store error carries the record path, so no caller of
+    /// this host may print it: only a code crosses this boundary.
+    fn mutation_error_code(error: &ControlError) -> &'static str {
+        match error {
+            ControlError::HostScopeMismatch => "host_scope_mismatch",
+            ControlError::StaleGeneration { .. } => "control_generation_conflict",
+            ControlError::UnexpectedRecord { .. } => "unexpected_record",
+            ControlError::BlankModelReference => "blank_model_reference",
+            ControlError::MigrationShapeInvalid { fault } => fault.as_str(),
+            ControlError::UnmergeablePolicy(_) => "unmergeable_policy",
+            ControlError::Store(inner) => control_error_code(inner),
+        }
+    }
+
     /// Stable machine-readable code of a control-store failure.
     ///
     /// The `Display` form of the store error carries the record path, so no log may
@@ -3566,7 +3768,6 @@ mod compiled {
         /// The returned permit is a queued tenure, not a grant: it proves only that
         /// this one scope is prepared, it authorizes no write, and a later consume
         /// must re-admit the workspace and re-check its authority under the lease.
-        #[allow(dead_code, reason = "the app-facing preparation command is a later slice")]
         pub(super) async fn prepare_initial_enable(
             &self,
             workspace_id: &str,
@@ -3587,6 +3788,177 @@ mod compiled {
             match job.await {
                 Ok(result) => result,
                 Err(_) => Err(InitialEnableRefusal::AnchorPreparationFailed),
+            }
+        }
+
+        /// Queues one preparation and leaves its permit with this host's book.
+        ///
+        /// The permit is deliberately not handed back: the book already holds the
+        /// slot, and forgetting the handle here is what keeps dropping this call from
+        /// revoking the reservation it just queued. The queued tenure is therefore
+        /// released by the matching confirmation, which consumes it, by
+        /// [`Self::cancel_initial_enable`], or by the drain, and a released slot is
+        /// swept when the next preparation of the same scope starts. Nothing here
+        /// expires it: a build that can leave a queue behind needs the timeout sweep of
+        /// the surface slice.
+        pub(crate) async fn prepare_initial_enable_queued(
+            &self,
+            workspace_id: &str,
+        ) -> Result<(), InitialEnableRefusal> {
+            let pending = self.prepare_initial_enable(workspace_id).await?;
+            std::mem::forget(pending);
+            Ok(())
+        }
+
+        /// Revokes the queued preparation of one workspace.
+        ///
+        /// Returns `true` when a live queued tenure existed and this call released it.
+        /// The enable state is deliberately not consulted: a cancellation must work
+        /// whatever another writer stored meanwhile. A workspace this host cannot name
+        /// a scope for — not in the catalogue, no anchor yet — has nothing queued and
+        /// answers `false`.
+        pub(crate) async fn cancel_initial_enable(&self, workspace_id: &str) -> bool {
+            let Ok(ScopeLookup::Anchored { scope, .. }) =
+                self.core.scope_lookup(workspace_id).await
+            else {
+                return false;
+            };
+            let scope_key = scope.as_str();
+            let queued = {
+                let mut book = self.core.book.lock().await;
+                book.clear_released_initial_enable();
+                book.initial_enable.get(&scope_key).cloned()
+            };
+            let Some(slot) = queued else {
+                return false;
+            };
+            // Released outside the book lock: dropping a lease is blocking IO. The answer
+            // is this call's own take, not a liveness probe, because a confirmation that
+            // takes the reservation between the probe and the revoke would otherwise be
+            // reported as a cancellation that never released anything.
+            slot.revoke()
+        }
+
+        /// The control observation of one workspace, before any enable rule.
+        ///
+        /// This is the app-facing status projection's read: it names exactly the scope
+        /// [`Self::initial_enable_admission`] would admit and observes its record
+        /// without applying the enable rules, so an already-enabled scope is projected
+        /// instead of refused. A workspace whose scope cannot be named yet — not in the
+        /// catalogue, no anchor, or a scope record nobody may read — answers with the
+        /// typed refusal, never with an empty observation, and a workspace without an
+        /// anchor answers `None` because no record can exist for a scope that has no
+        /// storage namespace.
+        ///
+        /// Delivery and model resolution come from [`status_delivery`] and
+        /// [`status_resolver`], the same two sources the scoped read decision uses, so
+        /// this projection cannot claim a capability or a model fact the rest of the
+        /// tree does not have.
+        pub(crate) async fn scope_control_observation(
+            &self,
+            workspace_id: &str,
+        ) -> Result<Option<ControlObservation>, InitialEnableRefusal> {
+            let ScopeLookup::Anchored { host, scope, .. } =
+                self.core.scope_lookup(workspace_id).await?
+            else {
+                return Ok(None);
+            };
+            // The handle is built from the very host key this scope was derived from, so
+            // the host/scopes mismatch `observe` can report is unreachable here; the
+            // mapping below keeps it fail-closed instead of unwrapping.
+            WorkspaceIntelligenceControl::for_host(&self.core.paths, host)
+                .observe(&scope, status_delivery(), status_resolver)
+                .await
+                .map(Some)
+                .map_err(|_| {
+                    InitialEnableRefusal::Host(WorkspaceIntelligenceHostReason::ControlUnreadable)
+                })
+        }
+
+        /// Stores one scope OFF under the caller's expected generation.
+        ///
+        /// This is the app-facing OFF switch: it never creates a record, never
+        /// back-fills one and never skips the compare-and-swap. The caller names the
+        /// generation it read, so a record that moved since is
+        /// [`ScopeDisableOutcome::StaleGeneration`] instead of being overwritten. The
+        /// expected generation is checked against a fresh observation first, so a stale
+        /// caller is answered without a write attempt at all; the store's own guard is
+        /// still what decides the write.
+        ///
+        /// A successful write is followed by one evaluation pass, so the owner of the
+        /// scope this host just switched off releases its tenure instead of waiting for
+        /// the coarse fallback.
+        pub(crate) async fn disable_scope(
+            &self,
+            workspace_id: &str,
+            expected_generation: u64,
+        ) -> Result<ScopeDisableOutcome, InitialEnableRefusal> {
+            // Imported here rather than at module level: the module-level import is gated
+            // on `agent-runtime` for the confirm path, while this method must exist in a
+            // host build without it.
+            use openbitfun_services_core::workspace_intelligence_store::{
+                ControlGenerationExpectation,
+            };
+
+            let ScopeLookup::Anchored { host, scope, .. } =
+                self.core.scope_lookup(workspace_id).await?
+            else {
+                // No anchor means no storage namespace, so no record can exist.
+                return Ok(ScopeDisableOutcome::RecordMissing);
+            };
+            let control = WorkspaceIntelligenceControl::for_host(&self.core.paths, host);
+            let observed = control
+                .observe(&scope, status_delivery(), status_resolver)
+                .await
+                .map_err(|_| {
+                    InitialEnableRefusal::Host(WorkspaceIntelligenceHostReason::ControlUnreadable)
+                })?;
+            match observed.authority {
+                ControlAuthority::NotObserved => return Ok(ScopeDisableOutcome::RecordMissing),
+                // An unreadable record is never overwritten by this path: the caller is
+                // told which stable fault the read hit and nothing is written.
+                ControlAuthority::Unavailable { fault } => {
+                    return Ok(ScopeDisableOutcome::Unreadable {
+                        fault: fault.code(),
+                    })
+                }
+                ControlAuthority::Observed {
+                    generation: observed_generation,
+                    ..
+                } => {
+                    if observed_generation != expected_generation {
+                        return Ok(ScopeDisableOutcome::StaleGeneration);
+                    }
+                }
+            }
+            match control
+                .apply(
+                    &scope,
+                    ControlGenerationExpectation::Exactly(expected_generation),
+                    ControlMutation::SetEnabled(false),
+                )
+                .await
+            {
+                Ok(ControlMutationOutcome::Applied(record)) => {
+                    self.core.evaluate().await;
+                    Ok(ScopeDisableOutcome::Disabled {
+                        generation: record.generation,
+                    })
+                }
+                // A record that already read off at the expected generation is not
+                // rewritten, so its generation does not move either.
+                Ok(ControlMutationOutcome::Unchanged { observed }) => {
+                    let generation = observed.map_or(expected_generation, |record| {
+                        record.generation
+                    });
+                    Ok(ScopeDisableOutcome::AlreadyDisabled { generation })
+                }
+                Err(ControlError::StaleGeneration { .. }) => {
+                    Ok(ScopeDisableOutcome::StaleGeneration)
+                }
+                Err(error) => Ok(ScopeDisableOutcome::Failed {
+                    code: mutation_error_code(&error),
+                }),
             }
         }
 
@@ -3629,7 +4001,6 @@ mod compiled {
         /// pass ([`ConfirmOutcome::EnabledPartitionPending`]) while a fence that
         /// reports the record itself changed is [`ConfirmRefusal::ControlChanged`].
         #[cfg(feature = "agent-runtime")]
-        #[allow(dead_code, reason = "the app-facing confirm command is a later slice")]
         pub(crate) async fn confirm_initial_enable(
             &self,
             workspace_id: &str,
@@ -3840,6 +4211,35 @@ mod compiled {
             }
         }
 
+        /// One read-only preview of the legacy Memory source of one workspace.
+        ///
+        /// A preview is a read of the workspace's own Memory source, not of its scope:
+        /// the workspace must be in this host's persisted catalogue, but no anchor and
+        /// no control record is required, because a user previews in order to decide and
+        /// therefore before anything is prepared or enabled. The root handed back next
+        /// to the preview is the persisted catalog root of that workspace, which is what
+        /// a caller compares the preview's normalized workspace against.
+        ///
+        /// The preview is blocking IO over SQLite and two file trees, so it runs off the
+        /// async worker. `Ok(None)` is the one untyped failure: the blocking task itself
+        /// did not complete, which is a host-side fault and never a statement about the
+        /// source.
+        #[cfg(feature = "agent-runtime")]
+        pub(crate) async fn legacy_preview_of(
+            &self,
+            workspace_id: &str,
+        ) -> Result<Option<(String, legacy_preview::LegacyPreview)>, InitialEnableRefusal> {
+            let workspace = self.core.catalog_workspace(workspace_id).await?;
+            let root = workspace.root().to_owned();
+            let database = self.core.paths.memories_database_file();
+            let memory_root = self.core.paths.memories_root_dir();
+            let preview = tokio::task::spawn_blocking(move || {
+                legacy_preview::read_legacy_preview(&database, &memory_root)
+            })
+            .await;
+            Ok(preview.ok().map(|preview| (root, preview)))
+        }
+
         /// The host-owned body of one complete initial-enable preparation.
         ///
         /// Every await in here can be long (a guarded mint, a lease acquisition, a
@@ -4024,8 +4424,9 @@ mod compiled {
                 }
             };
             if let Some(refusal) = refusal {
-                // Released outside the lock: dropping a lease is blocking IO.
-                slot.revoke();
+                // Released outside the lock: dropping a lease is blocking IO. This slot
+                // was never published, so this call is always the releasing one.
+                let _ = slot.revoke();
                 return Err(refusal);
             }
             info!(
@@ -4314,6 +4715,15 @@ pub use compiled::WorkspaceIntelligenceHost;
 #[allow(unused_imports)] // The only consumer, `scoped_read_io`, also requires `agent-runtime`.
 #[cfg(feature = "workspace-intelligence-host")]
 pub(crate) use compiled::read_persisted_host_id;
+/// One app-facing OFF mutation's outcome. It carries stable codes and generations
+/// only, so a caller can render or log it without any path, scope or payload.
+#[cfg(feature = "workspace-intelligence-host")]
+pub(crate) use compiled::ScopeDisableOutcome;
+/// Why one crate-internal enable-path call was refused. Only the app facade maps it,
+/// and only into its own stable codes, so no path, scope or payload crosses a
+/// boundary with it.
+#[cfg(feature = "workspace-intelligence-host")]
+pub(crate) use compiled::InitialEnableRefusal;
 
 #[allow(unused_imports)]
 #[cfg(all(test, feature = "workspace-intelligence-host"))]

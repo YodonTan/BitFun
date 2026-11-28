@@ -186,6 +186,21 @@ mod workspace_intelligence_facade_contract {
         assert_eq!(shutdown.state(), WorkspaceIntelligenceHostState::NotCompiled);
     }
 
+    /// The app facade of a build without the host feature is nameable and reports the
+    /// surface as unavailable, so a composition root can construct it unconditionally and
+    /// a caller never sees a silent success.
+    #[cfg(not(feature = "workspace-intelligence-host"))]
+    #[tokio::test]
+    async fn the_app_facade_reports_the_surface_unavailable_without_the_host_feature() {
+        let app = WorkspaceIntelligenceHost::not_compiled().app();
+        let status = app.status().await;
+        assert_eq!(status.host_state, "not_compiled");
+        assert_eq!(status.reason.as_deref(), Some("not_compiled"));
+        assert!(!status.surface_available);
+        assert_eq!(status.unavailability.as_deref(), Some("host_not_compiled"));
+        assert!(status.scopes.is_empty());
+    }
+
     /// An ordinary caller sees the redacted marker and nothing that would let it
     /// recover the anchor identity, a storage root or a tenure handle.
     #[cfg(feature = "workspace-intelligence-host")]
